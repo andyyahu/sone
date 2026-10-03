@@ -7,14 +7,6 @@
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-yellow.svg)]()
 [![Built with Tauri 2](https://img.shields.io/badge/Built_with-Tauri_2-orange.svg)](https://v2.tauri.app/)
 
-  <div align="center">
-    <a href="https://flathub.org/apps/io.github.lullabyX.sone">
-      <img height="60" align="middle" alt="Download on Flathub" src="https://flathub.org/api/badge?locale=en"/>
-    </a>  
-    <a href="https://snapcraft.io/sone">
-      <img height="64" align="middle" alt="Get it from the Snap Store" src="https://snapcraft.io/static/images/badges/en/snap-store-black.svg"/>
-    </a>
-  </div>
 </div>
 
 > [!IMPORTANT]
@@ -140,145 +132,7 @@ SONE is a lightweight, native alternative to the official TIDAL web player and E
 
 ## Installation
 
-### Flathub
-
-SONE is officially available on Flathub, making it easy to install on any Linux distribution. You can install it via your software center or by using the CLI:
-
-**Install the application**
-
-```
-flatpak install flathub io.github.lullabyX.sone
-```
-
-**Run the application**
-
-```
-flatpak run io.github.lullabyX.sone
-```
-
-<a href="https://flathub.org/apps/io.github.lullabyX.sone">
-  <img width="200" alt="Download on Flathub" src="https://flathub.org/api/badge?locale=en"/>
-</a>
-
-### OS Packages
-
-Pre-built packages for Ubuntu/Debian (.deb), Fedora (.rpm), openSUSE (.rpm), and Arch Linux (PKGBUILD) are available on the [GitHub Releases](https://github.com/lullabyX/sone/releases) page.
-
-<p align="center">
-  <a href="https://github.com/lullabyX/sone/releases/latest">
-    <img src="https://img.shields.io/badge/Debian%20/%20Ubuntu-.deb-A81D33?style=for-the-badge&logo=debian" height="60" alt="Download SONE .deb package for Debian and Ubuntu" />
-  </a>
-  <a href="https://github.com/lullabyX/sone/releases/latest">
-    <img src="https://img.shields.io/badge/Fedora-.rpm-51A2DA?style=for-the-badge&logo=fedora" height="60" alt="Download SONE .rpm package for Fedora Linux" />
-  </a>
-  <a href="https://github.com/lullabyX/sone/releases/latest">
-    <img src="https://img.shields.io/badge/openSUSE-.rpm-73BA25?style=for-the-badge&logo=opensuse" height="60" alt="Download SONE .rpm package for openSUSE Linux" />
-  </a>
-  <a href="https://github.com/lullabyX/sone/releases/latest">
-    <img src="https://img.shields.io/badge/Arch%20Linux-PKGBUILD-1793D1?style=for-the-badge&logo=archlinux" height="60" alt="Download SONE PKGBUILD for Arch Linux and Manjaro" />
-  </a>
-  <a href="https://aur.archlinux.org/packages/sone">
-    <img src="https://img.shields.io/badge/AUR-sone-1793D1?style=for-the-badge&logo=archlinux" height="60" alt="Install SONE from AUR (build from source)" />
-  </a>
-  <a href="https://aur.archlinux.org/packages/sone-bin">
-    <img src="https://img.shields.io/badge/AUR-sone--bin-1793D1?style=for-the-badge&logo=archlinux" height="60" alt="Install SONE from AUR (pre-built binary)" />
-  </a>
-</p>
-
-Or add the repository so `apt upgrade` / `dnf upgrade` / `zypper up` keep SONE current automatically (the setup script auto-detects your distro and imports the signing key):
-
-<details>
-<summary><b>Debian / Ubuntu (apt)</b></summary>
-
-```bash
-curl -1sLf 'https://dl.cloudsmith.io/public/lullabyx/sone/setup.deb.sh' | sudo -E bash
-sudo apt install sone
-```
-
-Derivatives (Kubuntu, Linux Mint, Pop!\_OS, Zorin, MX, LMDE) use the same command.
-
-</details>
-
-<details>
-<summary><b>Fedora (dnf)</b></summary>
-
-```bash
-curl -1sLf 'https://dl.cloudsmith.io/public/lullabyx/sone/setup.rpm.sh' | sudo -E bash
-sudo dnf install sone
-```
-
-</details>
-
-<details>
-<summary><b>openSUSE (zypper)</b></summary>
-
-```bash
-curl -1sLf 'https://dl.cloudsmith.io/public/lullabyx/sone/setup.rpm.sh' | sudo -E bash
-sudo zypper install sone
-```
-
-</details>
-
-<details>
-<summary><b>Arch Linux (AUR)</b></summary>
-
-```bash
-yay -S sone-bin    # prebuilt binary — or 'yay -S sone' to build from source
-```
-
-</details>
-
-<p align="center">
-  <a href="https://cloudsmith.com">
-    <img src="https://img.shields.io/badge/OSS%20hosting%20by-cloudsmith-blue?logo=cloudsmith&style=for-the-badge" alt="Package hosting by Cloudsmith" />
-  </a>
-</p>
-
-### Snap Store
-
-SONE is available on the Snap Store for any distribution with snap support. Install it via your software center or the CLI:
-
-**Install the application**
-
-```
-sudo snap install sone
-```
-
-**Run the application**
-
-```
-sone
-```
-
-> For exclusive / bit-perfect ALSA output, also connect the hardware-access interface:
->
-> ```
-> sudo snap connect sone:alsa
-> ```
-
-<a href="https://snapcraft.io/sone">
-  <img width="200" style="border-radius: 8px;" alt="Get it from the Snap Store" src="https://snapcraft.io/static/images/badges/en/snap-store-black.svg"/>
-</a>
-
-### Nix
-
-SONE ships a [Nix flake](flake.nix). On any system with Nix and flakes enabled, run it without installing:
-
-```bash
-nix run github:lullabyX/sone
-```
-
-Or install it into your profile:
-
-```bash
-nix profile install github:lullabyX/sone
-```
-
-The flake builds from source (no binary cache yet) and also exposes a development shell with every build and runtime dependency wired up:
-
-```bash
-nix develop github:lullabyX/sone   # then: pnpm tauri dev
-```
+[Upstream SONE](https://github.com/lullabyX/sone#installation) by lullabyX is the published app. It is on Flathub and the Snap Store, in Cloudsmith repositories for Debian, Ubuntu, Fedora, and openSUSE, on the AUR as a source package and a prebuilt binary, as a Nix flake, and as `.deb`, `.rpm`, and Arch packages on its GitHub Releases. Those builds do not include the changes in this fork. The upstream README has the install steps. This repository is built from source.
 
 ### Building from source
 
@@ -350,23 +204,6 @@ sudo dnf install -y gstreamer1-plugins-base-tools
 <details>
 <summary>Arch Linux</summary>
 
-#### AUR
-
-SONE is available on the AUR in two variants:
-
-- [`sone`](https://aur.archlinux.org/packages/sone) — builds from source
-- [`sone-bin`](https://aur.archlinux.org/packages/sone-bin) — pre-built binary, no compilation required
-
-**Install with your AUR helper:**
-
-```bash
-yay -S sone       # build from source
-# or
-yay -S sone-bin   # pre-built binary
-```
-
-#### Manual Install
-
 ```bash
 sudo pacman -S --needed \
     base-devel curl wget file patchelf \
@@ -389,7 +226,7 @@ sudo pacman -S --needed gst-plugin-pipewire alsa-plugins
 **Build and run:**
 
 ```bash
-git clone https://github.com/lullabyX/sone.git
+git clone https://github.com/andyyahu/sone.git
 cd sone
 pnpm install
 pnpm tauri dev             # Development mode
@@ -463,18 +300,19 @@ This is a known issue with NVIDIA's proprietary drivers and WebKitGTK hardware a
 
 ## Custom theme file
 
-The theme presets/custom colors are stored in `theme.json`, inside SONE's config
-directory. **That directory depends on how you installed SONE**, because Flatpak
-and Snap both redirect `XDG_CONFIG_HOME` into their own sandbox:
+The theme presets and custom colors are stored in `theme.json`. A build of
+this fork uses `~/.config/sone/theme.json`.
+
+Upstream's Flatpak and Snap packages redirect that file. Those packages are
+lullabyX's SONE, not this fork:
 
 | Install | `theme.json` |
 | --- | --- |
-| Native (AUR, `.deb`, `.rpm`, AppImage) | `~/.config/sone/theme.json` |
-| Flatpak | `~/.var/app/io.github.lullabyX.sone/config/sone/theme.json` |
-| Snap | `~/snap/sone/current/.config/sone/theme.json` |
+| This fork, or an upstream native package | `~/.config/sone/theme.json` |
+| Upstream Flatpak | `~/.var/app/io.github.lullabyX.sone/config/sone/theme.json` |
+| Upstream Snap | `~/snap/sone/current/.config/sone/theme.json` |
 
-A sandboxed SONE cannot read `~/.config/sone/`, so tools that write the theme
-for you need the matching path above.
+A sandboxed upstream build cannot read `~/.config/sone/`.
 
 SONE reads the file at startup and **watches it while running**, so an external
 edit is applied straight away — even when SONE is unfocused or sitting in the
@@ -527,7 +365,7 @@ Yes. SONE is a client for TIDAL and requires an active paid TIDAL subscription. 
 <details>
 <summary>Which Linux distributions are supported?</summary>
 
-Any modern Linux distribution. SONE is on Flathub (works everywhere), and ships native packages for Debian/Ubuntu (`.deb`), Fedora and openSUSE (`.rpm`), and Arch Linux (AUR).
+This fork is built from source on a normal Linux system. Upstream SONE is published for the same systems through Flathub, the Snap Store, Cloudsmith, the AUR, Nix, and GitHub Releases. Those packages do not include the changes in this repository.
 
 </details>
 
@@ -570,7 +408,9 @@ In short: exclusive gives you direct hardware access with volume control. Bit-pe
 <details>
 <summary>Discord Rich Presence isn't showing up (Flatpak or Snap)</summary>
 
-Discord Rich Presence talks over a socket in your session's runtime directory. Sandboxed packages are restricted there, so the fix depends on how you installed SONE. Native packages (`.deb`, `.rpm`, AUR) are unaffected.
+The Flatpak and Snap steps below are for upstream SONE (`io.github.lullabyX.sone` and the `sone` snap). A binary built from this fork is not sandboxed that way.
+
+Discord Rich Presence talks over a socket in your session's runtime directory. Sandboxed packages are restricted there. A native build is unaffected.
 
 **Flatpak** — start Discord *before* SONE.
 
@@ -614,9 +454,7 @@ Leave that running and SONE will find it. Run it before starting SONE, or restar
 
 ## Contributing
 
-Issues and pull requests are welcome on [GitHub](https://github.com/lullabyX/sone). To set up a development environment, follow the [Building from source](#building-from-source) instructions.
-
-If you enjoy using SONE, consider giving the project a star to help others find it.
+This fork lives at [andyyahu/sone](https://github.com/andyyahu/sone). The upstream project is [lullabyX/sone](https://github.com/lullabyX/sone). To build it, follow [Building from source](#building-from-source).
 
 ## Disclaimer
 
