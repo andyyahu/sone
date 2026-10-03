@@ -14,12 +14,10 @@ import {
 } from "../atoms/playback";
 import FlowDiagramBody from "./signal-path/FlowDiagramBody";
 import {
-  amplitudeToSliderPercent,
   dacDisplayName,
   deriveAlterations,
-  displayFormat,
-  formatRate,
-  gainFactorToDb,
+  signalHeadline,
+  signalVerdictWord,
 } from "./signal-path/types";
 import { useSignalPathRefresh } from "../hooks/useSignalPathRefresh";
 import { useEscapeDismiss } from "../hooks/useEscapeDismiss";
@@ -63,16 +61,7 @@ export default function SignalPathPanel({
 
   if (!open) return null;
 
-  const {
-    userVol,
-    normFactor,
-    userVolAltered,
-    normAltered,
-    isDirectAlsa,
-    isPristine,
-    lossyFormatChange,
-    losslessPromotion,
-  } = deriveAlterations(sp);
+  const { isDirectAlsa, isPristine } = deriveAlterations(sp);
 
   const sourceBits = streamInfo?.bitDepth;
   const sourceRate = streamInfo?.sampleRate;
@@ -86,40 +75,8 @@ export default function SignalPathPanel({
     .filter(Boolean)
     .join(" ");
 
-  let headline: string;
-  if (!sp || !sp.backend) {
-    headline = "Idle — no track playing";
-  } else if (!sp.dac && !sp.outputFormat) {
-    headline = "Pipeline starting…";
-  } else if (sp.dac?.state === "Closed") {
-    headline = "DAC inactive — output may be routed elsewhere";
-  } else if (isPristine) {
-    headline = losslessPromotion
-      ? `${displayFormat(sp?.decodedFormat)} → ${displayFormat(sp?.outputFormat)} — lossless promotion, every source bit preserved`
-      : sourceSummary
-        ? `${sourceSummary} reaches your DAC untouched`
-        : "Source PCM reaches your DAC untouched";
-  } else if (sp?.resampledFrom && sp?.resampledTo) {
-    headline = `Resampled ${formatRate(sp.resampledFrom)} → ${formatRate(sp.resampledTo)}`;
-  } else if (sp?.formatFallbackFrom && sp?.formatFallbackTo) {
-    headline = `DAC refused ${sp.formatFallbackFrom} — fell back to ${sp.formatFallbackTo}`;
-  } else if (lossyFormatChange) {
-    headline = `Bit-depth reduced ${displayFormat(sp?.decodedFormat)} → ${displayFormat(sp?.outputFormat)}`;
-  } else if (normAltered && userVolAltered) {
-    headline = "Samples scaled by volume slider and ReplayGain";
-  } else if (normAltered) {
-    headline = `ReplayGain applied · ${gainFactorToDb(normFactor)}`;
-  } else if (userVolAltered) {
-    headline = `Volume slider scaling samples · ${amplitudeToSliderPercent(userVol)}%`;
-  } else if (sp?.osMixer && !isDirectAlsa) {
-    headline = `Routed through ${sp.osMixer.server}`;
-  } else if (sp && !sp.bitPerfect) {
-    headline = "Bit-perfect mode off — pipeline at unity, not guaranteed";
-  } else {
-    headline = "Pipeline pass-through";
-  }
-
-  const verdictWord = isPristine ? "PRISTINE" : "MODIFIED";
+  const headline = signalHeadline(sp, sourceSummary);
+  const verdictWord = signalVerdictWord(sp, isPristine);
   const ringColor = isPristine ? "border-green-400" : "border-amber-400";
   const wordColor = isPristine ? "text-green-400" : "text-amber-300";
   const dotColor = isPristine ? "bg-green-400" : "bg-amber-400";
@@ -132,7 +89,7 @@ export default function SignalPathPanel({
         style={{
           width: expanded ? 680 : 480,
           transitionTimingFunction: "cubic-bezier(0.22, 1, 0.36, 1)",
-          animation: "fadeIn 0.2s ease-out",
+          animation: "fadeIn 0.2s var(--ease-settle)",
         }}
       >
         <div className="absolute top-3 right-3 z-20">
@@ -226,7 +183,7 @@ export default function SignalPathPanel({
                     (sp?.osMixer && !isDirectAlsa)) && (
                     <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[10.5px] font-mono text-th-text-faint mb-6 uppercase tracking-wider">
                       {sp?.exclusiveMode && <span>exclusive</span>}
-                      {sp?.bitPerfect && (
+                      {sp?.bitPerfect && !sp.camillaFir && (
                         <>
                           {sp?.exclusiveMode && (
                             <span className="text-th-text-faint/40">·</span>

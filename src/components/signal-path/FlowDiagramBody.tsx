@@ -1,6 +1,7 @@
 import { ArrowLeft } from "lucide-react";
 import {
   amplitudeToSliderPercent,
+  CAMILLA_ALTERATION,
   conversionState,
   dacDisplayName,
   deriveAlterations,
@@ -8,7 +9,11 @@ import {
   formatRate,
   formatsEquivalent,
   gainFactorToDb,
+  HQ_CABLE_CAPTION,
+  HQ_VERDICT,
+  replayGainReason,
   type SignalPathViewProps,
+  volumeReason,
 } from "./types";
 
 type CableState = "pristine" | "altered" | "lossy";
@@ -62,6 +67,7 @@ export default function FlowDiagramBody({
     isPristine,
     losslessPromotion,
   } = deriveAlterations(sp);
+  const hq = sp?.backend === "HQPlayer";
 
   const sourceCodec = streamInfo?.codec?.toUpperCase() ?? null;
   const sourceBits = streamInfo?.bitDepth ?? null;
@@ -91,19 +97,25 @@ export default function FlowDiagramBody({
     fmt: string | null;
     rate: number | null;
     tertiary: string | null;
-  } = isDirectAlsa
+  } = hq
     ? {
         fmt: sp?.outputFormat ?? null,
         rate: sp?.outputRate ?? null,
-        tertiary: userVolAltered || normAltered ? "+gain stage" : "pass-thru",
+        tertiary: "WAV to HQPlayer",
       }
-    : sp?.osMixer
+    : isDirectAlsa
       ? {
-          fmt: sp.osMixer.sinkFormat,
-          rate: sp.osMixer.sinkRate,
-          tertiary: `${sp.osMixer.server} · ${sp.osMixer.sinkChannels}ch`,
+          fmt: sp?.outputFormat ?? null,
+          rate: sp?.outputRate ?? null,
+          tertiary: userVolAltered || normAltered ? "+gain stage" : "pass-thru",
         }
-      : { fmt: null, rate: null, tertiary: "sw mixer" };
+      : sp?.osMixer
+        ? {
+            fmt: sp.osMixer.sinkFormat,
+            rate: sp.osMixer.sinkRate,
+            tertiary: `${sp.osMixer.server} · ${sp.osMixer.sinkChannels}ch`,
+          }
+        : { fmt: null, rate: null, tertiary: "sw mixer" };
 
   const nodes: NodeSpec[] = [
     {
@@ -119,18 +131,23 @@ export default function FlowDiagramBody({
       tertiary: sp?.decodedChannels ? `${sp.decodedChannels}ch` : null,
     },
     {
-      title: "MIX",
+      title: hq ? "HANDOFF" : "MIX",
       primary: displayFormat(mixSource.fmt),
       secondary: formatRate(mixSource.rate),
       tertiary: mixSource.tertiary,
     },
     {
-      title: "DAC",
-      primary: displayFormat(sp?.dac?.format ?? sp?.outputFormat ?? null),
-      secondary: formatRate(sp?.dac?.rate ?? sp?.outputRate ?? null),
-      tertiary:
-        sp?.dac?.cardName ??
-        (sp?.outputChannels ? `${sp.outputChannels}ch` : null),
+      title: hq ? "HQPLAYER" : "DAC",
+      primary: hq
+        ? "Desktop"
+        : displayFormat(sp?.dac?.format ?? sp?.outputFormat ?? null),
+      secondary: hq
+        ? "filter · DAC"
+        : formatRate(sp?.dac?.rate ?? sp?.outputRate ?? null),
+      tertiary: hq
+        ? "owns the device"
+        : (sp?.dac?.cardName ??
+          (sp?.outputChannels ? `${sp.outputChannels}ch` : null)),
     },
   ];
 
@@ -190,6 +207,7 @@ export default function FlowDiagramBody({
   // the OS mixer's per-sink working spec. Format strings differ in case
   // (GStreamer uses "S24LE", pactl uses "s24le") — compare case-insensitively.
   const mixerDiverges =
+    !hq &&
     !isDirectAlsa &&
     !!sp?.osMixer &&
     !!sp?.decodedFormat &&
@@ -241,7 +259,7 @@ export default function FlowDiagramBody({
   };
 
   const cable2Alterations: Alteration[] = [];
-  if (sp?.formatFallbackFrom && sp?.formatFallbackTo) {
+  if (!hq && sp?.formatFallbackFrom && sp?.formatFallbackTo) {
     cable2Alterations.push({
       state: "lossy",
       label: "FORMAT FALLBACK",
@@ -249,20 +267,28 @@ export default function FlowDiagramBody({
       reason: "DAC rejected requested format — fell back to nearest accepted",
     });
   }
-  if (userVolAltered) {
+  if (!hq && sp?.camillaFir) {
+    cable2Alterations.push({
+      state: "altered",
+      label: CAMILLA_ALTERATION.label,
+      detail: CAMILLA_ALTERATION.detail,
+      reason: CAMILLA_ALTERATION.reason,
+    });
+  }
+  if (!hq && userVolAltered) {
     cable2Alterations.push({
       state: "altered",
       label: "VOLUME",
       detail: `${amplitudeToSliderPercent(userVol)}% (${gainFactorToDb(userVol)})`,
-      reason: "Software volume scales samples in the writer thread",
+      reason: volumeReason(!!sp?.camillaFir),
     });
   }
-  if (normAltered) {
+  if (!hq && normAltered) {
     cable2Alterations.push({
       state: "altered",
       label: "REPLAYGAIN",
       detail: `${gainFactorToDb(normFactor)} (×${normFactor.toFixed(3)})`,
-      reason: "Loudness normalization scales samples before output",
+      reason: replayGainReason(!!sp?.camillaFir),
     });
   }
   // Normal mode: surface OS mixer mute / volume scaling. We're not the only
@@ -271,8 +297,9 @@ export default function FlowDiagramBody({
   // Skipped for DirectAlsa because we own the device exclusively (OS mixer is
   // bypassed). EPS_VOL guards against floating-point noise around 1.0.
   const EPS_VOL = 1e-3;
-  const osMuted = !isDirectAlsa && !!sp?.osMixer && sp.osMixer.sinkMuted;
+  const osMuted = !hq && !isDirectAlsa && !!sp?.osMixer && sp.osMixer.sinkMuted;
   const osVolumeAltered =
+    !hq &&
     !isDirectAlsa &&
     !!sp?.osMixer &&
     !sp.osMixer.sinkMuted &&
@@ -304,6 +331,7 @@ export default function FlowDiagramBody({
     : (sp?.osMixer?.sinkRate ?? sp?.outputRate ?? null);
 
   const dacDiverges =
+    !hq &&
     !!sp?.dac &&
     sp.dac.state === "Active" &&
     !!upstreamFormat &&
@@ -338,8 +366,9 @@ export default function FlowDiagramBody({
     : cable2Alterations.length > 0
       ? "altered"
       : "pristine";
-  const cable2Caption =
-    sp?.formatFallbackFrom && sp?.formatFallbackTo
+  const cable2Caption = hq
+    ? HQ_CABLE_CAPTION
+    : sp?.formatFallbackFrom && sp?.formatFallbackTo
       ? `fallback ${displayFormat(sp.formatFallbackFrom)}→${displayFormat(sp.formatFallbackTo)}`
       : osMuted
         ? "OS muted"
@@ -347,9 +376,11 @@ export default function FlowDiagramBody({
           ? "OS-layer conversion"
           : osVolumeAltered
             ? `OS vol ${gainFactorToDb(sp!.osMixer!.sinkVolume)}`
-            : userVolAltered || normAltered
-              ? "gain applied"
-              : "pass-thru";
+            : sp?.camillaFir
+              ? "CamillaDSP"
+              : userVolAltered || normAltered
+                ? "gain applied"
+                : "pass-thru";
   const cable2: CableSpec = {
     state: cable2State,
     caption: cable2Caption,
@@ -416,14 +447,24 @@ export default function FlowDiagramBody({
               </>
             )}
             <div className="flex gap-1.5 ml-auto pr-2">
+              {hq && (
+                <span className="px-1.5 py-0.5 rounded bg-th-inset text-th-text-muted tracking-wider">
+                  HQPLAYER
+                </span>
+              )}
               {sp?.exclusiveMode && (
                 <span className="px-1.5 py-0.5 rounded bg-th-inset text-th-text-muted tracking-wider">
                   EXCLUSIVE
                 </span>
               )}
-              {sp?.bitPerfect && (
+              {sp?.bitPerfect && !sp.camillaFir && (
                 <span className="px-1.5 py-0.5 rounded bg-th-inset text-green-400 tracking-wider">
                   BIT-PERFECT
+                </span>
+              )}
+              {sp?.camillaFir && (
+                <span className="px-1.5 py-0.5 rounded bg-th-inset text-amber-300 tracking-wider">
+                  FIR
                 </span>
               )}
             </div>
@@ -513,7 +554,7 @@ export default function FlowDiagramBody({
           </div>
           <div className="flex items-center gap-1.5">
             <div className="w-4 h-[3px] bg-amber-400" />
-            <span>ALTERED LOSSLESS</span>
+            <span>MODIFIED</span>
           </div>
           <div className="flex items-center gap-1.5">
             <div className="w-4 h-[3px] bg-red-400" />
@@ -575,17 +616,19 @@ export default function FlowDiagramBody({
           </button>
         )}
         <span className="text-center">
-          {isPristineVerdict
-            ? losslessPromotion
-              ? "PRISTINE · BIT-TRANSPARENT — LOSSLESS PROMOTION"
-              : "PRISTINE — NO ALTERATIONS DETECTED"
-            : lossyCount > 0
-              ? `NOT PRISTINE — ${lossyCount} LOSSY STAGE${lossyCount === 1 ? "" : "S"}${
-                  alteredCount > 0 ? ` · ${alteredCount} MODIFIED` : ""
-                }`
-              : alteredCount > 0
-                ? `MODIFIED — ${alteredCount} STAGE${alteredCount === 1 ? "" : "S"}`
-                : "MODIFIED"}
+          {hq
+            ? HQ_VERDICT
+            : isPristineVerdict
+              ? losslessPromotion
+                ? "PRISTINE · BIT-TRANSPARENT — LOSSLESS PROMOTION"
+                : "PRISTINE — NO ALTERATIONS DETECTED"
+              : lossyCount > 0
+                ? `NOT PRISTINE — ${lossyCount} LOSSY STAGE${lossyCount === 1 ? "" : "S"}${
+                    alteredCount > 0 ? ` · ${alteredCount} MODIFIED` : ""
+                  }`
+                : alteredCount > 0
+                  ? `MODIFIED — ${alteredCount} STAGE${alteredCount === 1 ? "" : "S"}`
+                  : "MODIFIED"}
         </span>
       </div>
     </>

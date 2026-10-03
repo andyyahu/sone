@@ -69,6 +69,26 @@ export function formatRate(hz: number | null | undefined): string | null {
     : `${hz} Hz`;
 }
 
+/**
+ * Stereo sent to a fixed-channel DAC is padded with digital silence.
+ * The source pair is copied at unity, so this is a note, not a verdict change.
+ * Downmixes and other layouts stay quiet here; the flow diagram still shows
+ * the channel counts.
+ */
+export function channelPadNote(
+  decodedChannels: number | null | undefined,
+  outputChannels: number | null | undefined,
+): string | null {
+  if (
+    decodedChannels !== 2 ||
+    outputChannels == null ||
+    outputChannels <= decodedChannels
+  ) {
+    return null;
+  }
+  return `stereo is padded with silence to ${outputChannels} channels; the source pair is unchanged`;
+}
+
 export function gainFactorToDb(factor: number): string {
   if (Math.abs(factor - 1.0) < EPS) return "0.0 dB";
   if (factor <= 0) return "−∞ dB";
@@ -182,6 +202,8 @@ export function deriveAlterations(sp: SignalPath | null) {
   //  - No ALSA format fallback recorded
   //  - No user-volume / ReplayGain scaling (any non-unity multiply is
   //    destructive on integer PCM)
+  //  - CamillaDSP is not convolving this output
+  //  - A noise shaper is not requantizing the exclusive output
   //  - No bit-depth narrowing between decoded and output (S24_32LE → S32LE
   //    or S24_32LE → S24LE are lossless container changes and DO NOT
   //    disqualify; S32LE → S16LE narrows and DOES)
@@ -222,6 +244,7 @@ export function deriveAlterations(sp: SignalPath | null) {
 
   const isPristine =
     !!sp &&
+    !sp.camillaFir &&
     isDirectAlsa &&
     !!sp.exclusiveMode &&
     sp.resampledFrom == null &&
@@ -241,4 +264,126 @@ export function deriveAlterations(sp: SignalPath | null) {
     lossyFormatChange,
     losslessPromotion,
   };
+}
+
+export const HQ_HEADLINE =
+  "Source-rate 32-bit WAV. HQPlayer Desktop does the filtering.";
+
+export const HQ_VERDICT = "HANDED OFF";
+
+export const HQ_CABLE_CAPTION = "source-rate WAV";
+
+export const CAMILLA_ALTERATION = {
+  label: "CAMILLADSP",
+  detail: "exclusive PCM at the source rate",
+  reason:
+    "The loaded config runs at the track rate. The following quantize includes the volume slider and ReplayGain.",
+};
+
+/** Compact ring and the expanded header. HQPlayer is a handoff, not a SONE modification. */
+export function signalVerdictWord(
+  sp: SignalPath | null,
+  isPristine: boolean,
+): "PRISTINE" | "MODIFIED" | "HANDED OFF" {
+  if (sp?.backend === "HQPlayer") return "HANDED OFF";
+  return isPristine ? "PRISTINE" : "MODIFIED";
+}
+
+export function volumeReason(camillaFir: boolean): string {
+  return camillaFir
+    ? "Applied in the quantize after CamillaDSP"
+    : "Software volume scales samples in the writer thread";
+}
+
+export function replayGainReason(camillaFir: boolean): string {
+  return camillaFir
+    ? "Applied in the quantize after CamillaDSP"
+    : "Loudness normalization scales samples before output";
+}
+
+export function camillaHeadline(
+  userVol: number,
+  normFactor: number,
+  userVolAltered: boolean,
+  normAltered: boolean,
+): string {
+  const base =
+    "CamillaDSP is processing this exclusive output at the source rate";
+  const parts: string[] = [];
+  if (userVolAltered) {
+    parts.push(`volume ${amplitudeToSliderPercent(userVol)}%`);
+  }
+  if (normAltered) {
+    parts.push(`ReplayGain ${gainFactorToDb(normFactor)}`);
+  }
+  if (parts.length === 0) return base;
+  return `${base} · ${parts.join(" · ")}`;
+}
+
+/** Compact and expanded headline. HQPlayer is decided before gain or bit-perfect copy. */
+export function signalHeadline(
+  sp: SignalPath | null,
+  sourceSummary: string,
+): string {
+  const {
+    userVol,
+    normFactor,
+    userVolAltered,
+    normAltered,
+    isDirectAlsa,
+    isPristine,
+    losslessPromotion,
+    lossyFormatChange,
+  } = deriveAlterations(sp);
+
+  if (!sp || !sp.backend) {
+    return "Idle — no track playing";
+  }
+  if (!sp.dac && !sp.outputFormat) {
+    return "Pipeline starting…";
+  }
+  if (sp.dac?.state === "Closed") {
+    return "DAC inactive — output may be routed elsewhere";
+  }
+  if (sp.backend === "HQPlayer") {
+    return HQ_HEADLINE;
+  }
+  if (sp.camillaFir) {
+    return camillaHeadline(userVol, normFactor, userVolAltered, normAltered);
+  }
+  if (isPristine) {
+    let headline = losslessPromotion
+      ? `${displayFormat(sp.decodedFormat)} → ${displayFormat(sp.outputFormat)} — lossless promotion, every source bit preserved`
+      : sourceSummary
+        ? `${sourceSummary} reaches your DAC untouched`
+        : "Source PCM reaches your DAC untouched";
+    const pad = channelPadNote(sp.decodedChannels, sp.outputChannels);
+    if (pad) headline = `${headline}. ${pad}`;
+    return headline;
+  }
+  if (sp.resampledFrom && sp.resampledTo) {
+    return `Resampled ${formatRate(sp.resampledFrom)} → ${formatRate(sp.resampledTo)}`;
+  }
+  if (sp.formatFallbackFrom && sp.formatFallbackTo) {
+    return `DAC refused ${sp.formatFallbackFrom} — fell back to ${sp.formatFallbackTo}`;
+  }
+  if (lossyFormatChange) {
+    return `Bit-depth reduced ${displayFormat(sp.decodedFormat)} → ${displayFormat(sp.outputFormat)}`;
+  }
+  if (normAltered && userVolAltered) {
+    return "Samples scaled by volume slider and ReplayGain";
+  }
+  if (normAltered) {
+    return `ReplayGain applied · ${gainFactorToDb(normFactor)}`;
+  }
+  if (userVolAltered) {
+    return `Volume slider scaling samples · ${amplitudeToSliderPercent(userVol)}%`;
+  }
+  if (sp.osMixer && !isDirectAlsa) {
+    return `Routed through ${sp.osMixer.server}`;
+  }
+  if (!sp.bitPerfect) {
+    return "Bit-perfect mode off — pipeline at unity, not guaranteed";
+  }
+  return "Pipeline pass-through";
 }
