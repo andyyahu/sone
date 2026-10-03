@@ -69,4 +69,13 @@ describe("UserMenu avatar + profile navigation", () => {
     renderMenu(null);
     expect(screen.queryByRole("button", { name: "Profile" })).toBeNull();
   });
+
+  it("keeps CamillaDSP and HQPlayer and drops integer upsampling", () => {
+    renderMenu(null);
+    expect(screen.queryByText("Integer upsampling")).toBeNull();
+    expect(document.body.textContent ?? "").not.toContain("Integer upsampling");
+    expect(screen.getByText("CamillaDSP FIR")).not.toBeNull();
+    expect(screen.getByText("HQPlayer")).not.toBeNull();
+    expect(screen.queryByText("Noise shaping")).toBeNull();
+  });
 });

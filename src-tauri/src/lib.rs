@@ -1,5 +1,7 @@
 mod audio;
 pub mod cache;
+#[cfg(target_os = "linux")]
+mod camilla_fir;
 mod commands;
 mod crypto;
 mod discord;
@@ -8,24 +10,26 @@ mod embedded_config;
 mod embedded_lastfm;
 mod embedded_librefm;
 mod error;
+mod hqplayer;
+mod http_util;
 mod idle_inhibit;
 pub mod logging;
+pub mod mcp;
 #[cfg(target_os = "linux")]
 mod mpris;
+pub mod overlay;
+pub(crate) mod pcm_dsp;
+mod pipeline_probe;
+pub mod proxy;
+mod proxy_http;
 mod rate_gate;
 mod scrobble;
 mod signal_path;
-mod pipeline_probe;
 mod theme_config;
-#[cfg(target_os = "linux")]
-mod tray;
 mod tidal_api;
 mod tidal_report;
-pub mod mcp;
-pub mod overlay;
-mod http_util;
-pub mod proxy;
-mod proxy_http;
+#[cfg(target_os = "linux")]
+mod tray;
 
 pub use error::SoneError;
 pub use signal_path::{SignalPath, SignalPathTracker};
@@ -36,7 +40,7 @@ use crypto::Crypto;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Listener, Manager};
@@ -46,14 +50,33 @@ use tidal_api::{AuthTokens, TidalClient};
 use tokio::sync::Mutex;
 
 mod defaults {
-    pub fn yes() -> bool { true }
-    pub fn volume() -> f32 { 1.0 }
-    pub fn mcp_enabled() -> bool { false }
-    pub fn mcp_port() -> u16 { 5577 }
-    pub fn overlay_enabled() -> bool { false }
-    pub fn overlay_port() -> u16 { 5578 }
-    pub fn overlay_host() -> String { "127.0.0.1".to_string() }
-    pub fn max_quality() -> String { "HI_RES_LOSSLESS".to_string() }
+    pub fn yes() -> bool {
+        true
+    }
+    pub fn volume() -> f32 {
+        1.0
+    }
+    pub fn mcp_enabled() -> bool {
+        false
+    }
+    pub fn mcp_port() -> u16 {
+        5577
+    }
+    pub fn overlay_enabled() -> bool {
+        false
+    }
+    pub fn overlay_port() -> u16 {
+        5578
+    }
+    pub fn overlay_host() -> String {
+        "127.0.0.1".to_string()
+    }
+    pub fn max_quality() -> String {
+        "HI_RES_LOSSLESS".to_string()
+    }
+    pub fn hqplayer_port() -> u16 {
+        4321
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -152,8 +175,23 @@ pub struct Settings {
     pub exclusive_device: Option<String>,
     #[serde(default)]
     pub bit_perfect: bool,
+    /// Convolve exclusive PCM with a CamillaDSP config. Idle while exclusive
+    /// output is off: the gapless path never hands PCM to this process.
+    #[serde(default)]
+    pub camilla_fir: bool,
+    /// Last chosen CamillaDSP YAML. Kept when the switch is turned off.
+    #[serde(default)]
+    pub camilla_config: Option<String>,
     #[serde(default = "defaults::yes")]
     pub gapless: bool,
+    /// Hand the next track to HQPlayer Desktop. SONE decodes; Desktop owns
+    /// the filters, the noise shaper, and the DAC.
+    #[serde(default)]
+    pub hqplayer: bool,
+    #[serde(default = "defaults::overlay_host")]
+    pub hqplayer_host: String,
+    #[serde(default = "defaults::hqplayer_port")]
+    pub hqplayer_port: u16,
     #[serde(default = "defaults::max_quality")]
     pub max_quality: String,
     #[serde(default)]
@@ -204,7 +242,12 @@ impl Default for Settings {
             exclusive_mode: false,
             exclusive_device: None,
             bit_perfect: false,
+            camilla_fir: false,
+            camilla_config: None,
             gapless: true,
+            hqplayer: false,
+            hqplayer_host: "127.0.0.1".to_string(),
+            hqplayer_port: defaults::hqplayer_port(),
             max_quality: "HI_RES_LOSSLESS".to_string(),
             scrobble: Default::default(),
             proxy: Default::default(),
@@ -247,7 +290,12 @@ pub struct AppState {
     pub volume_normalization: AtomicBool,
     pub exclusive_mode: AtomicBool,
     pub bit_perfect: AtomicBool,
+    pub camilla_fir: AtomicBool,
+    pub camilla_config: std::sync::Mutex<Option<String>>,
     pub gapless: AtomicBool,
+    pub hqplayer: AtomicBool,
+    pub hqplayer_host: std::sync::Mutex<String>,
+    pub hqplayer_port: AtomicU16,
     pub max_quality: std::sync::Mutex<String>,
     pub exclusive_device: std::sync::Mutex<Option<String>>,
     pub cached_audio_devices: std::sync::Mutex<Option<Vec<AudioDevice>>>,
@@ -352,9 +400,7 @@ impl AppState {
                 if let Ok(json) = serde_json::to_string_pretty(s) {
                     if let Ok(encrypted) = crypto.encrypt(json.as_bytes()) {
                         if let Err(e) = fs::write(&settings_path, encrypted) {
-                            log::warn!(
-                                "[migration] failed to persist titlebar_migration_v1: {e}"
-                            );
+                            log::warn!("[migration] failed to persist titlebar_migration_v1: {e}");
                         }
                     }
                 }
@@ -409,7 +455,20 @@ impl AppState {
             .unwrap_or(false);
         let exclusive_mode = saved.as_ref().map(|s| s.exclusive_mode).unwrap_or(false);
         let bit_perfect = saved.as_ref().map(|s| s.bit_perfect).unwrap_or(false);
+        let camilla_fir = saved.as_ref().map(|s| s.camilla_fir).unwrap_or(false);
+        let camilla_config = saved.as_ref().and_then(|s| s.camilla_config.clone());
         let gapless = saved.as_ref().map(|s| s.gapless).unwrap_or(true);
+        let hqplayer = saved.as_ref().map(|s| s.hqplayer).unwrap_or(false);
+        let hqplayer_host = saved
+            .as_ref()
+            .map(|s| s.hqplayer_host.clone())
+            .filter(|host| !host.trim().is_empty())
+            .unwrap_or_else(defaults::overlay_host);
+        let hqplayer_port = saved
+            .as_ref()
+            .map(|s| s.hqplayer_port)
+            .filter(|port| *port != 0)
+            .unwrap_or_else(defaults::hqplayer_port);
         let exclusive_device = saved.as_ref().and_then(|s| s.exclusive_device.clone());
         let max_quality = saved
             .as_ref()
@@ -443,7 +502,8 @@ impl AppState {
         // Settings that do not form a plan block egress rather than falling back
         // to Direct: "we could not read your proxy" must not become "so we went
         // around it". The user fixes it in settings, which needs no network.
-        let proxied_http = crate::proxy_http::ProxiedHttp::from_settings(&proxy_settings, &host_caps);
+        let proxied_http =
+            crate::proxy_http::ProxiedHttp::from_settings(&proxy_settings, &host_caps);
 
         let scrobble_manager = scrobble::ScrobbleManager::new(
             app_handle.clone(),
@@ -512,7 +572,12 @@ impl AppState {
             volume_normalization: AtomicBool::new(volume_normalization),
             exclusive_mode: AtomicBool::new(exclusive_mode),
             bit_perfect: AtomicBool::new(bit_perfect),
+            camilla_fir: AtomicBool::new(camilla_fir),
+            camilla_config: std::sync::Mutex::new(camilla_config),
             gapless: AtomicBool::new(gapless),
+            hqplayer: AtomicBool::new(hqplayer),
+            hqplayer_host: std::sync::Mutex::new(hqplayer_host),
+            hqplayer_port: AtomicU16::new(hqplayer_port),
             max_quality: std::sync::Mutex::new(max_quality),
             exclusive_device: std::sync::Mutex::new(exclusive_device),
             cached_audio_devices: std::sync::Mutex::new(None),
@@ -626,14 +691,10 @@ pub fn run() {
     // calls from setup hooks are captured. Reads only the logging toggle
     // sidecar file — Settings struct is encrypted and loaded later via
     // AppState.
-    let sone_dir =
-        config_dir_for_env().unwrap_or_else(|| std::path::PathBuf::from("./.sone"));
+    let sone_dir = config_dir_for_env().unwrap_or_else(|| std::path::PathBuf::from("./.sone"));
     let logging_toggle_path = sone_dir.join("logging.toggle");
     let logging_enabled = crate::logging::read_logging_preference(&logging_toggle_path);
-    let _logger_handle = crate::logging::init_logging(
-        sone_dir.join("logs"),
-        logging_enabled,
-    );
+    let _logger_handle = crate::logging::init_logging(sone_dir.join("logs"), logging_enabled);
     // Bind to a named local (not `let _ = ...`) so the handle lives until
     // the end of `run()`. flexi_logger flushes the log file on drop, so
     // the handle must outlive the Tauri event loop.
@@ -701,9 +762,27 @@ pub fn run() {
                 if bp {
                     state.audio_player.set_bit_perfect(true).ok();
                 }
+                if state.camilla_fir.load(std::sync::atomic::Ordering::Relaxed) {
+                    let path = state.camilla_config.lock().unwrap().clone();
+                    if path.is_some() {
+                        state.audio_player.set_camilla_fir(path).ok();
+                    }
+                }
                 let _ = state
                     .audio_player
                     .set_gapless(state.gapless.load(std::sync::atomic::Ordering::Relaxed));
+                if state.hqplayer.load(std::sync::atomic::Ordering::Relaxed) {
+                    let host = state.hqplayer_host.lock().unwrap().clone();
+                    let port = state
+                        .hqplayer_port
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    // Startup only remembers the mode. Probing here would block
+                    // launch on a Desktop that is not running yet.
+                    state
+                        .audio_player
+                        .set_hqplayer(true, host, port, false)
+                        .ok();
+                }
             }
 
             // Pre-warm audio device cache in background (GStreamer probe is slow)
@@ -858,13 +937,19 @@ pub fn run() {
                         .with_webview(|webview| {
                             let wv = webview.inner();
                             if let Some(settings) = wv.settings() {
-                                // Use OnDemand (default) — Always can cause severe lag
-                                // on dual-GPU systems (NVIDIA + iGPU) with WebKitGTK
+                                // Preserve our requested policy, then read back the
+                                // effective one: WebKit can normalize it to Always
+                                // or Never depending on capabilities/environment.
                                 settings.set_hardware_acceleration_policy(
                                     webkit2gtk::HardwareAccelerationPolicy::OnDemand,
                                 );
                                 settings.set_enable_webgl(true);
                                 settings.set_enable_smooth_scrolling(true);
+                                eprintln!(
+                                    "[sone] WebKit effective hardware-acceleration-policy={:?} smooth-scrolling={}",
+                                    settings.hardware_acceleration_policy(),
+                                    settings.enables_smooth_scrolling(),
+                                );
                             }
                         })
                         .ok();
@@ -1127,6 +1212,11 @@ pub fn run() {
             commands::utility::set_exclusive_mode,
             commands::utility::get_bit_perfect,
             commands::utility::set_bit_perfect,
+            commands::utility::get_camilla_fir,
+            commands::utility::set_camilla_fir,
+            commands::utility::pick_camilla_config,
+            commands::utility::get_hqplayer,
+            commands::utility::set_hqplayer,
             commands::utility::get_gapless,
             commands::utility::get_gapless_supported,
             commands::utility::set_gapless,
@@ -1191,5 +1281,42 @@ mod settings_tests {
         assert!(Settings::default().report_plays);
         let upgraded: Settings = serde_json::from_str("{}").unwrap();
         assert!(upgraded.report_plays);
+    }
+
+    #[test]
+    fn camilla_fir_defaults_off() {
+        assert!(!Settings::default().camilla_fir);
+        assert!(Settings::default().camilla_config.is_none());
+        let upgraded: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!upgraded.camilla_fir);
+        assert!(upgraded.camilla_config.is_none());
+    }
+
+    #[test]
+    fn old_dsp_keys_do_not_enable_conversion() {
+        let loaded: Settings = serde_json::from_str(
+            r#"{"integer_upsample":true,"upsample_ratio":8,"upsample_rate_limit":768000,"noise_shaper":5,"noiseShaper":4}"#,
+        )
+        .unwrap();
+        let again = serde_json::to_string(&loaded).unwrap();
+        assert!(!again.contains("integer_upsample"));
+        assert!(!again.contains("upsample_ratio"));
+        assert!(!again.contains("upsample_rate_limit"));
+        assert!(!again.contains("noise_shaper"));
+        assert!(!again.contains("noiseShaper"));
+        assert_eq!(crate::pcm_dsp::select_output_rate(44_100), 44_100);
+        assert_eq!(crate::pcm_dsp::select_output_rate(48_000), 48_000);
+    }
+
+    #[test]
+    fn hqplayer_defaults_off() {
+        let settings = Settings::default();
+        assert!(!settings.hqplayer);
+        assert_eq!(settings.hqplayer_host, "127.0.0.1");
+        assert_eq!(settings.hqplayer_port, 4321);
+        let upgraded: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!upgraded.hqplayer);
+        assert_eq!(upgraded.hqplayer_host, "127.0.0.1");
+        assert_eq!(upgraded.hqplayer_port, 4321);
     }
 }

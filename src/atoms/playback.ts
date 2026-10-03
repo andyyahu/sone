@@ -49,6 +49,8 @@ export interface SignalPath {
   formatFallbackTo: string | null;
   dac: DacHwParams | null;
   osMixer: OsMixerInfo | null;
+  /** True while CamillaDSP is convolving the exclusive output. */
+  camillaFir: boolean;
 }
 
 export const signalPathAtom = atom<SignalPath | null>(null);
@@ -78,9 +80,15 @@ export const allowExplicitAtom = atomWithStorage("sone.allowExplicit.v1", true);
 
 export const exclusiveModeAtom = atom(false);
 export const bitPerfectAtom = atom(false);
+/** CamillaDSP FIR switch. Backend-authoritative; idle until exclusive output is on. */
+export const camillaFirAtom = atom(false);
+/** Last chosen CamillaDSP YAML. Kept when the switch is off. */
+export const camillaConfigAtom = atom<string | null>(null);
 
-/** Gapless playback kill-switch (Normal mode only). Default ON. */
+/** Gapless playback kill-switch. Default ON. HQPlayer uses it for the next WAV. */
 export const gaplessAtom = atom(true);
+/** Hand the next track to a running HQPlayer Desktop. Built-in DSP stays idle. */
+export const hqplayerAtom = atom(false);
 /** Max streaming-quality ceiling: "HI_RES_LOSSLESS" | "LOSSLESS" | "HIGH". Backend-authoritative. */
 export const maxQualityAtom = atom("HI_RES_LOSSLESS");
 export const exclusiveDeviceAtom = atom<string | null>(null);

@@ -46,7 +46,10 @@ import {
   preMuteVolumeAtom,
   exclusiveModeAtom,
   bitPerfectAtom,
+  camillaFirAtom,
+  camillaConfigAtom,
   gaplessAtom,
+  hqplayerAtom,
   maxQualityAtom,
   exclusiveDeviceAtom,
   volumeNormalizationAtom,
@@ -265,6 +268,17 @@ export function AppInitializer() {
           .catch(() => {});
         invoke<boolean>("get_bit_perfect")
           .then((v) => store.set(bitPerfectAtom, v))
+          .catch(() => {});
+        invoke<{ enabled: boolean; configPath: string | null }>(
+          "get_camilla_fir",
+        )
+          .then((v) => {
+            store.set(camillaFirAtom, v.enabled);
+            store.set(camillaConfigAtom, v.configPath);
+          })
+          .catch(() => {});
+        invoke<{ enabled: boolean; host: string; port: number }>("get_hqplayer")
+          .then((v) => store.set(hqplayerAtom, v.enabled))
           .catch(() => {});
         invoke<boolean>("get_gapless")
           .then((v) => store.set(gaplessAtom, v))
@@ -723,18 +737,37 @@ export function AppInitializer() {
     };
   }, [store, showToast]);
 
+  // FIR bypass keeps playback going. Unlike audio-error, this must not
+  // clear isPlaying — the writer has already fallen back to direct PCM.
+  useEffect(() => {
+    const unlisten = listen<{ message?: string }>(
+      "camilla-fir-status",
+      (event) => {
+        const message = event.payload.message?.trim();
+        showToast(
+          message
+            ? `CamillaDSP FIR bypassed: ${message}`
+            : "CamillaDSP FIR bypassed",
+          "error",
+        );
+      },
+    );
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [showToast]);
+
   // ================================================================
-  //  RESAMPLING NOTIFICATION — toast when exclusive mode resamples
+  //  RATE REFUSAL — exclusive mode does not resample
   // ================================================================
   useEffect(() => {
     const unlisten = listen<{ from: number; to: number }>(
       "audio-resampled",
       (event) => {
-        const { from, to } = event.payload;
+        const { from } = event.payload;
         const fromKhz = from >= 1000 ? `${from / 1000}kHz` : `${from}Hz`;
-        const toKhz = to >= 1000 ? `${to / 1000}kHz` : `${to}Hz`;
         showToast(
-          `DAC doesn't support ${fromKhz} — resampling to ${toKhz}`,
+          `DAC doesn't support ${fromKhz}. SONE will not resample.`,
           "info",
         );
       },

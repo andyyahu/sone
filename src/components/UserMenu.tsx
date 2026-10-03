@@ -7,10 +7,12 @@ import {
   ChevronDown,
   Settings,
   Info,
+  AudioWaveform,
+  Cpu,
 } from "lucide-react";
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useAtom, useAtomValue } from "jotai";
+import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { useAuth } from "../hooks/useAuth";
 import { useNavigation } from "../hooks/useNavigation";
 import { usePlaybackActions } from "../hooks/usePlaybackActions";
@@ -20,7 +22,12 @@ import {
   exclusiveModeAtom,
   bitPerfectAtom,
   exclusiveDeviceAtom,
+  camillaFirAtom,
+  camillaConfigAtom,
+  hqplayerAtom,
+  isPlayingAtom,
 } from "../atoms/playback";
+import { safeErrorMessage } from "../lib/errorUtils";
 import { currentUserAvatarAtom } from "../atoms/auth";
 import { useToast } from "../contexts/ToastContext";
 import {
@@ -40,6 +47,11 @@ import { OPEN_SETTINGS_EVENT } from "./ProxyNoticeBanner";
 import AboutModal from "./AboutModal";
 import Toggle from "./Toggle";
 import TidalImage from "./TidalImage";
+
+function camillaFileName(path: string): string {
+  const cut = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return cut >= 0 ? path.slice(cut + 1) : path;
+}
 
 export default function UserMenu() {
   const { userName, logout } = useAuth();
@@ -78,6 +90,13 @@ export default function UserMenu() {
     return () => window.removeEventListener(OPEN_SETTINGS_EVENT, onOpen);
   }, []);
   const [deviceDropdownOpen, setDeviceDropdownOpen] = useState(false);
+  const [camillaFir, setCamillaFir] = useAtom(camillaFirAtom);
+  const [camillaConfig, setCamillaConfig] = useAtom(camillaConfigAtom);
+  const [camillaError, setCamillaError] = useState<string | null>(null);
+  const camillaBusy = useRef(false);
+  const [hqplayer, setHqplayer] = useAtom(hqplayerAtom);
+  const setIsPlaying = useSetAtom(isPlayingAtom);
+  const hqBusy = useRef(false);
   const { showToast } = useToast();
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -147,6 +166,100 @@ export default function UserMenu() {
         .catch(() => {});
     }
   }, [exclusiveMode]);
+
+  const applyCamilla = async (enabled: boolean, configPath: string | null) => {
+    try {
+      const saved = await invoke<{
+        enabled: boolean;
+        configPath: string | null;
+      }>("set_camilla_fir", { enabled, configPath });
+      setCamillaFir(saved.enabled);
+      setCamillaConfig(saved.configPath);
+      setCamillaError(null);
+      return true;
+    } catch (err) {
+      const message = safeErrorMessage(err, "CamillaDSP config was rejected");
+      if (camillaFir) setCamillaError(message);
+      showToast(message, "error");
+      return false;
+    }
+  };
+
+  const onToggleCamilla = async () => {
+    if (camillaBusy.current) return;
+    camillaBusy.current = true;
+    try {
+      if (camillaFir) {
+        const ok = await applyCamilla(false, null);
+        if (ok) showToast("CamillaDSP FIR off — takes effect next track");
+        return;
+      }
+      let configPath: string | null = null;
+      if (!camillaConfig) {
+        try {
+          configPath = await invoke<string | null>("pick_camilla_config");
+        } catch (err) {
+          showToast(
+            safeErrorMessage(err, "Could not open the config chooser"),
+            "error",
+          );
+          return;
+        }
+        if (!configPath) return;
+      }
+      const ok = await applyCamilla(true, configPath);
+      if (ok) showToast("CamillaDSP FIR on — takes effect next track");
+    } finally {
+      camillaBusy.current = false;
+    }
+  };
+
+  const onChooseCamillaConfig = async () => {
+    if (camillaBusy.current) return;
+    camillaBusy.current = true;
+    try {
+      const picked = await invoke<string | null>("pick_camilla_config");
+      if (!picked) return;
+      const ok = await applyCamilla(true, picked);
+      if (ok) {
+        showToast("CamillaDSP config saved — takes effect next track");
+      }
+    } catch (err) {
+      showToast(
+        safeErrorMessage(err, "Could not open the config chooser"),
+        "error",
+      );
+    } finally {
+      camillaBusy.current = false;
+    }
+  };
+
+  const onToggleHqPlayer = async () => {
+    if (hqBusy.current) return;
+    const next = !hqplayer;
+    const previous = hqplayer;
+    hqBusy.current = true;
+    setHqplayer(next);
+    try {
+      const saved = await invoke<{ released: boolean }>("set_hqplayer", {
+        enabled: next,
+      });
+      if (saved.released) setIsPlaying(false);
+      const toast = !next
+        ? "HQPlayer off — takes effect next track"
+        : saved.released
+          ? "HQPlayer on — the DAC is free. Press play once Desktop is up."
+          : "HQPlayer on — takes effect next track";
+      showToast(toast);
+    } catch (err) {
+      setHqplayer(previous);
+      // The exclusive pipeline is already gone by the time the probe fails.
+      if (next && (exclusiveMode || bitPerfect)) setIsPlaying(false);
+      showToast(safeErrorMessage(err, "Could not reach HQPlayer"), "error");
+    } finally {
+      hqBusy.current = false;
+    }
+  };
 
   // Close on click outside
   useEffect(() => {
@@ -256,7 +369,9 @@ export default function UserMenu() {
             <div className="px-4 py-1 relative">
               <div className="ml-7">
                 <button
-                  onClick={() => setDeviceDropdownOpen((p) => !p)}
+                  onClick={() => {
+                    setDeviceDropdownOpen((p) => !p);
+                  }}
                   className="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-md bg-th-inset border border-th-border-subtle text-[12px] text-th-text-secondary hover:border-th-accent/50 transition-colors"
                 >
                   <span className="truncate">
@@ -313,6 +428,70 @@ export default function UserMenu() {
               <span className="flex-1 text-left">Bit-perfect</span>
               <Toggle on={bitPerfect} />
             </button>
+          )}
+
+          <button
+            onClick={() => {
+              void onToggleHqPlayer();
+            }}
+            className={menuItemClass}
+          >
+            <Cpu size={16} />
+            <span className="flex-1 text-left">HQPlayer</span>
+            <Toggle on={hqplayer} />
+          </button>
+          {hqplayer && (
+            <div className="px-4 py-1">
+              <p className="ml-7 text-[11px] leading-snug text-th-text-faint">
+                The next track is handed to HQPlayer Desktop at 127.0.0.1:4321.
+                SONE releases the DAC. CamillaDSP stays idle. Start Desktop and
+                close its settings dialog first. Volume stays HQPlayer&apos;s.
+              </p>
+            </div>
+          )}
+
+          <button
+            onClick={() => {
+              void onToggleCamilla();
+            }}
+            className={menuItemClass}
+          >
+            <AudioWaveform size={16} />
+            <span className="flex-1 text-left">CamillaDSP FIR</span>
+            <Toggle on={camillaFir} />
+          </button>
+
+          {camillaFir && (
+            <div className="px-4 py-1">
+              <div className="ml-7 flex flex-col gap-1">
+                <button
+                  onClick={() => {
+                    void onChooseCamillaConfig();
+                  }}
+                  className="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-md bg-th-inset border border-th-border-subtle text-[12px] text-th-text-secondary hover:border-th-accent/50 transition-colors"
+                >
+                  <span className="truncate">Choose config</span>
+                </button>
+                <span
+                  className="truncate text-[11px] text-th-text-muted"
+                  title={camillaConfig ?? undefined}
+                >
+                  {camillaConfig
+                    ? camillaFileName(camillaConfig)
+                    : "No config selected"}
+                </span>
+                <p className="text-[11px] leading-snug text-th-text-faint">
+                  {exclusiveMode
+                    ? "Filtered PCM occupies the exclusive device"
+                    : "Applies when exclusive output is on. Until then, playback stays on the system output."}
+                </p>
+                {camillaError && (
+                  <p className="text-[11px] text-red-400 break-words">
+                    {camillaError}
+                  </p>
+                )}
+              </div>
+            </div>
           )}
 
           {/* ── Settings ── */}
@@ -395,7 +574,7 @@ export default function UserMenu() {
           <div
             className="bg-th-elevated rounded-xl shadow-2xl w-[460px] max-h-[80vh] flex flex-col overflow-hidden"
             onClick={(e) => e.stopPropagation()}
-            style={{ animation: "slideUp 0.2s ease-out" }}
+            style={{ animation: "slideUp 0.2s var(--ease-settle)" }}
           >
             <div className="flex items-center justify-between px-5 pt-5 pb-3">
               <h2 className="text-[16px] font-bold text-th-text-primary">

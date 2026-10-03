@@ -233,6 +233,214 @@ pub fn set_bit_perfect(state: State<'_, AppState>, enabled: bool) -> Result<(), 
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CamillaFirSettings {
+    enabled: bool,
+    config_path: Option<String>,
+}
+
+#[tauri::command]
+pub fn get_camilla_fir(state: State<'_, AppState>) -> CamillaFirSettings {
+    CamillaFirSettings {
+        enabled: state.camilla_fir.load(Ordering::Relaxed),
+        config_path: state.camilla_config.lock().unwrap().clone(),
+    }
+}
+
+#[tauri::command]
+pub fn set_camilla_fir(
+    state: State<'_, AppState>,
+    enabled: bool,
+    config_path: Option<String>,
+) -> Result<CamillaFirSettings, SoneError> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (&state, enabled, config_path);
+        return Err(SoneError::Audio("CamillaDSP FIR requires Linux".into()));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let incoming = config_path.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+        let saved = state.camilla_config.lock().unwrap().clone();
+        let resolved = incoming.clone().or(saved);
+
+        if enabled {
+            if let Some(path) = resolved.as_deref() {
+                crate::camilla_fir::validate_config_file(path).map_err(SoneError::Audio)?;
+            }
+        }
+
+        let armed = if enabled { resolved } else { None };
+        state
+            .audio_player
+            .set_camilla_fir(armed)
+            .map_err(SoneError::Audio)?;
+
+        state.camilla_fir.store(enabled, Ordering::Relaxed);
+        if let Some(path) = incoming {
+            *state.camilla_config.lock().unwrap() = Some(path);
+        }
+        let stored = state.camilla_config.lock().unwrap().clone();
+
+        let mut settings = state.load_settings().unwrap_or_default();
+        settings.camilla_fir = enabled;
+        settings.camilla_config = stored.clone();
+        state.save_settings(&settings)?;
+
+        Ok(CamillaFirSettings {
+            enabled,
+            config_path: stored,
+        })
+    }
+}
+
+/// The chooser blocks in a nested GTK loop on the main thread. This command
+/// waits on the blocking pool, with no timeout: a file dialog can stay open
+/// for minutes.
+#[tauri::command]
+pub async fn pick_camilla_config(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = app;
+        return Err("CamillaDSP FIR requires Linux".into());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        tauri::async_runtime::spawn_blocking(move || choose_camilla_config(&app))
+            .await
+            .map_err(|err| err.to_string())?
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn choose_camilla_config(app: &tauri::AppHandle) -> Result<Option<String>, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.run_on_main_thread(move || {
+        let _ = tx.send(open_camilla_yaml_dialog());
+    })
+    .map_err(|err| err.to_string())?;
+    rx.recv()
+        .map_err(|_| "CamillaDSP config chooser closed before a path was chosen".to_string())?
+}
+
+#[cfg(target_os = "linux")]
+fn open_camilla_yaml_dialog() -> Result<Option<String>, String> {
+    use gtk::prelude::*;
+
+    let dialog = gtk::FileChooserDialog::builder()
+        .title("Choose CamillaDSP config")
+        .action(gtk::FileChooserAction::Open)
+        .modal(true)
+        .build();
+    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+    dialog.add_button("Open", gtk::ResponseType::Accept);
+
+    let yaml = gtk::FileFilter::new();
+    yaml.set_name(Some("YAML"));
+    yaml.add_pattern("*.yml");
+    yaml.add_pattern("*.yaml");
+    dialog.add_filter(yaml);
+
+    let all = gtk::FileFilter::new();
+    all.set_name(Some("All files"));
+    all.add_pattern("*");
+    dialog.add_filter(all);
+
+    let accepted = dialog.run() == gtk::ResponseType::Accept;
+    let chosen = if accepted { dialog.filename() } else { None };
+    dialog.close();
+
+    let Some(path) = chosen else {
+        return Ok(None);
+    };
+    path.into_os_string()
+        .into_string()
+        .map(Some)
+        .map_err(|_| "config path is not valid UTF-8".to_string())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HqPlayerSettings {
+    enabled: bool,
+    host: String,
+    port: u16,
+    /// True when enabling the mode stopped a pipeline that was holding the DAC.
+    released: bool,
+}
+
+fn hqplayer_view(state: &AppState, released: bool) -> HqPlayerSettings {
+    let host = state.hqplayer_host.lock().unwrap().clone();
+    HqPlayerSettings {
+        enabled: state.hqplayer.load(Ordering::Relaxed),
+        host: if host.trim().is_empty() {
+            "127.0.0.1".to_string()
+        } else {
+            host
+        },
+        port: {
+            let port = state.hqplayer_port.load(Ordering::Relaxed);
+            if port == 0 {
+                4321
+            } else {
+                port
+            }
+        },
+        released,
+    }
+}
+
+#[tauri::command]
+pub fn get_hqplayer(state: State<'_, AppState>) -> HqPlayerSettings {
+    hqplayer_view(&state, false)
+}
+
+/// Enabling releases the DAC immediately and checks that Desktop is accepting
+/// control. A failed check leaves the mode off and the device free.
+#[tauri::command]
+pub fn set_hqplayer(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<HqPlayerSettings, SoneError> {
+    let host = {
+        let mut saved_host = state.hqplayer_host.lock().unwrap();
+        if saved_host.trim().is_empty() {
+            *saved_host = "127.0.0.1".to_string();
+        }
+        saved_host.clone()
+    };
+    let port = {
+        let port = state.hqplayer_port.load(Ordering::Relaxed);
+        if port == 0 {
+            4321
+        } else {
+            port
+        }
+    };
+    let released = state
+        .audio_player
+        .set_hqplayer(enabled, host.clone(), port, enabled)
+        .map_err(SoneError::Audio)?;
+    state.hqplayer.store(enabled, Ordering::Relaxed);
+
+    let mut settings = state.load_settings().unwrap_or_default();
+    settings.hqplayer = enabled;
+    settings.hqplayer_host = host;
+    settings.hqplayer_port = port;
+    state.save_settings(&settings)?;
+    Ok(hqplayer_view(&state, released))
+}
+
 #[tauri::command]
 pub fn get_gapless(state: State<'_, AppState>) -> bool {
     state.gapless.load(Ordering::Relaxed)
