@@ -1,21 +1,21 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::{broadcast, Semaphore};
-use tokio_util::sync::CancellationToken;
+use axum::response::sse::{Event, KeepAlive};
 use axum::{
-    Router,
     extract::State,
     http::StatusCode,
     response::{Html, Response, Sse},
     routing::get,
+    Router,
 };
-use axum::response::sse::{Event, KeepAlive};
 use futures_util::stream::Stream;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::{broadcast, Semaphore};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
 
-use crate::error::SoneError;
 use super::state::OverlayStateRef;
+use crate::error::SoneError;
 
 const MAX_SSE_CONNECTIONS: usize = 16;
 
@@ -501,8 +501,7 @@ async fn serve_sse(
     // SSE bodies never end on their own — end them on shutdown so graceful
     // shutdown can drain the connection instead of hanging forever. The
     // permit rides in the closure so it is released when the stream drops.
-    let merged =
-        futures_util::StreamExt::take_until(merged, ctx.cancel.clone().cancelled_owned());
+    let merged = futures_util::StreamExt::take_until(merged, ctx.cancel.clone().cancelled_owned());
     let merged = futures_util::StreamExt::inspect(merged, move |_| {
         let _ = &permit;
     });
@@ -670,7 +669,9 @@ mod tests {
         let mut body = String::new();
         stream.read_to_string(&mut body).await.unwrap();
         assert!(
-            !body.to_ascii_lowercase().contains("access-control-allow-origin"),
+            !body
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
             "CORS header must be gone"
         );
         handle.shutdown().await;
