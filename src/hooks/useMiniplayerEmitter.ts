@@ -15,7 +15,7 @@ import { miniplayerOpenAtom } from "../atoms/ui";
 import { themeAtom } from "../atoms/theme";
 import { getInterpolatedPosition } from "../lib/playbackPosition";
 import { usePlaybackActions } from "./usePlaybackActions";
-import { useFavorites } from "./useFavorites";
+import { useFavoriteActions } from "./useFavorites";
 import { useDrawer } from "./useDrawer";
 import { useNavigation } from "./useNavigation";
 import { useToast } from "../contexts/ToastContext";
@@ -186,7 +186,7 @@ export function useMiniplayerEmitter() {
     seekTo,
     setVolume,
   } = usePlaybackActions();
-  const { addFavoriteTrack, removeFavoriteTrack } = useFavorites();
+  const { addFavoriteTrack, removeFavoriteTrack } = useFavoriteActions();
   const { openDrawerToTab } = useDrawer();
   const {
     navigateToArtist,

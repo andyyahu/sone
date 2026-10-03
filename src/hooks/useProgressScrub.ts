@@ -3,10 +3,13 @@ import { useAtomValue } from "jotai";
 import { currentTrackAtom, isPlayingAtom } from "../atoms/playback";
 import { usePlaybackActions } from "./usePlaybackActions";
 import { getInterpolatedPosition, notifySeek } from "../lib/playbackPosition";
+import { useDocumentVisible } from "./useDocumentVisible";
 
 interface UseProgressScrubOptions {
-  /** Ref to signal parent that a drag is in progress (for auto-hide) */
-  isDraggingRef?: React.MutableRefObject<boolean>;
+  /** False while this scrubber is covered or its controls are hidden. */
+  active?: boolean;
+  /** Notify the parent when dragging changes (for auto-hide). */
+  onDraggingChange?: (dragging: boolean) => void;
   /** Callback when drag ends (for resetting auto-hide timer) */
   onDragEnd?: () => void;
 }
@@ -15,9 +18,12 @@ export function useProgressScrub(options?: UseProgressScrubOptions) {
   const currentTrack = useAtomValue(currentTrackAtom);
   const isPlaying = useAtomValue(isPlayingAtom);
   const { seekTo } = usePlaybackActions();
+  const documentVisible = useDocumentVisible();
+  const active = (options?.active ?? true) && documentVisible;
+  const trackId = currentTrack?.id;
 
-  // Destructure options for stable deps (refs are stable, useCallback fns are stable)
-  const isDraggingRef = options?.isDraggingRef;
+  // Destructure options so callback dependencies remain stable.
+  const onDraggingChange = options?.onDraggingChange;
   const onDragEnd = options?.onDragEnd;
 
   const [currentTime, setCurrentTime] = useState(0);
@@ -28,21 +34,24 @@ export function useProgressScrub(options?: UseProgressScrubOptions) {
 
   // Sync progress with interpolated position (no IPC per tick)
   useEffect(() => {
-    if (!isPlaying || !currentTrack || isDragging) return;
+    if (!active || isDragging) return;
+    if (trackId === undefined) {
+      setCurrentTime(0);
+      return;
+    }
 
     const syncPosition = () => {
       setCurrentTime(getInterpolatedPosition());
     };
 
     syncPosition();
-    const interval = setInterval(syncPosition, 500);
-    return () => clearInterval(interval);
-  }, [isPlaying, currentTrack, isDragging]);
-
-  // Reset on track change
-  useEffect(() => {
-    setCurrentTime(0);
-  }, [currentTrack?.id]);
+    window.addEventListener("playback-seeked", syncPosition);
+    const interval = isPlaying ? setInterval(syncPosition, 500) : undefined;
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener("playback-seeked", syncPosition);
+    };
+  }, [active, isPlaying, trackId, isDragging]);
 
   const duration = currentTrack?.duration ?? 0;
   const rawTime = isDragging ? dragTime : currentTime;
@@ -81,7 +90,7 @@ export function useProgressScrub(options?: UseProgressScrubOptions) {
     (e: React.MouseEvent) => {
       if (!currentTrack) return;
       e.preventDefault();
-      if (isDraggingRef) isDraggingRef.current = true;
+      onDraggingChange?.(true);
       const startTime = getTimeFromClientX(e.clientX);
       setIsDragging(true);
       setDragTime(startTime);
@@ -96,7 +105,7 @@ export function useProgressScrub(options?: UseProgressScrubOptions) {
         const finalTime = getTimeFromClientX(ev.clientX);
         setCurrentTime(finalTime);
         setIsDragging(false);
-        if (isDraggingRef) isDraggingRef.current = false;
+        onDraggingChange?.(false);
         onDragEnd?.();
         notifySeek(finalTime);
         await seekTo(finalTime);
@@ -105,7 +114,7 @@ export function useProgressScrub(options?: UseProgressScrubOptions) {
       document.addEventListener("mousemove", onMove);
       document.addEventListener("mouseup", onUp);
     },
-    [currentTrack, getTimeFromClientX, seekTo, isDraggingRef, onDragEnd],
+    [currentTrack, getTimeFromClientX, seekTo, onDraggingChange, onDragEnd],
   );
 
   return {

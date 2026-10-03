@@ -16,6 +16,13 @@ pub struct Crypto {
 }
 
 impl Crypto {
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            cipher: Aes256Gcm::new_from_slice(&[0; 32]).unwrap(),
+        }
+    }
+
     /// Load or generate the master key and construct the cipher.
     ///
     /// Key sources (in order):

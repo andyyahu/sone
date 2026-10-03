@@ -15,6 +15,7 @@ import {
   useMemo,
   useState,
   useCallback,
+  useLayoutEffect,
   useRef,
   startTransition,
 } from "react";
@@ -33,6 +34,7 @@ import {
   getPlaylistDetails,
 } from "../api/tidal";
 import { getApiStatus, safeErrorMessage } from "../lib/errorUtils";
+import { headerActionClass } from "./headerChrome";
 import {
   getShareUrl,
   formatTotalDuration,
@@ -177,7 +179,7 @@ export default function PlaylistView({
   const { userPlaylists, addTrackToPlaylist, updatePlaylist } = usePlaylists();
   const { showToast } = useToast();
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     allTracksRef.current = allTracks;
   }, [allTracks]);
 
@@ -307,9 +309,10 @@ export default function PlaylistView({
           setError(safeErrorMessage(err, "Failed to load playlist"));
         }
       } finally {
-        if (generationRef.current !== gen) return;
-        setLoading(false);
-        setSortLoading(false);
+        if (generationRef.current === gen) {
+          setLoading(false);
+          setSortLoading(false);
+        }
       }
     };
 
@@ -451,19 +454,29 @@ export default function PlaylistView({
     [playlistId, setTrackSortPrefs],
   );
 
-  const playlistSource = (allTracks: Track[]) => ({
-    type: "playlist" as const,
-    id: playlistId,
-    name: effectiveInfo?.title || "Playlist",
-    image: effectiveInfo?.image,
-    allTracks,
-  });
+  const playlistSource = useCallback(
+    (allTracks: Track[]) => ({
+      type: "playlist" as const,
+      id: playlistId,
+      name: effectiveInfo?.title || "Playlist",
+      image: effectiveInfo?.image,
+      allTracks,
+    }),
+    [playlistId, effectiveInfo?.title, effectiveInfo?.image],
+  );
+
+  const handleTrackRemoved = useCallback((index: number) => {
+    setAllTracks((prev) => prev.filter((_, i) => i !== index));
+  }, []);
 
   const handlePlayTrack = useCallback(
     async (track: Track, _index: number) => {
       try {
-        await playFromSource(track, tracks, {
-          source: playlistSource(tracks),
+        // Appending a page must not change every existing row's play callback.
+        // Read the last committed collection when the user actually plays it.
+        const currentTracks = allTracksRef.current;
+        await playFromSource(track, currentTracks, {
+          source: playlistSource(currentTracks),
         });
 
         // Fire-and-forget: append remaining pages to queue as they arrive
@@ -474,7 +487,7 @@ export default function PlaylistView({
         console.error("Failed to play playlist track:", err);
       }
     },
-    [tracks, playlistSource, fetchRemaining, appendToQueue, playFromSource],
+    [playlistSource, fetchRemaining, appendToQueue, playFromSource],
   );
 
   const handlePlayRec = useCallback(
@@ -719,10 +732,7 @@ export default function PlaylistView({
                 sourceId={playlistId}
                 onPlay={handlePlayAll}
               />
-              <button
-                onClick={handleShuffle}
-                className="flex items-center gap-2 px-6 py-2.5 bg-th-button/40 backdrop-blur-md text-th-text-primary font-bold text-sm rounded-full hover:bg-th-button/60 hover:scale-[1.03] transition-[transform,filter,background-color] duration-150"
-              >
+              <button onClick={handleShuffle} className={headerActionClass}>
                 <Shuffle size={18} />
                 Shuffle
               </button>
@@ -857,9 +867,7 @@ export default function PlaylistView({
             sortDirection={sortDirection}
             onSort={handleSort}
             sortLoading={sortLoading}
-            onTrackRemoved={(index) => {
-              setAllTracks((prev) => prev.filter((_, i) => i !== index));
-            }}
+            onTrackRemoved={handleTrackRemoved}
             virtualize
           />
 
@@ -917,7 +925,7 @@ export default function PlaylistView({
           <div
             className="bg-th-elevated rounded-xl shadow-2xl max-w-[700px] w-[90%] max-h-[80vh] flex flex-col overflow-hidden"
             onClick={(e) => e.stopPropagation()}
-            style={{ animation: "slideUp 0.2s ease-out" }}
+            style={{ animation: "slideUp 0.2s var(--ease-settle)" }}
           >
             {/* Header: cover + title + close */}
             <div className="flex items-center gap-3 px-6 pt-5 pb-4">

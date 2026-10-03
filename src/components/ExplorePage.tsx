@@ -298,12 +298,12 @@ function ExploreSkeleton() {
     <div className="space-y-10">
       {[1, 2, 3].map((i) => (
         <div key={i}>
-          <div className="h-7 w-32 bg-th-surface-hover rounded animate-pulse mb-4" />
+          <div className="h-7 w-32 bg-th-surface-hover rounded mb-4" />
           <div className="flex gap-3">
             {Array.from({ length: 8 }).map((_, j) => (
               <div
                 key={j}
-                className="h-11 w-32 bg-th-surface-hover rounded-lg animate-pulse shrink-0"
+                className="h-11 w-32 bg-th-surface-hover rounded-lg shrink-0"
               />
             ))}
           </div>

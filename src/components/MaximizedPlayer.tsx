@@ -52,6 +52,9 @@ import {
 } from "../api/tidal";
 import { parseLrc, type LrcLine } from "../lib/lrc";
 import { themeAtom } from "../atoms/theme";
+import { currentVideoAtom, videoExpandedAtom } from "../atoms/video";
+import { useDocumentVisible } from "../hooks/useDocumentVisible";
+import { finishBakedBackdrop, maximizedWashStyle } from "./maximizedBackdrop";
 
 function useThemeContext() {
   const theme = useAtomValue(themeAtom);
@@ -132,8 +135,10 @@ function blurRGBA(
 
 const BlurredBackground = memo(function BlurredBackground({
   coverUrl,
+  isDark,
 }: {
   coverUrl: string | undefined;
+  isDark: boolean;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   useEffect(() => {
@@ -174,6 +179,7 @@ const BlurredBackground = memo(function BlurredBackground({
       try {
         const id = octx.getImageData(0, 0, W, H);
         blurRGBA(id.data, W, H, radius);
+        finishBakedBackdrop(id.data, isDark);
         octx.putImageData(id, 0, 0);
       } catch {
         return; // tainted/failed — keep the previous backdrop rather than black
@@ -189,7 +195,7 @@ const BlurredBackground = memo(function BlurredBackground({
     return () => {
       cancelled = true;
     };
-  }, [coverUrl]);
+  }, [coverUrl, isDark]);
   // A frozen bitmap — no live filter, so each per-frame paint is a cheap blit.
   return <canvas ref={canvasRef} className="w-full h-full object-cover" />;
 });
@@ -197,12 +203,20 @@ const BlurredBackground = memo(function BlurredBackground({
 // ─── MaxProgressScrubber ──────────────────────────────────────────────────
 
 const MaxProgressScrubber = memo(function MaxProgressScrubber({
+  active,
   isDraggingRef,
   resetHideTimer,
 }: {
+  active: boolean;
   isDraggingRef: React.MutableRefObject<boolean>;
   resetHideTimer: () => void;
 }) {
+  const onDraggingChange = useCallback(
+    (dragging: boolean) => {
+      isDraggingRef.current = dragging;
+    },
+    [isDraggingRef],
+  );
   const {
     progressRef,
     currentTrack,
@@ -213,7 +227,11 @@ const MaxProgressScrubber = memo(function MaxProgressScrubber({
     isHoveringProgress,
     setIsHoveringProgress,
     handleProgressMouseDown,
-  } = useProgressScrub({ isDraggingRef, onDragEnd: resetHideTimer });
+  } = useProgressScrub({
+    active,
+    onDraggingChange,
+    onDragEnd: resetHideTimer,
+  });
 
   return (
     <div className="w-full flex items-center gap-2 text-th-text-muted">
@@ -263,6 +281,7 @@ const MaxProgressScrubber = memo(function MaxProgressScrubber({
 // ─── MaxTransportBar ──────────────────────────────────────────────────────
 
 const MaxTransportBar = memo(function MaxTransportBar({
+  active,
   currentTrack,
   controlsVisible,
   isDraggingRef,
@@ -271,6 +290,7 @@ const MaxTransportBar = memo(function MaxTransportBar({
   isDark,
   bgBaseRgb,
 }: {
+  active: boolean;
   currentTrack: {
     title: string;
     artist?: { name?: string };
@@ -330,7 +350,7 @@ const MaxTransportBar = memo(function MaxTransportBar({
           <div className="flex items-center gap-4">
             <button
               onClick={toggleShuffle}
-              className={`w-8 h-8 flex items-center justify-center rounded-full transition-[color,background-color,transform] duration-200 active:scale-90 relative ${
+              className={`w-8 h-8 flex items-center justify-center rounded-full transition-[color,background-color,transform] duration-200 relative ${
                 isShuffle
                   ? "text-th-accent"
                   : "text-th-text-secondary hover:text-th-text-primary hover:bg-th-border-subtle"
@@ -343,13 +363,13 @@ const MaxTransportBar = memo(function MaxTransportBar({
             </button>
             <button
               onClick={playPrevious}
-              className="w-8 h-8 flex items-center justify-center rounded-full text-th-text-secondary hover:text-th-text-primary hover:bg-th-border-subtle transition-[color,background-color,transform] duration-150 active:scale-90"
+              className="w-8 h-8 flex items-center justify-center rounded-full text-th-text-secondary hover:text-th-text-primary hover:bg-th-border-subtle transition-[color,background-color,transform] duration-150"
             >
               <SkipBack size={20} fill="currentColor" />
             </button>
             <button
               onClick={() => (isPlaying ? pauseTrack() : resumeTrack())}
-              className="w-10 h-10 bg-th-text-primary rounded-full flex items-center justify-center hover:scale-105 active:scale-95 transition-transform duration-150"
+              className="w-10 h-10 bg-th-text-primary rounded-full flex items-center justify-center hover:scale-105 transition-transform duration-150"
             >
               {isPlaying ? (
                 <Pause size={19} fill="currentColor" className="text-th-base" />
@@ -363,13 +383,13 @@ const MaxTransportBar = memo(function MaxTransportBar({
             </button>
             <button
               onClick={() => playNext({ explicit: true })}
-              className="w-8 h-8 flex items-center justify-center rounded-full text-th-text-secondary hover:text-th-text-primary hover:bg-th-border-subtle transition-[color,background-color,transform] duration-150 active:scale-90"
+              className="w-8 h-8 flex items-center justify-center rounded-full text-th-text-secondary hover:text-th-text-primary hover:bg-th-border-subtle transition-[color,background-color,transform] duration-150"
             >
               <SkipForward size={20} fill="currentColor" />
             </button>
             <button
               onClick={() => setRepeatMode((repeatMode + 1) % 3)}
-              className={`w-8 h-8 flex items-center justify-center rounded-full transition-[color,background-color,transform] duration-200 active:scale-90 relative ${
+              className={`w-8 h-8 flex items-center justify-center rounded-full transition-[color,background-color,transform] duration-200 relative ${
                 repeatMode > 0
                   ? "text-th-accent"
                   : "text-th-text-secondary hover:text-th-text-primary hover:bg-th-border-subtle"
@@ -387,6 +407,7 @@ const MaxTransportBar = memo(function MaxTransportBar({
             </button>
           </div>
           <MaxProgressScrubber
+            active={active && controlsVisible}
             isDraggingRef={isDraggingRef}
             resetHideTimer={resetHideTimer}
           />
@@ -401,7 +422,7 @@ const MaxTransportBar = memo(function MaxTransportBar({
           />
           <button
             onClick={() => setShowLyrics((v) => !v)}
-            className={`relative transition-[color,transform] duration-150 active:scale-90 ${
+            className={`relative transition-[color,transform] duration-150 ${
               showLyrics
                 ? "text-th-accent"
                 : "text-th-text-faint hover:text-th-text-primary"
@@ -513,8 +534,10 @@ function useLyricsTier() {
 
 const MaximizedLyrics = memo(function MaximizedLyrics({
   tier,
+  active,
 }: {
   tier: Tier;
+  active: boolean;
 }) {
   const currentTrack = useAtomValue(currentTrackAtom);
   const isPlaying = useAtomValue(isPlayingAtom);
@@ -590,7 +613,7 @@ const MaximizedLyrics = memo(function MaximizedLyrics({
 
   // Sync active line — rAF loop with interpolated position, pure DOM updates
   useEffect(() => {
-    if (lrcLines.length === 0 || !isPlaying) return;
+    if (!active || lrcLines.length === 0 || !isPlaying) return;
 
     const applyLine = (idx: number) => {
       const prev = activeLineRef.current;
@@ -636,7 +659,7 @@ const MaximizedLyrics = memo(function MaximizedLyrics({
 
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [lrcLines, isPlaying, lh, baseCls]);
+  }, [active, lrcLines, isPlaying, lh, baseCls]);
 
   if (loading) {
     return (
@@ -723,6 +746,10 @@ const MaximizedLyrics = memo(function MaximizedLyrics({
 
 export default function MaximizedPlayer() {
   const currentTrack = useAtomValue(currentTrackAtom);
+  const currentVideo = useAtomValue(currentVideoAtom);
+  const videoExpanded = useAtomValue(videoExpandedAtom);
+  const documentVisible = useDocumentVisible();
+  const active = documentVisible && !(currentVideo && videoExpanded);
   const setMaximized = useSetAtom(maximizedPlayerAtom);
   const favoriteTrackIds = useAtomValue(favoriteTrackIdsAtom);
   const setFavoriteTrackIds = useSetAtom(favoriteTrackIdsAtom);
@@ -744,13 +771,17 @@ export default function MaximizedPlayer() {
     if (!coverKey) return;
     setHiResReady(false);
     let cancelled = false;
-    fetchCachedImageUrl(getTidalImageUrl(coverKey, 1280))
+    const controller = new AbortController();
+    fetchCachedImageUrl(getTidalImageUrl(coverKey, 1280), {
+      signal: controller.signal,
+    })
       .then(() => {
         if (!cancelled) setHiResReady(true);
       })
       .catch(() => {});
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, [coverKey]);
 
@@ -893,6 +924,8 @@ export default function MaximizedPlayer() {
 
   if (!currentTrack) return null;
 
+  const wash = maximizedWashStyle(isDark, bgBaseRgb);
+
   return (
     <div
       role="dialog"
@@ -903,14 +936,13 @@ export default function MaximizedPlayer() {
     >
       {/* Blurred album art background — pre-rendered to canvas once, zero per-frame cost */}
       <div className="absolute inset-0 overflow-hidden">
-        <BlurredBackground coverUrl={currentTrack.album?.cover} />
+        <BlurredBackground
+          coverUrl={currentTrack.album?.cover}
+          isDark={isDark}
+        />
         <div
-          className={`absolute inset-0 ${!isDark ? "backdrop-brightness-[1.6] backdrop-saturate-50" : ""}`}
-          style={{
-            backgroundColor: isDark
-              ? "rgba(0,0,0,0.6)"
-              : `rgba(${bgBaseRgb},0.45)`,
-          }}
+          className={wash.className}
+          style={{ backgroundColor: wash.backgroundColor }}
         />
       </div>
 
@@ -951,6 +983,7 @@ export default function MaximizedPlayer() {
           >
             {animatedCover ? (
               <TidalVideoCover
+                active={active}
                 cover={coverKey}
                 videoCover={currentTrack.album?.videoCover}
                 size={1280}
@@ -959,7 +992,7 @@ export default function MaximizedPlayer() {
                 className="aspect-square rounded-lg overflow-hidden"
               />
             ) : (
-              <TiltCover className="aspect-square rounded-lg">
+              <TiltCover active={active} className="aspect-square rounded-lg">
                 <TidalImage
                   src={getTidalImageUrl(coverKey, hiResReady ? 1280 : 160)}
                   alt={currentTrack.album?.title || currentTrack.title}
@@ -1000,7 +1033,7 @@ export default function MaximizedPlayer() {
           <div className="flex items-center gap-3">
             <button
               onClick={toggleLike}
-              className={`transition-[color,transform] duration-200 active:scale-90 ${
+              className={`transition-[color,transform] duration-200 ${
                 isLiked
                   ? "text-th-accent"
                   : `${isDark ? "text-th-text-faint" : "text-th-text-secondary"} hover:text-th-text-primary`
@@ -1025,7 +1058,7 @@ export default function MaximizedPlayer() {
         {/* Right: Lyrics panel (only when toggled on) */}
         {showLyrics && (
           <div className="flex-1 h-[80vmin] max-h-[1000px] pointer-events-none">
-            <MaximizedLyrics tier={lyricsTier} />
+            <MaximizedLyrics tier={lyricsTier} active={active} />
           </div>
         )}
       </div>
@@ -1042,6 +1075,7 @@ export default function MaximizedPlayer() {
 
       {/* Bottom bar — memo'd to isolate transport atom subscriptions */}
       <MaxTransportBar
+        active={active}
         currentTrack={currentTrack}
         controlsVisible={controlsVisible}
         isDraggingRef={isDraggingRef}

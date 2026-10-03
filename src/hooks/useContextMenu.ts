@@ -27,7 +27,11 @@ export function useContextMenu({
 }: UseContextMenuOptions) {
   const menuRef = useRef<HTMLDivElement>(null);
   const [isPositioned, setIsPositioned] = useState(false);
-  const [pos, setPos] = useState({ top: -9999, left: -9999 });
+  const [pos, setPos] = useState<{
+    top: number;
+    left: number;
+    origin: "top left" | "bottom left";
+  }>({ top: -9999, left: -9999, origin: "top left" });
 
   // Position the menu after first paint so we can measure its size.
   useEffect(() => {
@@ -75,7 +79,15 @@ export function useContextMenu({
       }
       if (top < pad) top = pad;
 
-      setPos({ top, left });
+      let origin: "top left" | "bottom left" = "top left";
+      if (cursorPosition) {
+        if (top < cursorPosition.y / zoom) origin = "bottom left";
+      } else if (anchorRef?.current) {
+        const anchorTop = anchorRef.current.getBoundingClientRect().top / zoom;
+        if (top < anchorTop) origin = "bottom left";
+      }
+
+      setPos({ top, left, origin });
       setIsPositioned(true);
     });
 
@@ -102,12 +114,19 @@ export function useContextMenu({
     };
   }, [onClose, anchorRef, ignoreRefs, suppressClose]);
 
+  const reduceMotion =
+    window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false;
+
   const style: CSSProperties = {
     position: "fixed",
     top: pos.top,
     left: pos.left,
     opacity: isPositioned ? 1 : 0,
-    animation: isPositioned ? "fadeIn 0.12s ease-out" : undefined,
+    transformOrigin: pos.origin,
+    animation:
+      isPositioned && !reduceMotion
+        ? "menuIn 160ms var(--ease-settle) both"
+        : undefined,
   };
 
   return { menuRef, style, isPositioned };

@@ -1,0 +1,59 @@
+/* Interaction curves.
+   The stock timing eases in, so a hover waits before it moves. Settle arrives
+   immediately and lands softly. Press is shorter than the release, which is
+   what makes a click feel like it answered. `scale` is separate from
+   `transform`, so a press does not cancel a hover translate. A full-width
+   control only scales a little; the pressed control is one layer for the
+   click, and playlist rows stay unscaled so scrolling does not grow a layer
+   per row. */
+@theme {
+  --ease-settle: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-press: cubic-bezier(0.3, 0, 0.15, 1);
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.45, 0, 0.15, 1);
+  --default-transition-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  button:not(:disabled) {
+    transition-property:
+      scale, transform, translate, background-color, color, border-color,
+      opacity, box-shadow, filter;
+    transition-duration: 180ms;
+    transition-timing-function: var(--ease-settle);
+  }
+
+  button:not(:disabled):active {
+    transition-duration: 80ms;
+    transition-timing-function: var(--ease-press);
+  }
+
+  button:not(:disabled):not(.w-full):active,
+  button:not(:disabled)[class*="scale"]:active {
+    scale: 0.96;
+  }
+
+  button.w-full:not(:disabled):not([class*="scale"]):active {
+    scale: 0.985;
+  }
+
+  /* Press is the short curve. Release falls back to the longer settle
+     already set on the element, which is what makes the click answer. */
+  .ease-settle:active {
+    transition-duration: 80ms;
+    transition-timing-function: var(--ease-press);
+  }
+}
+
+/* Context menus are positioned with top/left, so this scale does not
+   fight placement. The hook sets transform-origin at the pointer. */
+@keyframes menuIn {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}

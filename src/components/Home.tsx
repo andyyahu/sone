@@ -420,7 +420,7 @@ export default function Home() {
               {[64, 88, 76].map((w, i) => (
                 <div
                   key={i}
-                  className="h-9 rounded-full bg-th-surface-hover/60 animate-pulse"
+                  className="h-9 rounded-full bg-th-surface-hover/60"
                   style={{ width: w }}
                 />
               ))}
@@ -432,7 +432,7 @@ export default function Home() {
               {Array.from({ length: 8 }).map((_, i) => (
                 <div
                   key={i}
-                  className="h-[56px] bg-th-surface-hover/40 rounded-[4px] animate-pulse"
+                  className="h-[56px] bg-th-surface-hover/40 rounded-[4px]"
                 />
               ))}
             </div>
@@ -440,14 +440,14 @@ export default function Home() {
           {/* Skeleton sections */}
           {Array.from({ length: 3 }).map((_, i) => (
             <div key={i} className="mb-8">
-              <div className="h-7 w-48 bg-th-surface-hover rounded animate-pulse mb-4" />
+              <div className="h-7 w-48 bg-th-surface-hover rounded mb-4" />
               <div className="card-scroll">
                 <div className="card-scroll-track">
                   {Array.from({ length: 10 }).map((_, j) => (
                     <div key={j} className="card-scroll-item">
-                      <div className="aspect-square bg-th-surface-hover rounded-md animate-pulse mb-2" />
-                      <div className="h-4 w-3/4 bg-th-surface-hover rounded animate-pulse mb-1" />
-                      <div className="h-3 w-1/2 bg-th-surface-hover rounded animate-pulse" />
+                      <div className="aspect-square bg-th-surface-hover rounded-md mb-2" />
+                      <div className="h-4 w-3/4 bg-th-surface-hover rounded mb-1" />
+                      <div className="h-3 w-1/2 bg-th-surface-hover rounded" />
                     </div>
                   ))}
                 </div>
@@ -506,11 +506,11 @@ export default function Home() {
                 {/* Loved Tracks - always first */}
                 <div
                   onClick={navigateToFavorites}
-                  className="flex items-center bg-th-inset/40 hover:bg-th-inset rounded-[4px] overflow-hidden cursor-pointer group transition-[background-color,box-shadow] duration-300 h-[56px] shadow-sm hover:shadow-md"
+                  className="flex items-center bg-th-inset/40 hover:bg-th-inset active:scale-[0.985] rounded-[4px] overflow-hidden cursor-pointer group transition-[background-color,scale] duration-200 ease-settle motion-reduce:transition-none motion-reduce:active:scale-100 h-[56px] shadow-sm"
                 >
                   <div className="w-[56px] h-[56px] flex-shrink-0 bg-gradient-to-br from-[#450af5] via-[#8e2de2] to-[#00d2ff] shadow-lg flex items-center justify-center relative">
                     <Heart size={22} className="text-white" fill="white" />
-                    <div className="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                    <div className="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-150 ease-settle motion-reduce:transition-none">
                       <Play
                         size={18}
                         fill="white"
@@ -529,7 +529,7 @@ export default function Home() {
                     key={getItemId(item)}
                     onClick={() => handleShortcutClick(item)}
                     onContextMenu={(e) => handleShortcutContextMenu(e, item)}
-                    className="flex items-center bg-th-inset/40 hover:bg-th-inset rounded-[4px] overflow-hidden cursor-pointer group transition-[background-color,box-shadow] duration-300 h-[56px] shadow-sm hover:shadow-md"
+                    className="flex items-center bg-th-inset/40 hover:bg-th-inset active:scale-[0.985] rounded-[4px] overflow-hidden cursor-pointer group transition-[background-color,scale] duration-200 ease-settle motion-reduce:transition-none motion-reduce:active:scale-100 h-[56px] shadow-sm"
                   >
                     <div className="w-[56px] h-[56px] flex-shrink-0 bg-th-surface-hover shadow-lg relative">
                       {getItemImage(item, 160) ? (
@@ -542,7 +542,7 @@ export default function Home() {
                       ) : (
                         <div className="w-full h-full bg-th-surface-hover" />
                       )}
-                      <div className="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                      <div className="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-150 ease-settle motion-reduce:transition-none">
                         <Play
                           size={18}
                           fill="white"
@@ -571,14 +571,14 @@ export default function Home() {
             <div>
               {Array.from({ length: 2 }).map((_, i) => (
                 <div key={i} className="mb-8">
-                  <div className="h-7 w-48 bg-th-surface-hover rounded animate-pulse mb-4" />
+                  <div className="h-7 w-48 bg-th-surface-hover rounded mb-4" />
                   <div className="card-scroll">
                     <div className="card-scroll-track">
                       {Array.from({ length: 10 }).map((_, j) => (
                         <div key={j} className="card-scroll-item">
-                          <div className="aspect-square bg-th-surface-hover rounded-md animate-pulse mb-2" />
-                          <div className="h-4 w-3/4 bg-th-surface-hover rounded animate-pulse mb-1" />
-                          <div className="h-3 w-1/2 bg-th-surface-hover rounded animate-pulse" />
+                          <div className="aspect-square bg-th-surface-hover rounded-md mb-2" />
+                          <div className="h-4 w-3/4 bg-th-surface-hover rounded mb-1" />
+                          <div className="h-3 w-1/2 bg-th-surface-hover rounded" />
                         </div>
                       ))}
                     </div>

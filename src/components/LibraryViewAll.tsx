@@ -638,6 +638,96 @@ export default function LibraryViewAll({
       ? playlistApiTotalRef.current || displayItems.length
       : totalCount || displayItems.length;
 
+  // Request progress does not change the cards. Reuse their elements so
+  // pagination flags cannot rebuild a large collection before virtualization.
+  const mediaGrid = useMemo(
+    () => (
+      <MediaGrid>
+        {(filteredItems as any[]).map((item: any) => {
+          // Folder rendering
+          if (
+            libraryType === "playlists" &&
+            (item as PlaylistOrFolder).kind === "folder"
+          ) {
+            const folder = (
+              item as Extract<PlaylistOrFolder, { kind: "folder" }>
+            ).data;
+            const displayName = renamedFolders.get(folder.id) ?? folder.name;
+            return (
+              <MediaCard
+                key={folder.id}
+                item={{
+                  title: displayName,
+                  subTitle: folderSubtitle(
+                    (folder.totalNumberOfItems ?? 0) +
+                      (countAdjustments.get(folder.id) ?? 0),
+                  ),
+                }}
+                onClick={() => navigateToPlaylistFolder(folder.id, displayName)}
+                onContextMenu={(e: React.MouseEvent) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setFolderContextMenu({
+                    folderId: folder.id,
+                    folderName: displayName,
+                    position: { x: e.clientX, y: e.clientY },
+                  });
+                }}
+                titleOverride={displayName}
+                imageOverride={
+                  <div className="w-full h-full flex items-center justify-center bg-th-surface-hover">
+                    <FolderOpen size={32} className="text-th-text-faint" />
+                  </div>
+                }
+                showPlayButton={false}
+              />
+            );
+          }
+
+          const key =
+            libraryType === "playlists"
+              ? (item as Extract<PlaylistOrFolder, { kind: "playlist" }>).data
+                  .uuid
+              : item.uuid || item.id?.toString() || item.mixId;
+
+          const actualItem =
+            libraryType === "playlists"
+              ? (item as Extract<PlaylistOrFolder, { kind: "playlist" }>).data
+              : item;
+
+          return (
+            <MediaCard
+              key={key}
+              item={actualItem}
+              isArtist={isArtist}
+              userId={libraryType === "playlists" ? userId : undefined}
+              onClick={() => handleItemClick(item)}
+              onContextMenu={(e) => handleContextMenu(e, actualItem)}
+              onPlay={(e) => handlePlay(e, actualItem)}
+              isFavorited={isFavorited(item)}
+              onFavoriteToggle={(e) => handleFavoriteToggle(e, item)}
+              onMoreClick={(e) => handleContextMenu(e, actualItem)}
+            />
+          );
+        })}
+      </MediaGrid>
+    ),
+    [
+      filteredItems,
+      libraryType,
+      renamedFolders,
+      countAdjustments,
+      navigateToPlaylistFolder,
+      isArtist,
+      userId,
+      handleItemClick,
+      handleContextMenu,
+      handlePlay,
+      isFavorited,
+      handleFavoriteToggle,
+    ],
+  );
+
   if (loading) {
     return (
       <div className="flex-1 bg-linear-to-b from-th-surface to-th-base overflow-y-auto scrollbar-thin scrollbar-thumb-th-button scrollbar-track-transparent">
@@ -730,82 +820,7 @@ export default function LibraryViewAll({
               }
             />
           ) : (
-            <MediaGrid>
-              {(filteredItems as any[]).map((item: any) => {
-                // Folder rendering
-                if (
-                  libraryType === "playlists" &&
-                  (item as PlaylistOrFolder).kind === "folder"
-                ) {
-                  const folder = (
-                    item as Extract<PlaylistOrFolder, { kind: "folder" }>
-                  ).data;
-                  const displayName =
-                    renamedFolders.get(folder.id) ?? folder.name;
-                  return (
-                    <MediaCard
-                      key={folder.id}
-                      item={{
-                        title: displayName,
-                        subTitle: folderSubtitle(
-                          (folder.totalNumberOfItems ?? 0) +
-                            (countAdjustments.get(folder.id) ?? 0),
-                        ),
-                      }}
-                      onClick={() =>
-                        navigateToPlaylistFolder(folder.id, displayName)
-                      }
-                      onContextMenu={(e: React.MouseEvent) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        setFolderContextMenu({
-                          folderId: folder.id,
-                          folderName: displayName,
-                          position: { x: e.clientX, y: e.clientY },
-                        });
-                      }}
-                      titleOverride={displayName}
-                      imageOverride={
-                        <div className="w-full h-full flex items-center justify-center bg-th-surface-hover">
-                          <FolderOpen
-                            size={32}
-                            className="text-th-text-faint"
-                          />
-                        </div>
-                      }
-                      showPlayButton={false}
-                    />
-                  );
-                }
-
-                const key =
-                  libraryType === "playlists"
-                    ? (item as Extract<PlaylistOrFolder, { kind: "playlist" }>)
-                        .data.uuid
-                    : item.uuid || item.id?.toString() || item.mixId;
-
-                const actualItem =
-                  libraryType === "playlists"
-                    ? (item as Extract<PlaylistOrFolder, { kind: "playlist" }>)
-                        .data
-                    : item;
-
-                return (
-                  <MediaCard
-                    key={key}
-                    item={actualItem}
-                    isArtist={isArtist}
-                    userId={libraryType === "playlists" ? userId : undefined}
-                    onClick={() => handleItemClick(item)}
-                    onContextMenu={(e) => handleContextMenu(e, actualItem)}
-                    onPlay={(e) => handlePlay(e, actualItem)}
-                    isFavorited={isFavorited(item)}
-                    onFavoriteToggle={(e) => handleFavoriteToggle(e, item)}
-                    onMoreClick={(e) => handleContextMenu(e, actualItem)}
-                  />
-                );
-              })}
-            </MediaGrid>
+            mediaGrid
           )}
 
           {/* Infinite scroll sentinel */}

@@ -26,7 +26,7 @@ interface ListenBrainzState {
 }
 
 const CONNECT_BTN =
-  "px-4 py-1.5 text-[13px] font-bold rounded-full bg-th-accent text-th-on-accent hover:brightness-110 active:scale-95 transition-all duration-150 disabled:opacity-50 disabled:pointer-events-none flex items-center gap-1.5";
+  "px-4 py-1.5 text-[13px] font-bold rounded-full bg-th-accent text-th-on-accent hover:brightness-110 transition-all duration-150 disabled:opacity-50 disabled:pointer-events-none flex items-center gap-1.5";
 
 const ACCENT_TINT =
   "linear-gradient(90deg, color-mix(in srgb, var(--th-accent) 10%, transparent), transparent 72%)";

@@ -117,7 +117,6 @@ struct EntryMeta {
 
 struct IndexEntry {
     tier: CacheTier,
-    #[allow(dead_code)] // kept for index rebuild from metadata files
     tags: Vec<String>,
     created_at: u64,
     size: u64,
@@ -133,7 +132,7 @@ struct DiskCacheInner {
     /// hash → index entry
     index: HashMap<String, IndexEntry>,
     /// tag → set of hashes
-    tag_index: HashMap<String, Vec<String>>,
+    tag_index: HashMap<String, HashSet<String>>,
     /// Monotonic counter for LRU ordering.
     access_counter: u64,
     /// Total bytes of all `.dat` files on disk.
@@ -158,22 +157,27 @@ impl DiskCacheInner {
             self.tag_index
                 .entry(tag.clone())
                 .or_default()
-                .push(hash.to_string());
+                .insert(hash.to_string());
         }
     }
 
-    fn remove_from_tag_index(&mut self, hash: &str) {
-        // Remove hash from every tag list, clean up empty lists.
-        self.tag_index.retain(|_, hashes| {
-            hashes.retain(|h| h != hash);
-            !hashes.is_empty()
-        });
+    fn remove_from_tag_index(&mut self, hash: &str, tags: &[String]) {
+        // Removing metadata must not scan the much larger image collection.
+        // Each entry already records exactly which tag sets contain it.
+        for tag in tags {
+            if let Some(hashes) = self.tag_index.get_mut(tag) {
+                hashes.remove(hash);
+                if hashes.is_empty() {
+                    self.tag_index.remove(tag);
+                }
+            }
+        }
     }
 
     fn remove_entry(&mut self, hash: &str) -> Option<IndexEntry> {
         if let Some(entry) = self.index.remove(hash) {
             self.total_disk_usage = self.total_disk_usage.saturating_sub(entry.size);
-            self.remove_from_tag_index(hash);
+            self.remove_from_tag_index(hash, &entry.tags);
             Some(entry)
         } else {
             None
@@ -339,6 +343,24 @@ impl DiskCache {
             return CacheResult::Miss;
         }
 
+        let age = now_secs().saturating_sub(created_at);
+        let ttl = tier.ttl().as_secs();
+        let grace = tier.swr_grace().as_secs();
+        if age >= ttl + grace {
+            log::debug!(
+                "[DiskCache] MISS (expired): {} (tier={:?}, age={}s)",
+                key,
+                tier,
+                age
+            );
+            // The index already proves this data unusable. Skip reading and
+            // decrypting it only to throw the resulting allocation away.
+            self.remove_files(&hash, tier);
+            let mut inner = self.inner.write().await;
+            inner.remove_entry(&hash);
+            return CacheResult::Miss;
+        }
+
         // Read data from disk (outside lock) and decrypt.
         let dat_path = self
             .base_dir
@@ -374,10 +396,6 @@ impl DiskCache {
             }
         }
 
-        let age = now_secs().saturating_sub(created_at);
-        let ttl = tier.ttl().as_secs();
-        let grace = tier.swr_grace().as_secs();
-
         if age < ttl {
             log::debug!(
                 "[DiskCache] HIT (fresh): {} (tier={:?}, age={}s)",
@@ -386,7 +404,7 @@ impl DiskCache {
                 age
             );
             CacheResult::Fresh(data)
-        } else if age < ttl + grace {
+        } else {
             log::debug!(
                 "[DiskCache] HIT (stale): {} (tier={:?}, age={}s, refresh needed)",
                 key,
@@ -394,18 +412,6 @@ impl DiskCache {
                 age
             );
             CacheResult::Stale(data)
-        } else {
-            log::debug!(
-                "[DiskCache] MISS (expired): {} (tier={:?}, age={}s)",
-                key,
-                tier,
-                age
-            );
-            // Beyond grace — treat as miss and clean up.
-            self.remove_files(&hash, tier);
-            let mut inner = self.inner.write().await;
-            inner.remove_entry(&hash);
-            CacheResult::Miss
         }
     }
 
@@ -445,10 +451,7 @@ impl DiskCache {
             let mut inner = self.inner.write().await;
 
             // Remove old entry if overwriting.
-            if let Some(old) = inner.index.remove(&hash) {
-                inner.total_disk_usage = inner.total_disk_usage.saturating_sub(old.size);
-                inner.remove_from_tag_index(&hash);
-            }
+            inner.remove_entry(&hash);
 
             inner.access_counter += 1;
             let counter = inner.access_counter;
@@ -475,7 +478,7 @@ impl DiskCache {
 
     /// Invalidate all entries matching a given tag.
     pub async fn invalidate_tag(&self, tag: &str) {
-        let hashes: Vec<String> = {
+        let hashes: HashSet<String> = {
             let inner = self.inner.read().await;
             inner.tag_index.get(tag).cloned().unwrap_or_default()
         };
@@ -655,4 +658,220 @@ fn hash_key(key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache() -> (tempfile::TempDir, DiskCache) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path(), Arc::new(Crypto::for_tests()));
+        (dir, cache)
+    }
+
+    async fn age_entry(cache: &DiskCache, key: &str, age: u64) {
+        cache
+            .inner
+            .write()
+            .await
+            .index
+            .get_mut(&hash_key(key))
+            .unwrap()
+            .created_at = now_secs() - age;
+    }
+
+    #[tokio::test]
+    async fn overwriting_updates_only_the_entries_own_tags_and_size() {
+        let (_dir, cache) = cache();
+        cache
+            .put("cover", b"image", CacheTier::Image, &["image"])
+            .await
+            .unwrap();
+        cache
+            .put("album", b"old", CacheTier::StaticMeta, &["old", "shared"])
+            .await
+            .unwrap();
+        cache
+            .put(
+                "album",
+                b"replacement",
+                CacheTier::StaticMeta,
+                &["new", "shared"],
+            )
+            .await
+            .unwrap();
+
+        let inner = cache.inner.read().await;
+        assert_eq!(inner.index.len(), 2);
+        assert_eq!(inner.total_disk_usage, 16);
+        assert!(!inner.tag_index.contains_key("old"));
+        assert_eq!(inner.tag_index["image"], HashSet::from([hash_key("cover")]));
+        assert_eq!(inner.tag_index["new"], HashSet::from([hash_key("album")]));
+        assert_eq!(
+            inner.tag_index["shared"],
+            HashSet::from([hash_key("album")])
+        );
+        drop(inner);
+        assert!(
+            matches!(cache.get("album", CacheTier::StaticMeta).await, CacheResult::Fresh(data) if data == b"replacement")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidating_a_tag_removes_every_member_without_touching_unrelated_entries() {
+        let (_dir, cache) = cache();
+        cache
+            .put("a", b"aa", CacheTier::UserContent, &["favorites", "user:1"])
+            .await
+            .unwrap();
+        cache
+            .put(
+                "b",
+                b"bbb",
+                CacheTier::UserContent,
+                &["favorites", "user:2"],
+            )
+            .await
+            .unwrap();
+        cache
+            .put("cover", b"image", CacheTier::Image, &["image"])
+            .await
+            .unwrap();
+        cache.invalidate_tag("favorites").await;
+        assert!(matches!(
+            cache.get("a", CacheTier::UserContent).await,
+            CacheResult::Miss
+        ));
+        assert!(matches!(
+            cache.get("b", CacheTier::UserContent).await,
+            CacheResult::Miss
+        ));
+        assert!(
+            matches!(cache.get("cover", CacheTier::Image).await, CacheResult::Fresh(data) if data == b"image")
+        );
+        let inner = cache.inner.read().await;
+        assert_eq!(inner.total_disk_usage, 5);
+        assert_eq!(inner.tag_index.len(), 1);
+        assert_eq!(inner.tag_index["image"].len(), 1);
+        drop(inner);
+        cache.invalidate_tag("missing").await;
+        cache.invalidate_key("cover").await;
+        let inner = cache.inner.read().await;
+        assert!(inner.index.is_empty());
+        assert!(inner.tag_index.is_empty());
+        assert_eq!(inner.total_disk_usage, 0);
+    }
+
+    #[tokio::test]
+    async fn restart_rebuilds_the_same_tag_membership_from_unchanged_metadata() {
+        let (dir, cache) = cache();
+        cache
+            .put(
+                "cover",
+                b"image",
+                CacheTier::Image,
+                &["image", "image", "album:1"],
+            )
+            .await
+            .unwrap();
+        cache
+            .put("album", b"metadata", CacheTier::StaticMeta, &["album:1"])
+            .await
+            .unwrap();
+        drop(cache);
+        let cache = DiskCache::new(dir.path(), Arc::new(Crypto::for_tests()));
+        let inner = cache.inner.read().await;
+        assert_eq!(inner.index.len(), 2);
+        assert_eq!(inner.tag_index["image"].len(), 1);
+        assert_eq!(inner.tag_index["album:1"].len(), 2);
+        drop(inner);
+        cache.invalidate_tag("album:1").await;
+        assert_eq!(cache.stats().await.total_entries, 0);
+        assert!(cache.inner.read().await.tag_index.is_empty());
+        drop(cache);
+        let cache = DiskCache::new(dir.path(), Arc::new(Crypto::for_tests()));
+        assert_eq!(cache.stats().await.total_entries, 0);
+    }
+
+    #[tokio::test]
+    async fn cache_freshness_keeps_the_existing_ttl_and_stale_grace() {
+        let (_dir, cache) = cache();
+        for tier in ALL_TIERS {
+            let key = format!("entry:{tier:?}");
+            cache.put(&key, b"data", tier, &["entry"]).await.unwrap();
+            assert!(
+                matches!(cache.get(&key, tier).await, CacheResult::Fresh(data) if data == b"data")
+            );
+            age_entry(&cache, &key, tier.ttl().as_secs() + 5).await;
+            assert!(
+                matches!(cache.get(&key, tier).await, CacheResult::Stale(data) if data == b"data")
+            );
+            age_entry(
+                &cache,
+                &key,
+                tier.ttl().as_secs() + tier.swr_grace().as_secs() + 5,
+            )
+            .await;
+            assert!(matches!(cache.get(&key, tier).await, CacheResult::Miss));
+            assert!(!cache.inner.read().await.index.contains_key(&hash_key(&key)));
+        }
+        assert_eq!(cache.stats().await.total_entries, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn expired_entries_are_discarded_without_opening_the_data_file() {
+        use std::ffi::CString;
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::mpsc;
+
+        let (_dir, cache) = cache();
+        let tier = CacheTier::Image;
+        cache
+            .put("expired", b"old", tier, &["image"])
+            .await
+            .unwrap();
+        age_entry(
+            &cache,
+            "expired",
+            tier.ttl().as_secs() + tier.swr_grace().as_secs() + 5,
+        )
+        .await;
+        let dat = cache
+            .base_dir
+            .join(tier.subdir())
+            .join(format!("{}.dat", hash_key("expired")));
+        fs::remove_file(&dat).unwrap();
+        let path = CString::new(dat.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is a live, NUL-terminated path inside our temporary dir.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let mut writer = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&dat)
+            .unwrap();
+        // Reading this FIFO would block. The watchdog releases an accidental
+        // reader, so a regression fails instead of hanging the test process.
+        let (done, wait) = mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            let read_blocked = wait.recv_timeout(Duration::from_secs(5)).is_err();
+            if read_blocked {
+                writer.write_all(b"old").unwrap();
+            }
+            read_blocked
+        });
+        let result = cache.get("expired", tier).await;
+        let _ = done.send(());
+        assert!(
+            !watchdog.join().unwrap(),
+            "expired cache tried reading its data file"
+        );
+        assert!(matches!(result, CacheResult::Miss));
+        assert!(!dat.exists());
+        assert_eq!(cache.stats().await.total_entries, 0);
+    }
 }

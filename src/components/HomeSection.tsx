@@ -306,7 +306,7 @@ export default function HomeSection({ section }: HomeSectionProps) {
                     <TidalImage
                       src={getTidalPromoImageUrl(item.imageId)}
                       alt={promoTitle}
-                      className="w-full h-full object-cover transform group-hover:scale-105 transition-transform duration-500"
+                      className="w-full h-full object-cover transform group-hover:scale-105 transition-transform duration-300 ease-settle motion-reduce:transition-none"
                     />
                   }
                   showPlayButton={false}
@@ -424,7 +424,9 @@ export default function HomeSection({ section }: HomeSectionProps) {
                 isArtist={isArtist}
                 isFavorited={isFavorited}
                 onFavoriteToggle={onFavoriteToggle}
-                widthClass={isVideo ? "card-scroll-item-video" : "card-scroll-item"}
+                widthClass={
+                  isVideo ? "card-scroll-item-video" : "card-scroll-item"
+                }
                 {...(myTracks && {
                   titleOverride: "Loved Tracks",
                   imageOverride: (
@@ -534,7 +536,7 @@ function TrackListSection({
               onContextMenu={
                 myTracks ? undefined : (e) => openTrackMenu(e, item, idx)
               }
-              className="flex items-center gap-3 p-2 rounded-md hover:bg-th-inset cursor-pointer group transition-colors"
+              className="flex items-center gap-3 p-2 rounded-md hover:bg-th-inset active:bg-th-inset-hover cursor-pointer group transition-colors duration-150 ease-settle motion-reduce:transition-none"
             >
               <div className="w-10 h-10 flex-shrink-0 rounded bg-th-surface-hover overflow-hidden relative">
                 {myTracks ? (
@@ -789,7 +791,7 @@ function CompactGridSection({
               onContextMenu={
                 myTracks ? undefined : (e) => openMenu(e, item, idx)
               }
-              className="flex items-center gap-3 p-2 rounded-md hover:bg-th-inset cursor-pointer group transition-colors"
+              className="flex items-center gap-3 p-2 rounded-md hover:bg-th-inset active:bg-th-inset-hover cursor-pointer group transition-colors duration-150 ease-settle motion-reduce:transition-none"
             >
               <div className="w-10 h-10 flex-shrink-0 rounded bg-th-surface-hover overflow-hidden relative">
                 {myTracks ? (

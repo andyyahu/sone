@@ -12,6 +12,7 @@ import { usePlaybackActions } from "../hooks/usePlaybackActions";
 import { useFavorites } from "../hooks/useFavorites";
 import { getMixItems } from "../api/tidal";
 import { getApiStatus, safeErrorMessage } from "../lib/errorUtils";
+import { headerActionClass } from "./headerChrome";
 import NotFoundPage from "./NotFoundPage";
 import {
   type Track,
@@ -314,10 +315,7 @@ export default function MixPage({ mixId, mixInfo, onBack }: MixPageProps) {
                 sourceId={mixId}
                 onPlay={handlePlayAll}
               />
-              <button
-                onClick={handleShuffle}
-                className="flex items-center gap-2 px-6 py-2.5 bg-th-button/40 backdrop-blur-md text-th-text-primary font-bold text-sm rounded-full hover:bg-th-button/60 hover:scale-[1.03] transition-[transform,filter,background-color] duration-150"
-              >
+              <button onClick={handleShuffle} className={headerActionClass}>
                 <Shuffle size={18} />
                 Shuffle
               </button>

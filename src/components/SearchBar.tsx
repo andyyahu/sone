@@ -266,7 +266,7 @@ export default function SearchBar() {
               {matchingHistory.slice(0, 5).map((item) => (
                 <div
                   key={item}
-                  className="flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle transition-colors cursor-pointer"
+                  className="flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle active:bg-th-hl-strong transition-colors duration-150 ease-settle motion-reduce:transition-none cursor-pointer"
                 >
                   <Clock size={15} className="text-th-text-faint shrink-0" />
                   <button
@@ -361,7 +361,7 @@ export default function SearchBar() {
                       return (
                         <div
                           key={`dh-${idx}`}
-                          className="flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle transition-colors text-left group/item cursor-pointer"
+                          className="flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle active:bg-th-hl-strong transition-colors duration-150 ease-settle motion-reduce:transition-none text-left group/item cursor-pointer"
                           onClick={() => {
                             setSearchOpen(false);
                             if (hit.id)
@@ -434,7 +434,7 @@ export default function SearchBar() {
                       return (
                         <div
                           key={`dh-${idx}`}
-                          className="flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle transition-colors text-left group/item cursor-pointer"
+                          className="flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle active:bg-th-hl-strong transition-colors duration-150 ease-settle motion-reduce:transition-none text-left group/item cursor-pointer"
                           onClick={() => {
                             setSearchOpen(false);
                             if (hit.id)
@@ -503,7 +503,7 @@ export default function SearchBar() {
                       return (
                         <div
                           key={`dh-${idx}`}
-                          className={`flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle transition-colors text-left group/track ${
+                          className={`flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle active:bg-th-hl-strong transition-colors duration-150 ease-settle motion-reduce:transition-none text-left group/track ${
                             hit.albumId ? "cursor-pointer" : ""
                           }`}
                           onClick={() => {
@@ -593,7 +593,7 @@ export default function SearchBar() {
                       return (
                         <div
                           key={`dh-${idx}`}
-                          className="flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle transition-colors text-left group/item cursor-pointer"
+                          className="flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle active:bg-th-hl-strong transition-colors duration-150 ease-settle motion-reduce:transition-none text-left group/item cursor-pointer"
                           onClick={() => {
                             setSearchOpen(false);
                             if (hit.uuid)

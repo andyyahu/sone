@@ -724,7 +724,7 @@ function TopHitsList({
           return (
             <div
               key={`th-${idx}`}
-              className={`flex items-center gap-4 px-3 py-3 hover:bg-th-border-subtle rounded-md transition-colors text-left group/track ${
+              className={`flex items-center gap-4 px-3 py-3 hover:bg-th-border-subtle active:bg-th-hl-strong rounded-md transition-colors duration-150 ease-settle motion-reduce:transition-none text-left group/track ${
                 hit.albumId ? "cursor-pointer" : ""
               }`}
               onClick={() => onTrackAlbumClick(hit)}
@@ -809,7 +809,7 @@ function TopHitsList({
           return (
             <div
               key={`th-${idx}`}
-              className="flex items-center gap-4 px-3 py-3 hover:bg-th-border-subtle rounded-md transition-colors text-left group/item cursor-pointer"
+              className="flex items-center gap-4 px-3 py-3 hover:bg-th-border-subtle active:bg-th-hl-strong rounded-md transition-colors duration-150 ease-settle motion-reduce:transition-none text-left group/item cursor-pointer"
               onClick={() => onPlayVideo(hit)}
               onContextMenu={(e) => {
                 e.preventDefault();
@@ -850,7 +850,10 @@ function TopHitsList({
                 title="More options"
                 onClick={(e) => {
                   e.stopPropagation();
-                  onMediaContextMenu(videoMedia, { x: e.clientX, y: e.clientY });
+                  onMediaContextMenu(videoMedia, {
+                    x: e.clientX,
+                    y: e.clientY,
+                  });
                 }}
               >
                 <MoreHorizontal size={16} />
@@ -862,7 +865,7 @@ function TopHitsList({
           return (
             <div
               key={`th-${idx}`}
-              className="flex items-center gap-4 px-3 py-3 hover:bg-th-border-subtle rounded-md transition-colors text-left group/item cursor-pointer"
+              className="flex items-center gap-4 px-3 py-3 hover:bg-th-border-subtle active:bg-th-hl-strong rounded-md transition-colors duration-150 ease-settle motion-reduce:transition-none text-left group/item cursor-pointer"
               onClick={() => onAlbumClick(hit)}
               onContextMenu={(e) => {
                 if (!hit.id) return;
@@ -923,7 +926,7 @@ function TopHitsList({
           return (
             <div
               key={`th-${idx}`}
-              className="flex items-center gap-4 px-3 py-3 hover:bg-th-border-subtle rounded-md transition-colors text-left group/item cursor-pointer"
+              className="flex items-center gap-4 px-3 py-3 hover:bg-th-border-subtle active:bg-th-hl-strong rounded-md transition-colors duration-150 ease-settle motion-reduce:transition-none text-left group/item cursor-pointer"
               onClick={() => onArtistClick(hit)}
               onContextMenu={(e) => {
                 if (!hit.id) return;
@@ -985,7 +988,7 @@ function TopHitsList({
           return (
             <div
               key={`th-${idx}`}
-              className="flex items-center gap-4 px-3 py-3 hover:bg-th-border-subtle rounded-md transition-colors text-left group/item cursor-pointer"
+              className="flex items-center gap-4 px-3 py-3 hover:bg-th-border-subtle active:bg-th-hl-strong rounded-md transition-colors duration-150 ease-settle motion-reduce:transition-none text-left group/item cursor-pointer"
               onClick={() => onPlaylistClick(hit)}
               onContextMenu={(e) => {
                 if (!hit.uuid) return;

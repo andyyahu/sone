@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { useAtom, useAtomValue, useSetAtom, useStore } from "jotai";
+import { useAtomValue, useSetAtom, useStore } from "jotai";
 import { invoke } from "@tauri-apps/api/core";
 import {
   favoriteTrackIdsAtom,
@@ -33,17 +33,14 @@ import type {
   FavoriteMix,
 } from "../types";
 
-export function useFavorites() {
-  const [favoriteTrackIds, setFavoriteTrackIds] = useAtom(favoriteTrackIdsAtom);
-  const [favoriteVideoIds, setFavoriteVideoIds] = useAtom(favoriteVideoIdsAtom);
-  const [favoriteAlbumIds, setFavoriteAlbumIds] = useAtom(favoriteAlbumIdsAtom);
-  const [favoritePlaylistUuids, setFavoritePlaylistUuids] = useAtom(
-    favoritePlaylistUuidsAtom,
-  );
-  const [followedArtistIds, setFollowedArtistIds] = useAtom(
-    followedArtistIdsAtom,
-  );
-  const [favoriteMixIds, setFavoriteMixIds] = useAtom(favoriteMixIdsAtom);
+/** Mutations without subscribing the caller to any favorite collection. */
+export function useFavoriteActions() {
+  const setFavoriteTrackIds = useSetAtom(favoriteTrackIdsAtom);
+  const setFavoriteVideoIds = useSetAtom(favoriteVideoIdsAtom);
+  const setFavoriteAlbumIds = useSetAtom(favoriteAlbumIdsAtom);
+  const setFavoritePlaylistUuids = useSetAtom(favoritePlaylistUuidsAtom);
+  const setFollowedArtistIds = useSetAtom(followedArtistIdsAtom);
+  const setFavoriteMixIds = useSetAtom(favoriteMixIdsAtom);
   const authTokens = useAtomValue(authTokensAtom);
   const store = useStore();
   const setDeletedPlaylistIds = useSetAtom(deletedPlaylistIdsAtom);
@@ -386,23 +383,38 @@ export function useFavorites() {
   );
 
   return {
-    favoriteTrackIds,
     addFavoriteTrack,
     removeFavoriteTrack,
-    favoriteVideoIds,
     addFavoriteVideo,
     removeFavoriteVideo,
-    favoriteAlbumIds,
     addFavoriteAlbum,
     removeFavoriteAlbum,
-    favoritePlaylistUuids,
     addFavoritePlaylist,
     removeFavoritePlaylist,
-    followedArtistIds,
     followArtist,
     unfollowArtist,
-    favoriteMixIds,
     addFavoriteMix,
     removeFavoriteMix,
+  };
+}
+
+/** Collection-level API for views that need the complete favorite sets. */
+export function useFavorites() {
+  const actions = useFavoriteActions();
+  const favoriteTrackIds = useAtomValue(favoriteTrackIdsAtom);
+  const favoriteVideoIds = useAtomValue(favoriteVideoIdsAtom);
+  const favoriteAlbumIds = useAtomValue(favoriteAlbumIdsAtom);
+  const favoritePlaylistUuids = useAtomValue(favoritePlaylistUuidsAtom);
+  const followedArtistIds = useAtomValue(followedArtistIdsAtom);
+  const favoriteMixIds = useAtomValue(favoriteMixIdsAtom);
+
+  return {
+    ...actions,
+    favoriteTrackIds,
+    favoriteVideoIds,
+    favoriteAlbumIds,
+    favoritePlaylistUuids,
+    followedArtistIds,
+    favoriteMixIds,
   };
 }

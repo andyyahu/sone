@@ -109,8 +109,10 @@ function FeedRow({
     <div
       onClick={isInert ? undefined : handleOpen}
       onContextMenu={openMenu}
-      className={`group flex items-center gap-4 px-2 py-2 rounded-md transition-colors duration-150 ${
-        isInert ? "" : "cursor-pointer hover:bg-th-surface-hover"
+      className={`group flex items-center gap-4 px-2 py-2 rounded-md transition-[background-color,color] duration-150 ease-settle motion-reduce:transition-none ${
+        isInert
+          ? ""
+          : "cursor-pointer hover:bg-th-surface-hover active:bg-th-hl-med"
       }`}
     >
       <div className="relative w-14 h-14 shrink-0 rounded-md overflow-hidden bg-th-surface-hover shadow">
@@ -131,7 +133,7 @@ function FeedRow({
         )}
         {!isInert && (
           <>
-            <div className="absolute inset-0 bg-black/30 opacity-0 group-hover:opacity-100 transition-opacity duration-200" />
+            <div className="absolute inset-0 bg-black/30 opacity-0 group-hover:opacity-100 transition-opacity duration-200 ease-settle motion-reduce:transition-none" />
             <button
               onClick={handlePlay}
               aria-label={`Play ${title}`}

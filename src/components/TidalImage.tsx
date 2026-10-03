@@ -1,70 +1,11 @@
-import { memo, useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { memo, useState, useEffect, useRef } from "react";
 import { ListMusic, Play, User } from "lucide-react";
+import { observeNearViewport } from "../lib/nearViewport";
+import { usePageScrollElement } from "../contexts/PageScrollContext";
+import ScheduledImage from "./ScheduledImage";
 
-// In-memory blob URL cache — size-based LRU (50 MB) with revokeObjectURL on eviction.
-const MAX_BLOB_BYTES = 200 * 1024 * 1024; // 200 MB
-let blobTotalBytes = 0;
-let blobAccessCounter = 0;
-
-interface BlobEntry {
-  url: string;
-  size: number;
-  accessOrder: number;
-}
-
-const blobCache = new Map<string, BlobEntry>();
-
-function evictBlobsIfNeeded(requiredBytes: number): void {
-  if (blobTotalBytes + requiredBytes <= MAX_BLOB_BYTES) return;
-  const entries = [...blobCache.entries()].sort(
-    (a, b) => a[1].accessOrder - b[1].accessOrder,
-  );
-  const target = MAX_BLOB_BYTES * 0.9;
-  for (const [key, entry] of entries) {
-    if (blobTotalBytes + requiredBytes <= target) break;
-    URL.revokeObjectURL(entry.url);
-    blobTotalBytes -= entry.size;
-    blobCache.delete(key);
-  }
-}
-
-const inflight = new Map<string, Promise<string>>();
-
-export function fetchCachedImageUrl(src: string): Promise<string> {
-  const entry = blobCache.get(src);
-  if (entry) {
-    entry.accessOrder = ++blobAccessCounter;
-    return Promise.resolve(entry.url);
-  }
-
-  const existing = inflight.get(src);
-  if (existing) return existing;
-
-  const promise = invoke<ArrayBuffer>("get_image_bytes", { url: src })
-    .then((buffer) => {
-      const arr = new Uint8Array(buffer);
-      const blob = new Blob([arr], { type: "image/jpeg" });
-      const blobUrl = URL.createObjectURL(blob);
-      const size = arr.byteLength;
-      evictBlobsIfNeeded(size);
-      blobCache.set(src, {
-        url: blobUrl,
-        size,
-        accessOrder: ++blobAccessCounter,
-      });
-      blobTotalBytes += size;
-      inflight.delete(src);
-      return blobUrl;
-    })
-    .catch((err) => {
-      inflight.delete(src);
-      throw err;
-    });
-
-  inflight.set(src, promise);
-  return promise;
-}
+import { fetchCachedImageUrl, getCachedImageUrl } from "../lib/imageCache";
+export { fetchCachedImageUrl } from "../lib/imageCache";
 
 interface TidalImageProps {
   src: string | undefined;
@@ -87,47 +28,63 @@ interface TidalImageProps {
     | "object-bottom-left"
     | "object-bottom-right";
   onLoad?: () => void;
+  /** Bypass viewport gating for a known above-the-fold cover. */
+  loading?: "lazy" | "eager";
 }
 
 function TidalImageComponent({
   src,
   alt,
-  className = "",
+  className = "w-full h-full",
   type = "album",
   objectFit = "object-cover",
   onLoad,
+  loading = "lazy",
 }: TidalImageProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const scrollElement = usePageScrollElement();
+  const [nearViewport, setNearViewport] = useState(loading === "eager");
   const [hasError, setHasError] = useState(false);
   // Synchronous cache check — if the blob is already in memory, skip loading entirely
   const [blobUrl, setBlobUrl] = useState<string | undefined>(() => {
     if (!src) return undefined;
-    const entry = blobCache.get(src);
-    if (entry) {
-      entry.accessOrder = ++blobAccessCounter;
-      return entry.url;
-    }
-    return undefined;
+    return getCachedImageUrl(src);
   });
   const [isLoading, setIsLoading] = useState(blobUrl === undefined);
+
+  useEffect(() => {
+    const element = containerRef.current;
+    if (loading === "eager" || nearViewport || !element) return;
+    // A cached blob paints from the first render. Observing it only flips
+    // state, so every warm cover renders again as a playlist scrolls.
+    if (src && getCachedImageUrl(src)) return;
+    return observeNearViewport(
+      element,
+      () => setNearViewport(true),
+      scrollElement,
+    );
+  }, [loading, nearViewport, scrollElement, src]);
 
   useEffect(() => {
     if (!src) return;
 
     // Sync cache hit — skip loading shimmer
-    const cached = blobCache.get(src);
+    const cached = getCachedImageUrl(src);
     if (cached) {
-      cached.accessOrder = ++blobAccessCounter;
-      setBlobUrl(cached.url);
+      setBlobUrl(cached);
       setIsLoading(false);
       setHasError(false);
       return;
     }
 
+    if (loading !== "eager" && !nearViewport) return;
+
     // Not cached — fetch silently, keep old image visible until ready
     setHasError(false);
 
     let cancelled = false;
-    fetchCachedImageUrl(src)
+    const controller = new AbortController();
+    fetchCachedImageUrl(src, { signal: controller.signal })
       .then((url) => {
         if (!cancelled) setBlobUrl(url);
       })
@@ -137,12 +94,14 @@ function TidalImageComponent({
 
     return () => {
       cancelled = true;
+      controller.abort();
     };
-  }, [src]);
+  }, [src, nearViewport, loading]);
 
   if (!src || hasError) {
     return (
       <div
+        ref={containerRef}
         className={`bg-gradient-to-br from-th-button to-th-surface flex items-center justify-center ${className}`}
       >
         {type === "playlist" ? (
@@ -158,21 +117,20 @@ function TidalImageComponent({
 
   if (!blobUrl) {
     return (
-      <div className={`relative ${className}`}>
-        <div className="absolute inset-0 bg-th-surface-hover animate-pulse" />
+      <div ref={containerRef} className={`relative ${className}`}>
+        <div className="absolute inset-0 bg-th-surface-hover" />
       </div>
     );
   }
 
   return (
-    <div className={`relative ${className}`}>
-      {isLoading && (
-        <div className="absolute inset-0 bg-th-surface-hover animate-pulse" />
-      )}
-      <img
+    <div ref={containerRef} className={`relative ${className}`}>
+      {isLoading && <div className="absolute inset-0 bg-th-surface-hover" />}
+      <ScheduledImage
         src={blobUrl}
         alt={alt}
         draggable={false}
+        decoding="async"
         className={`w-full h-full ${isLoading ? "opacity-0" : "opacity-100"} transition-opacity ${objectFit}`}
         onError={() => setHasError(true)}
         onLoad={() => {
@@ -191,5 +149,5 @@ export default TidalImage;
 
 export function preloadImage(url: string): void {
   if (!url) return;
-  fetchCachedImageUrl(url).catch(() => {});
+  fetchCachedImageUrl(url, { priority: "prefetch" }).catch(() => {});
 }

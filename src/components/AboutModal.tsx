@@ -64,7 +64,7 @@ export default function AboutModal({ open, onClose }: AboutModalProps) {
       <div
         ref={panelRef}
         className="w-[420px] bg-th-elevated rounded-xl shadow-2xl flex flex-col overflow-hidden"
-        style={{ animation: "slideUp 0.2s ease-out" }}
+        style={{ animation: "slideUp 0.2s var(--ease-settle)" }}
       >
         {/* Header */}
         <div className="flex items-center justify-end px-3 pt-3">

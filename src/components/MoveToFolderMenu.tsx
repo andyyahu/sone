@@ -102,7 +102,7 @@ function CreateFolderModal({
   return (
     <div
       className="fixed inset-0 z-[10000] flex items-center justify-center"
-      style={{ animation: "fadeIn 0.15s ease-out" }}
+      style={{ animation: "fadeIn 0.15s var(--ease-settle)" }}
     >
       {/* Backdrop */}
       <div
@@ -113,7 +113,7 @@ function CreateFolderModal({
       {/* Modal panel */}
       <div
         className="relative w-full max-w-[520px] bg-th-surface rounded-xl shadow-2xl overflow-hidden mx-4"
-        style={{ animation: "slideUp 0.2s ease-out" }}
+        style={{ animation: "slideUp 0.2s var(--ease-settle)" }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}

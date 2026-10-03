@@ -17,7 +17,7 @@ vi.mock("../hooks/useNavigation", () => ({
 }));
 
 vi.mock("../hooks/useFavorites", () => ({
-  useFavorites: () => ({
+  useFavoriteActions: () => ({
     favoriteTrackIds: new Set<number>(),
     addFavoriteTrack: vi.fn(),
     removeFavoriteTrack: vi.fn(),
