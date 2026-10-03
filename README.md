@@ -28,6 +28,34 @@ https://github.com/user-attachments/assets/67d7a8ed-352b-4ce6-8b9c-70b7427a5f22
   <img src="data/sone_theme_readme.png" width="32%" alt="SONE custom theme — native Linux music player with full color customization" />
 </p>
 
+## This fork
+
+This tree is [Andy's](https://github.com/andyyahu/sone) fork of [SONE](https://github.com/lullabyX/sone). The original application is by [lullabyX](https://github.com/lullabyX). Thank you to lullabyX for the Linux TIDAL client, the exclusive ALSA path, and the work this fork starts from.
+
+The changes from that upstream tree are these.
+
+### Playback
+
+Exclusive output stays at the track sample rate. If the DAC does not accept that rate, the track fails. SONE does not silently pick another rate. Format and bit-depth fallback remain. The in-app integer upsampler and the noise-shaper menu are gone. Old `integer_upsample`, `upsample_ratio`, `upsample_rate_limit`, and `noise_shaper` settings still load and do nothing. Unity gain leaves samples byte-identical. Any other gain dithers only when the result is not already an integer.
+
+CamillaDSP can process that exclusive PCM with a YAML config whose sample rate matches the track. A resampler that would change the rate is rejected. With exclusive output off, the switch is saved and stays idle. The menu label remains CamillaDSP FIR.
+
+HQPlayer mode hands the decoded track to a running HQPlayer Desktop as a source-rate 32-bit WAV on localhost. That WAV is not resampled, gained, dithered, or passed through CamillaDSP. Desktop owns the filters, the noise shaper, and the DAC. Turning the mode on releases the DAC and checks control port 4321. The first track of a session clears Desktop's playlist. The next track is queued on that playlist for gapless playback. `PlayNextURI` sends the address in the `value` attribute.
+
+### Signal path
+
+The diagram follows the path that actually runs. An HQPlayer handoff is labeled HANDED OFF, and the cable to Desktop reads source-rate WAV. Volume and ReplayGain figures kept for a later track are not described as if they had scaled that WAV. CamillaDSP is described as processing the exclusive output at the track rate. When the volume slider or ReplayGain is not unity, the headline names those coefficients, because they are applied in the one quantize after the pipeline. The amber state is MODIFIED.
+
+### Catalog
+
+Playlist, mix, and similar-album reads try the official TIDAL OpenAPI first and use the private API when the official page is incomplete. Rate-limit and authentication failures stay failures. Full playback still uses the existing private manifest path. A playlist row is removed by its official item id. Similar tracks are available from the track menu. Identical in-flight catalog requests are shared, and a later invalidation cannot be overwritten by an older response.
+
+### Interface
+
+Long track lists, home grids of 40 or more cards, and the sidebar collections are virtualized. During a fast scroll, rows that just entered the list draw as text until scrolling settles. Covers go through a shared cache and a decode budget. An HTTP error is not stored as a cover. Banner and full-screen-player blurs are baked once instead of staying live while the page scrolls. Playback persistence, favorite buttons, video progress, and the mini player clock update without rebuilding the surrounding screen.
+
+On NVIDIA, SONE no longer forces `WEBKIT_DISABLE_DMABUF_RENDERER=1`. `SONE_RENDERER` selects `auto`, `dmabuf`, or `compatibility`. A `WEBKIT_DISABLE_DMABUF_RENDERER` value that is already set still wins.
+
 ## The Vision
 
 The Linux desktop app TIDAL never built.
@@ -39,6 +67,7 @@ We went beyond the basics with direct-to-DAC bit-perfect ALSA output, a resizabl
 <details>
 <summary>Table of Contents</summary>
 
+- [This fork](#this-fork)
 - [Features](#features)
 - [Why SONE?](#why-sone)
 - [Installation](#installation)
@@ -59,11 +88,11 @@ We went beyond the basics with direct-to-DAC bit-perfect ALSA output, a resizabl
 - **Max streaming quality** — cap streaming at your preferred quality tier
 - **Bit-perfect output** — no resampling, no dithering. Your DAC receives the unaltered decoded signal
 - **Exclusive ALSA** — bypasses PipeWire/PulseAudio entirely for direct hardware access
-- **Smart DAC matching** — automatically detects your hardware's supported formats and sample rates, picking the best fit
-- **Signal Path Transparency** — see exactly what your audio is going through end-to-end. Probes the live GStreamer pipeline, OS mixer (`pactl`), and ALSA card (`/proc/asound`); flags every conversion, format mismatch, or volume alteration with a PRISTINE verdict for bit-clean playback
+- **Source rate** — exclusive output plays the track's own sample rate. A DAC that refuses that rate fails the track, and SONE does not resample it. Format and bit depth can still fall back
+- **Signal Path Transparency** — see exactly what your audio is going through end-to-end. Probes the live GStreamer pipeline, OS mixer (`pactl`), and ALSA card (`/proc/asound`); flags every conversion, format mismatch, or volume alteration. Bit-clean exclusive playback reads PRISTINE. An HQPlayer handoff reads HANDED OFF. CamillaDSP, the volume slider, and ReplayGain read MODIFIED
 - **Volume normalization** (ReplayGain) with automatic context switching between album and track gain
 - **Autoplay** — discovers and plays similar tracks when your queue ends
-- **Gapless playback** — seamless, silence-free transitions between tracks in normal output mode. On by default, with automatic fallback when unavailable
+- **Gapless playback** — seamless transitions in normal output and in HQPlayer mode. On by default, with automatic fallback when unavailable. Exclusive ALSA does not use it
 
 ### Video
 

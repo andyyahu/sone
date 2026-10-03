@@ -39,6 +39,7 @@ docs/
 .claude/
 *claude*
 *CLAUDE*
+AGENTS.md
 
 # local files
 nocommit
