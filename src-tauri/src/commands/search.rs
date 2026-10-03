@@ -23,5 +23,5 @@ pub async fn get_suggestions(
 ) -> Result<SuggestionsResponse, SoneError> {
     log::debug!("[get_suggestions]: query=\"{}\", limit={}", query, limit);
     let mut client = state.tidal_client.lock().await;
-    Ok(client.get_suggestions(&query, limit).await)
+    client.get_suggestions(&query, limit).await
 }

@@ -1096,6 +1096,33 @@ pub async fn debug_home_page_raw(state: State<'_, AppState>) -> Result<String, S
     Ok(summary)
 }
 
+#[tauri::command(rename_all = "camelCase")]
+pub async fn get_similar_albums(
+    state: State<'_, AppState>,
+    album_id: u64,
+) -> Result<Vec<TidalAlbumDetail>, SoneError> {
+    log::debug!("[get_similar_albums]: album_id={album_id}");
+    let mut client = state.tidal_client.lock().await;
+    client.similar_albums(album_id).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn get_similar_tracks(
+    state: State<'_, AppState>,
+    track_id: u64,
+) -> Result<Vec<TidalTrack>, SoneError> {
+    log::debug!("[get_similar_tracks]: track_id={track_id}");
+    let mut client = state.tidal_client.lock().await;
+    client.similar_tracks(track_id).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn get_user_mixes(state: State<'_, AppState>) -> Result<Vec<MixPageResult>, SoneError> {
+    log::debug!("[get_user_mixes]");
+    let mut client = state.tidal_client.lock().await;
+    client.list_user_mixes().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

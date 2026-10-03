@@ -4,7 +4,11 @@ interface UseInfiniteScrollOptions<T> {
   fetchPage: (
     offset: number,
     limit: number,
-  ) => Promise<{ items: T[]; totalNumberOfItems: number }>;
+  ) => Promise<{
+    items: T[];
+    totalNumberOfItems: number;
+    nextOffset?: number;
+  }>;
   pageSize?: number;
   enabled?: boolean;
   resetKey?: string;
@@ -48,7 +52,8 @@ export function useInfiniteScroll<T>({
         setItems((prev) =>
           currentOffset === 0 ? result.items : [...prev, ...result.items],
         );
-        const newOffset = currentOffset + result.items.length;
+        const newOffset =
+          result.nextOffset ?? currentOffset + result.items.length;
         offsetRef.current = newOffset;
         const more =
           newOffset < result.totalNumberOfItems && result.items.length > 0;

@@ -121,6 +121,8 @@ export interface Track {
   itemType?: string;
   /** Video thumbnail UUID (videos carry `imageId` instead of `album.cover`). */
   imageId?: string;
+  /** Official playlist item id, used to delete that row rather than an index. */
+  playlistItemId?: string | null;
   _qid?: string;
 }
 
@@ -199,6 +201,8 @@ export interface Paginated<T> {
   totalNumberOfItems: number;
   offset: number;
   limit: number;
+  /** Present when the next request offset is not `offset + items.length`. */
+  nextOffset?: number;
 }
 
 export type SearchTab =

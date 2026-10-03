@@ -38,6 +38,11 @@ interface CacheEntry {
   estimatedSize: number;
 }
 
+interface PendingRequest<T = unknown> {
+  tags: string[];
+  promise: Promise<T>;
+}
+
 const MAX_BYTES = 150 * 1024 * 1024; // 150 MB
 let currentBytes = 0;
 let accessCounter = 0;
@@ -45,6 +50,8 @@ let accessCounter = 0;
 const store = new Map<string, CacheEntry>(); // hashedKey → entry
 const tagIndex = new Map<string, Set<string>>(); // tag → Set<hashedKey>
 const keyMap = new Map<string, string>(); // hashedKey → plaintextKey
+// Share misses as well as hits. The full key keeps distinct requests separate.
+const pendingRequests = new Map<string, PendingRequest>();
 
 const TTL = {
   SHORT: 2 * 60_000, // 2 min  — search, suggestions
@@ -130,41 +137,65 @@ function cached<T>(
     entry.accessOrder = ++accessCounter;
     return Promise.resolve(entry.data as T);
   }
-  return fetcher()
-    .catch((err) => {
-      checkNetworkError(err);
-      throw err;
-    })
-    .then((data) => {
-      // Remove stale entry if present
-      if (store.has(hk)) removeEntry(hk);
-      const size = estimateSize(data);
-      evictIfNeeded(size);
-      const newEntry: CacheEntry = {
-        data,
-        ts: Date.now(),
-        ttl,
-        tags,
-        accessOrder: ++accessCounter,
-        estimatedSize: size,
-      };
-      store.set(hk, newEntry);
-      keyMap.set(hk, key);
-      currentBytes += size;
-      for (const tag of tags) {
-        let set = tagIndex.get(tag);
-        if (!set) {
-          set = new Set();
-          tagIndex.set(tag, set);
+  const pending = pendingRequests.get(key);
+  if (pending) return pending.promise as Promise<T>;
+
+  const request: PendingRequest<T> = {
+    tags,
+    promise: fetcher()
+      .catch((err) => {
+        checkNetworkError(err);
+        throw err;
+      })
+      .then((data) => {
+        // Invalidating or clearing the cache detaches pending requests too. An
+        // older response still resolves for its caller, but cannot repopulate
+        // the cache after a mutation/logout or replace a newer request's data.
+        if (pendingRequests.get(key) !== request) return data;
+        // Remove stale entry if present
+        if (store.has(hk)) removeEntry(hk);
+        const size = estimateSize(data);
+        evictIfNeeded(size);
+        const newEntry: CacheEntry = {
+          data,
+          ts: Date.now(),
+          ttl,
+          tags,
+          accessOrder: ++accessCounter,
+          estimatedSize: size,
+        };
+        store.set(hk, newEntry);
+        keyMap.set(hk, key);
+        currentBytes += size;
+        for (const tag of tags) {
+          let set = tagIndex.get(tag);
+          if (!set) {
+            set = new Set();
+            tagIndex.set(tag, set);
+          }
+          set.add(hk);
         }
-        set.add(hk);
-      }
-      return data;
-    });
+        return data;
+      })
+      .finally(() => {
+        if (pendingRequests.get(key) === request) pendingRequests.delete(key);
+      }),
+  };
+  pendingRequests.set(key, request);
+  return request.promise;
+}
+
+function detachPending(prefix: string): void {
+  for (const [key, request] of pendingRequests) {
+    if (request.tags.includes(prefix) || key.startsWith(prefix)) {
+      pendingRequests.delete(key);
+    }
+  }
 }
 
 /** Remove all cache entries matching a tag (fast path) or key prefix (fallback). */
 export function invalidateCache(prefix: string): void {
+  detachPending(prefix);
   // Fast path: try tag index
   const tagSet = tagIndex.get(prefix);
   if (tagSet) {
@@ -179,6 +210,7 @@ export function invalidateCache(prefix: string): void {
 
 /** Mutate a cached entry in-place. Scans plaintext keys for prefix match. */
 function mutateCache<T>(keyPrefix: string, updater: (data: T) => T): void {
+  detachPending(keyPrefix);
   for (const [hk, plainKey] of keyMap.entries()) {
     if (plainKey.startsWith(keyPrefix)) {
       const entry = store.get(hk);
@@ -287,6 +319,7 @@ export function removeArtistFromFollowedCache(
 
 /** Drop the entire cache (e.g. on logout). */
 export function clearCache(): void {
+  pendingRequests.clear();
   store.clear();
   tagIndex.clear();
   keyMap.clear();
@@ -765,6 +798,10 @@ export interface MixPageResult {
   tracks: Track[];
 }
 
+export async function getSimilarTracks(trackId: number): Promise<Track[]> {
+  return invoke<Track[]>("get_similar_tracks", { trackId });
+}
+
 export async function getMixItems(mixId: string): Promise<MixPageResult> {
   return cached(
     `mix-page:${mixId}`,
@@ -1151,7 +1188,10 @@ export async function updateProfileMeta(
   await invoke("update_profile_meta", { artistId, name, handle, dryRun });
 }
 
-export async function updateProfileBio(bioId: string, text: string): Promise<void> {
+export async function updateProfileBio(
+  bioId: string,
+  text: string,
+): Promise<void> {
   await invoke("update_profile_bio", { bioId, text });
 }
 
