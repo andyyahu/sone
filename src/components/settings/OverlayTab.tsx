@@ -1,7 +1,10 @@
 import { useState, useEffect } from "react";
 import { useAtom } from "jotai";
 import { invoke } from "@tauri-apps/api/core";
-import { overlayConnectionInfoAtom, type OverlayConnectionInfo } from "../../atoms/overlay";
+import {
+  overlayConnectionInfoAtom,
+  type OverlayConnectionInfo,
+} from "../../atoms/overlay";
 import { safeErrorMessage } from "../../lib/errorUtils";
 import Toggle from "../Toggle";
 import SettingRow from "./SettingRow";
@@ -30,7 +33,9 @@ export default function OverlayTab() {
 
   const refresh = async () => {
     try {
-      const i = await invoke<OverlayConnectionInfo>("overlay_get_connection_info");
+      const i = await invoke<OverlayConnectionInfo>(
+        "overlay_get_connection_info",
+      );
       setInfo(i);
       setEnabled(i.enabled);
     } catch {
@@ -73,7 +78,9 @@ export default function OverlayTab() {
     setPortError("");
     setBusy(true);
     try {
-      const i = await invoke<OverlayConnectionInfo>("overlay_set_port", { port: p });
+      const i = await invoke<OverlayConnectionInfo>("overlay_set_port", {
+        port: p,
+      });
       setInfo(i);
       setPortInput(String(i.port ?? p));
     } catch (e) {
@@ -94,7 +101,9 @@ export default function OverlayTab() {
     setHostError("");
     setBusy(true);
     try {
-      const i = await invoke<OverlayConnectionInfo>("overlay_set_host", { host: h });
+      const i = await invoke<OverlayConnectionInfo>("overlay_set_host", {
+        host: h,
+      });
       setInfo(i);
       setHostInput(i.host);
     } catch (e) {
@@ -199,10 +208,16 @@ export default function OverlayTab() {
             {/* Instructions */}
             <div className="rounded-[11px] border border-th-border-subtle bg-th-inset px-[13px] py-3 mb-4">
               <p className="text-[11.5px] text-th-text-secondary leading-relaxed">
-                In OBS: <span className="text-th-text-primary font-medium">Sources → + → Browser</span>
+                In OBS:{" "}
+                <span className="text-th-text-primary font-medium">
+                  Sources → + → Browser
+                </span>
                 <br />
                 Paste the URL above and set the size to{" "}
-                <span className="font-mono text-th-text-primary font-medium">400 × 120</span>.
+                <span className="font-mono text-th-text-primary font-medium">
+                  400 × 120
+                </span>
+                .
               </p>
             </div>
           </>
@@ -239,8 +254,10 @@ export default function OverlayTab() {
           <p className="text-[11px] text-[#ff6666] mt-1">{hostError}</p>
         )}
         <p className="text-[11px] text-th-text-muted mt-1 mb-4">
-          <span className="font-mono text-th-text-secondary">127.0.0.1</span> = local only &nbsp;·&nbsp;
-          <span className="font-mono text-th-text-secondary">0.0.0.0</span> = all interfaces (accessible on LAN)
+          <span className="font-mono text-th-text-secondary">127.0.0.1</span> =
+          local only &nbsp;·&nbsp;
+          <span className="font-mono text-th-text-secondary">0.0.0.0</span> =
+          all interfaces (accessible on LAN)
         </p>
 
         {/* Port config */}

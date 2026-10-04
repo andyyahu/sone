@@ -59,7 +59,9 @@ export default function SocialMediaPanel({
                 type="text"
                 placeholder={LABELS[type]}
                 value={socials[type] ?? ""}
-                onChange={(e) => onChange({ ...socials, [type]: e.target.value })}
+                onChange={(e) =>
+                  onChange({ ...socials, [type]: e.target.value })
+                }
                 className="bg-th-inset rounded-md px-3 py-2 text-[14px] text-th-text-primary placeholder:text-th-text-faint outline-none focus:ring-1 focus:ring-th-accent"
               />
             </label>

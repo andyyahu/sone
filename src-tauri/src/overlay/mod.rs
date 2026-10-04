@@ -24,7 +24,14 @@ pub(crate) async fn ensure_overlay_started(app: &tauri::AppHandle) {
         s.tx.clone()
     };
 
-    match start_server(state.overlay_state.clone(), tx, &settings.overlay_host, settings.overlay_port).await {
+    match start_server(
+        state.overlay_state.clone(),
+        tx,
+        &settings.overlay_host,
+        settings.overlay_port,
+    )
+    .await
+    {
         Ok(handle) => *guard = Some(handle),
         Err(e) => log::error!("Overlay server failed to start: {e}"),
     }

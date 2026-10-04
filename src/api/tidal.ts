@@ -1151,7 +1151,10 @@ export async function updateProfileMeta(
   await invoke("update_profile_meta", { artistId, name, handle, dryRun });
 }
 
-export async function updateProfileBio(bioId: string, text: string): Promise<void> {
+export async function updateProfileBio(
+  bioId: string,
+  text: string,
+): Promise<void> {
   await invoke("update_profile_bio", { bioId, text });
 }
 

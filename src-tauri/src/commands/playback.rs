@@ -214,7 +214,9 @@ pub async fn play_tidal_track(
     explain_block(&proxy_settings, &state.host_caps(), is_dash)?;
 
     // Store selected values for live toggle
-    state.last_replay_gain.store(rg.to_bits(), Ordering::Relaxed);
+    state
+        .last_replay_gain
+        .store(rg.to_bits(), Ordering::Relaxed);
     state
         .last_peak_amplitude
         .store(peak.to_bits(), Ordering::Relaxed);
@@ -226,9 +228,9 @@ pub async fn play_tidal_track(
         player.set_normalization_gain(norm_gain)?;
         player.play_url(&uri, None)
     })
-        .await
-        .map_err(|e| SoneError::Audio(e.to_string()))?
-        .map_err(SoneError::Audio)?;
+    .await
+    .map_err(|e| SoneError::Audio(e.to_string()))?
+    .map_err(SoneError::Audio)?;
 
     // Save last played track
     if let Some(mut settings) = state.load_settings() {
@@ -264,7 +266,10 @@ pub async fn set_next_track(
 
 #[tauri::command]
 pub fn clear_next_track(state: State<'_, AppState>) -> Result<(), SoneError> {
-    state.audio_player.clear_next_track().map_err(SoneError::Audio)
+    state
+        .audio_player
+        .clear_next_track()
+        .map_err(SoneError::Audio)
 }
 
 /// Pure resolver: returns `StreamInfo` WITHOUT arming the gapless slot or
@@ -493,10 +498,7 @@ pub fn update_mpris_playback_status(
 
 #[tauri::command]
 #[allow(unused_variables)]
-pub fn update_mpris_shuffle(
-    state: State<'_, AppState>,
-    enabled: bool,
-) -> Result<(), SoneError> {
+pub fn update_mpris_shuffle(state: State<'_, AppState>, enabled: bool) -> Result<(), SoneError> {
     #[cfg(target_os = "linux")]
     state
         .mpris
@@ -519,10 +521,7 @@ pub fn update_mpris_fullscreen(
 
 #[tauri::command]
 #[allow(unused_variables)]
-pub fn update_mpris_loop_status(
-    state: State<'_, AppState>,
-    mode: u8,
-) -> Result<(), SoneError> {
+pub fn update_mpris_loop_status(state: State<'_, AppState>, mode: u8) -> Result<(), SoneError> {
     #[cfg(target_os = "linux")]
     state
         .mpris
@@ -546,7 +545,10 @@ mod tests {
     #[test]
     fn ceiling_max_without_secret_drops_hires() {
         // Reproduces the legacy no-secret branch exactly.
-        assert_eq!(quality_tiers("HI_RES_LOSSLESS", false), vec!["LOSSLESS", "HIGH"]);
+        assert_eq!(
+            quality_tiers("HI_RES_LOSSLESS", false),
+            vec!["LOSSLESS", "HIGH"]
+        );
     }
 
     #[test]
@@ -574,7 +576,10 @@ mod tests {
         for ceiling in ["HI_RES_LOSSLESS", "LOSSLESS", "HIGH", "GARBAGE"] {
             for has_secret in [true, false] {
                 let tiers = quality_tiers(ceiling, has_secret);
-                assert!(tiers.contains(&"HIGH"), "ceiling={ceiling} secret={has_secret}");
+                assert!(
+                    tiers.contains(&"HIGH"),
+                    "ceiling={ceiling} secret={has_secret}"
+                );
             }
         }
     }

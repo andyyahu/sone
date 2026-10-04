@@ -266,7 +266,9 @@ export default function McpTab() {
                   </span>
                 </div>
                 {regenError && (
-                  <p className="text-[11px] text-[#ff6666] mt-1.5">{regenError}</p>
+                  <p className="text-[11px] text-[#ff6666] mt-1.5">
+                    {regenError}
+                  </p>
                 )}
               </>
             );

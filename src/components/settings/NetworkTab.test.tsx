@@ -304,8 +304,6 @@ describe("NetworkTab reports a blocked proxy to the user", () => {
 
     fireEvent.click(screen.getByText("Test connection"));
 
-    expect(
-      await screen.findByText("proxy host must be ASCII"),
-    ).toBeTruthy();
+    expect(await screen.findByText("proxy host must be ASCII")).toBeTruthy();
   });
 });

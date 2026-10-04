@@ -27,7 +27,11 @@ pub struct OverlayState {
 }
 
 impl OverlayState {
-    pub fn new() -> (Self, broadcast::Receiver<String>, broadcast::Receiver<String>) {
+    pub fn new() -> (
+        Self,
+        broadcast::Receiver<String>,
+        broadcast::Receiver<String>,
+    ) {
         let (tx, rx) = broadcast::channel(16);
         let (theme_tx, theme_rx) = broadcast::channel(8);
         (
@@ -45,7 +49,11 @@ impl OverlayState {
 
 pub type OverlayStateRef = Arc<RwLock<OverlayState>>;
 
-pub fn new_state() -> (OverlayStateRef, broadcast::Receiver<String>, broadcast::Receiver<String>) {
+pub fn new_state() -> (
+    OverlayStateRef,
+    broadcast::Receiver<String>,
+    broadcast::Receiver<String>,
+) {
     let (state, rx, theme_rx) = OverlayState::new();
     (Arc::new(RwLock::new(state)), rx, theme_rx)
 }

@@ -113,6 +113,9 @@ sys.exit(0)
         // it. Accepting a second spelling means every consumer decides for
         // itself whether to bracket — and `[[::1]]`, which *does* abort, is
         // precisely what that produces when one of them decides twice.
-        eprintln!("host {host:?} -> status {:?} (aborts: {aborts:?})", out.status);
+        eprintln!(
+            "host {host:?} -> status {:?} (aborts: {aborts:?})",
+            out.status
+        );
     }
 }

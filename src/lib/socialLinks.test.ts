@@ -33,8 +33,14 @@ describe("assembleExternalLinks", () => {
       TIKTOK: "   ",
       TWITTER: "",
     });
-    expect(out).toContainEqual({ href: "https://me.com", linkType: "OFFICIAL_HOMEPAGE" });
-    expect(out).toContainEqual({ href: "https://instagram.com/me", linkType: "INSTAGRAM" });
+    expect(out).toContainEqual({
+      href: "https://me.com",
+      linkType: "OFFICIAL_HOMEPAGE",
+    });
+    expect(out).toContainEqual({
+      href: "https://instagram.com/me",
+      linkType: "INSTAGRAM",
+    });
     expect(out.find((l) => l.linkType === "TIKTOK")).toBeUndefined();
     expect(out).toHaveLength(2);
   });

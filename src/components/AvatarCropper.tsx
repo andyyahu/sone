@@ -53,8 +53,8 @@ export default function AvatarCropper({
 
         <div className="px-5 py-4">
           <p className="text-[12px] text-th-text-muted mb-3">
-            TIDAL requires a square photo. Drag to reposition, then zoom to frame
-            it.
+            TIDAL requires a square photo. Drag to reposition, then zoom to
+            frame it.
           </p>
           <div className="relative w-full aspect-square bg-black rounded-lg overflow-hidden">
             <Cropper

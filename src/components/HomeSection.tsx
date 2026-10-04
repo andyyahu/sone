@@ -424,7 +424,9 @@ export default function HomeSection({ section }: HomeSectionProps) {
                 isArtist={isArtist}
                 isFavorited={isFavorited}
                 onFavoriteToggle={onFavoriteToggle}
-                widthClass={isVideo ? "card-scroll-item-video" : "card-scroll-item"}
+                widthClass={
+                  isVideo ? "card-scroll-item-video" : "card-scroll-item"
+                }
                 {...(myTracks && {
                   titleOverride: "Loved Tracks",
                   imageOverride: (

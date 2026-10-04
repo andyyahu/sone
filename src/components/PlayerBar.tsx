@@ -73,8 +73,7 @@ const TrackInfoSection = memo(function TrackInfoSection() {
   // `currentTrack` with no session is a restored/queued video (the session
   // atom isn't persisted) — show it as a video and (re)start it on click.
   const videoItem =
-    currentVideo ??
-    (currentTrack?.itemType === "video" ? currentTrack : null);
+    currentVideo ?? (currentTrack?.itemType === "video" ? currentTrack : null);
   if (videoItem) {
     // artists[] first: videoToTrack always backfills the singular `artist` from
     // artists[0], so preferring it would collapse a multi-artist video to one
@@ -372,7 +371,10 @@ const VideoProgressScrubber = memo(function VideoProgressScrubber() {
       const v = videoElementRef.current;
       if (!track || !v || !duration) return;
       const rect = track.getBoundingClientRect();
-      const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+      const ratio = Math.min(
+        1,
+        Math.max(0, (clientX - rect.left) / rect.width),
+      );
       const target = ratio * duration;
       setPosition(target);
       v.currentTime = target;

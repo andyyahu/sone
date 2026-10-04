@@ -140,7 +140,10 @@ export function getItemTitle(item: any): string {
   return "";
 }
 
-export function playlistCountLabel(numberOfTracks?: number, numberOfVideos?: number): string {
+export function playlistCountLabel(
+  numberOfTracks?: number,
+  numberOfVideos?: number,
+): string {
   const t = numberOfTracks ?? 0;
   const v = numberOfVideos ?? 0;
   const parts: string[] = [];

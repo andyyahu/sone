@@ -176,7 +176,10 @@ const VideoScrubber = memo(function VideoScrubber({
       const v = videoRef.current;
       if (!track || !v || !duration) return;
       const rect = track.getBoundingClientRect();
-      const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+      const ratio = Math.min(
+        1,
+        Math.max(0, (clientX - rect.left) / rect.width),
+      );
       const target = ratio * duration;
       setPosition(target);
       v.currentTime = target;
@@ -482,9 +485,7 @@ export default function VideoPlayer() {
   if (!video) return null;
 
   const artistName =
-    video.artist?.name ||
-    video.artists?.map((a) => a.name).join(", ") ||
-    "";
+    video.artist?.name || video.artists?.map((a) => a.name).join(", ") || "";
 
   const isFavorite = favoriteVideoIds.has(video.id);
 
@@ -524,7 +525,8 @@ export default function VideoPlayer() {
           controlsVisible ? "opacity-100" : "opacity-0 pointer-events-none"
         }`}
         style={{
-          background: "linear-gradient(to bottom, rgba(0,0,0,0.6), transparent)",
+          background:
+            "linear-gradient(to bottom, rgba(0,0,0,0.6), transparent)",
         }}
       >
         <div className="flex flex-col min-w-0">

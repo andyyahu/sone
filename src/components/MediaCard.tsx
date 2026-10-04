@@ -63,7 +63,9 @@ export default function MediaCard({
       : aspect === "promo"
         ? "aspect-[11/8]"
         : "aspect-square";
-  const image = isVideo ? getTidalImageUrl(item.imageId, 640) : getItemImage(item);
+  const image = isVideo
+    ? getTidalImageUrl(item.imageId, 640)
+    : getItemImage(item);
   const title = titleOverride || getItemTitle(item);
   const subtitle = subtitleOverride ?? getItemSubtitle(item, userId);
 

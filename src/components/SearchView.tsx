@@ -850,7 +850,10 @@ function TopHitsList({
                 title="More options"
                 onClick={(e) => {
                   e.stopPropagation();
-                  onMediaContextMenu(videoMedia, { x: e.clientX, y: e.clientY });
+                  onMediaContextMenu(videoMedia, {
+                    x: e.clientX,
+                    y: e.clientY,
+                  });
                 }}
               >
                 <MoreHorizontal size={16} />

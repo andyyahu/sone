@@ -113,8 +113,8 @@ describe("useOverlayBridge", () => {
     await waitFor(() => expect(publishCalls().length).toBeGreaterThan(0));
     const calls = publishCalls();
     const [, args] = calls[calls.length - 1];
-    expect(
-      (args as { track: { coverUrl: string } }).track.coverUrl,
-    ).toContain("cccc/dddd");
+    expect((args as { track: { coverUrl: string } }).track.coverUrl).toContain(
+      "cccc/dddd",
+    );
   });
 });
