@@ -52,6 +52,9 @@ import {
 } from "../api/tidal";
 import { parseLrc, type LrcLine } from "../lib/lrc";
 import { themeAtom } from "../atoms/theme";
+import { currentVideoAtom, videoExpandedAtom } from "../atoms/video";
+import { useDocumentVisible } from "../hooks/useDocumentVisible";
+import { bakeMaximizedBackdrop, maximizedWashStyle } from "./maximizedBackdrop";
 
 function useThemeContext() {
   const theme = useAtomValue(themeAtom);
@@ -63,133 +66,25 @@ function useThemeContext() {
   return { isDark, bgBaseRgb: `${r},${g},${b}` };
 }
 
-// One separable box-blur pass (horizontal or vertical) over RGBA pixels, using a
-// sliding running-sum so cost is O(pixels) regardless of radius. Edges clamped.
-function boxBlurPass(
-  data: Uint8ClampedArray,
-  w: number,
-  h: number,
-  radius: number,
-  horizontal: boolean,
-) {
-  const div = radius * 2 + 1;
-  const lineLen = horizontal ? w : h;
-  const lineCount = horizontal ? h : w;
-  const stride = horizontal ? 4 : w * 4; // step between pixels along a line
-  const lineStep = horizontal ? w * 4 : 4; // step between lines
-  const line = new Float32Array(lineLen * 4);
-  for (let l = 0; l < lineCount; l++) {
-    const base = l * lineStep;
-    let sr = 0,
-      sg = 0,
-      sb = 0,
-      sa = 0;
-    for (let i = -radius; i <= radius; i++) {
-      const p = base + Math.min(lineLen - 1, Math.max(0, i)) * stride;
-      sr += data[p];
-      sg += data[p + 1];
-      sb += data[p + 2];
-      sa += data[p + 3];
-    }
-    for (let x = 0; x < lineLen; x++) {
-      line[x * 4] = sr / div;
-      line[x * 4 + 1] = sg / div;
-      line[x * 4 + 2] = sb / div;
-      line[x * 4 + 3] = sa / div;
-      const pOut =
-        base + Math.min(lineLen - 1, Math.max(0, x - radius)) * stride;
-      const pIn =
-        base + Math.min(lineLen - 1, Math.max(0, x + radius + 1)) * stride;
-      sr += data[pIn] - data[pOut];
-      sg += data[pIn + 1] - data[pOut + 1];
-      sb += data[pIn + 2] - data[pOut + 2];
-      sa += data[pIn + 3] - data[pOut + 3];
-    }
-    for (let x = 0; x < lineLen; x++) {
-      const p = base + x * stride;
-      data[p] = line[x * 4];
-      data[p + 1] = line[x * 4 + 1];
-      data[p + 2] = line[x * 4 + 2];
-      data[p + 3] = line[x * 4 + 3];
-    }
-  }
-}
-
-// Dependency-free near-gaussian blur: 3 box passes per axis (central-limit
-// theorem ≈ gaussian). Runs ONCE per track, never on the per-frame paint path.
-function blurRGBA(
-  data: Uint8ClampedArray,
-  w: number,
-  h: number,
-  radius: number,
-) {
-  if (radius < 1) return;
-  for (let pass = 0; pass < 3; pass++) {
-    boxBlurPass(data, w, h, radius, true);
-    boxBlurPass(data, w, h, radius, false);
-  }
-}
-
 const BlurredBackground = memo(function BlurredBackground({
   coverUrl,
+  isDark,
 }: {
   coverUrl: string | undefined;
+  isDark: boolean;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !coverUrl) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    // Modest bake resolution: upscaling already-blurred pixels stays smooth, and
-    // it keeps the one-time blur cheap so it never hitches playback.
-    const cap = 1280;
-    const sw = window.innerWidth || 1920;
-    const sh = window.innerHeight || 1080;
-    const ratio = Math.min(1, cap / Math.max(sw, sh));
-    const W = Math.round(sw * ratio);
-    const H = Math.round(sh * ratio);
-    const radius = Math.max(1, Math.round(40 * (W / sw)));
-
-    let cancelled = false;
-    const img = new Image();
-    // crossOrigin + cache-bust query: a separate, CORS-clean cache entry the
-    // app's non-CORS <img> loads can't poison. Without this, getImageData can
-    // throw on a tainted canvas and the blur is silently skipped (sharp bg).
-    img.crossOrigin = "anonymous";
-    img.onload = () => {
-      if (cancelled) return;
-      // Draw + blur on an OFFSCREEN canvas, then blit the finished result in one
-      // step. The visible canvas keeps the previous backdrop until the new one
-      // is ready — no black flash on track change.
-      const off = document.createElement("canvas");
-      off.width = W;
-      off.height = H;
-      const octx = off.getContext("2d");
-      if (!octx) return;
-      const scale = Math.max(W / img.width, H / img.height) * 1.1;
-      const dw = img.width * scale;
-      const dh = img.height * scale;
-      octx.drawImage(img, (W - dw) / 2, (H - dh) / 2, dw, dh);
-      try {
-        const id = octx.getImageData(0, 0, W, H);
-        blurRGBA(id.data, W, H, radius);
-        octx.putImageData(id, 0, 0);
-      } catch {
-        return; // tainted/failed — keep the previous backdrop rather than black
-      }
-      if (cancelled) return;
-      if (canvas.width !== W || canvas.height !== H) {
-        canvas.width = W;
-        canvas.height = H;
-      }
-      ctx.drawImage(off, 0, 0);
-    };
-    img.src = `${getTidalImageUrl(coverUrl, 320)}?blur=1`;
-    return () => {
-      cancelled = true;
-    };
-  }, [coverUrl]);
+    return bakeMaximizedBackdrop(
+      canvas,
+      getTidalImageUrl(coverUrl, 320),
+      isDark,
+      window.innerWidth || 1920,
+      window.innerHeight || 1080,
+    );
+  }, [coverUrl, isDark]);
   // A frozen bitmap — no live filter, so each per-frame paint is a cheap blit.
   return <canvas ref={canvasRef} className="w-full h-full object-cover" />;
 });
@@ -197,12 +92,20 @@ const BlurredBackground = memo(function BlurredBackground({
 // ─── MaxProgressScrubber ──────────────────────────────────────────────────
 
 const MaxProgressScrubber = memo(function MaxProgressScrubber({
+  active,
   isDraggingRef,
   resetHideTimer,
 }: {
+  active: boolean;
   isDraggingRef: React.MutableRefObject<boolean>;
   resetHideTimer: () => void;
 }) {
+  const onDraggingChange = useCallback(
+    (dragging: boolean) => {
+      isDraggingRef.current = dragging;
+    },
+    [isDraggingRef],
+  );
   const {
     progressRef,
     currentTrack,
@@ -213,7 +116,11 @@ const MaxProgressScrubber = memo(function MaxProgressScrubber({
     isHoveringProgress,
     setIsHoveringProgress,
     handleProgressMouseDown,
-  } = useProgressScrub({ isDraggingRef, onDragEnd: resetHideTimer });
+  } = useProgressScrub({
+    active,
+    onDraggingChange,
+    onDragEnd: resetHideTimer,
+  });
 
   return (
     <div className="w-full flex items-center gap-2 text-th-text-muted">
@@ -263,6 +170,7 @@ const MaxProgressScrubber = memo(function MaxProgressScrubber({
 // ─── MaxTransportBar ──────────────────────────────────────────────────────
 
 const MaxTransportBar = memo(function MaxTransportBar({
+  active,
   currentTrack,
   controlsVisible,
   isDraggingRef,
@@ -271,6 +179,7 @@ const MaxTransportBar = memo(function MaxTransportBar({
   isDark,
   bgBaseRgb,
 }: {
+  active: boolean;
   currentTrack: {
     title: string;
     artist?: { name?: string };
@@ -330,7 +239,7 @@ const MaxTransportBar = memo(function MaxTransportBar({
           <div className="flex items-center gap-4">
             <button
               onClick={toggleShuffle}
-              className={`w-8 h-8 flex items-center justify-center rounded-full transition-[color,background-color,transform] duration-200 active:scale-90 relative ${
+              className={`w-8 h-8 flex items-center justify-center rounded-full transition-[color,background-color,transform] duration-200 relative ${
                 isShuffle
                   ? "text-th-accent"
                   : "text-th-text-secondary hover:text-th-text-primary hover:bg-th-border-subtle"
@@ -343,13 +252,13 @@ const MaxTransportBar = memo(function MaxTransportBar({
             </button>
             <button
               onClick={playPrevious}
-              className="w-8 h-8 flex items-center justify-center rounded-full text-th-text-secondary hover:text-th-text-primary hover:bg-th-border-subtle transition-[color,background-color,transform] duration-150 active:scale-90"
+              className="w-8 h-8 flex items-center justify-center rounded-full text-th-text-secondary hover:text-th-text-primary hover:bg-th-border-subtle transition-[color,background-color,transform] duration-150"
             >
               <SkipBack size={20} fill="currentColor" />
             </button>
             <button
               onClick={() => (isPlaying ? pauseTrack() : resumeTrack())}
-              className="w-10 h-10 bg-th-text-primary rounded-full flex items-center justify-center hover:scale-105 active:scale-95 transition-transform duration-150"
+              className="w-10 h-10 bg-th-text-primary rounded-full flex items-center justify-center hover:scale-105 transition-transform duration-150"
             >
               {isPlaying ? (
                 <Pause size={19} fill="currentColor" className="text-th-base" />
@@ -363,13 +272,13 @@ const MaxTransportBar = memo(function MaxTransportBar({
             </button>
             <button
               onClick={() => playNext({ explicit: true })}
-              className="w-8 h-8 flex items-center justify-center rounded-full text-th-text-secondary hover:text-th-text-primary hover:bg-th-border-subtle transition-[color,background-color,transform] duration-150 active:scale-90"
+              className="w-8 h-8 flex items-center justify-center rounded-full text-th-text-secondary hover:text-th-text-primary hover:bg-th-border-subtle transition-[color,background-color,transform] duration-150"
             >
               <SkipForward size={20} fill="currentColor" />
             </button>
             <button
               onClick={() => setRepeatMode((repeatMode + 1) % 3)}
-              className={`w-8 h-8 flex items-center justify-center rounded-full transition-[color,background-color,transform] duration-200 active:scale-90 relative ${
+              className={`w-8 h-8 flex items-center justify-center rounded-full transition-[color,background-color,transform] duration-200 relative ${
                 repeatMode > 0
                   ? "text-th-accent"
                   : "text-th-text-secondary hover:text-th-text-primary hover:bg-th-border-subtle"
@@ -387,6 +296,7 @@ const MaxTransportBar = memo(function MaxTransportBar({
             </button>
           </div>
           <MaxProgressScrubber
+            active={active && controlsVisible}
             isDraggingRef={isDraggingRef}
             resetHideTimer={resetHideTimer}
           />
@@ -401,7 +311,7 @@ const MaxTransportBar = memo(function MaxTransportBar({
           />
           <button
             onClick={() => setShowLyrics((v) => !v)}
-            className={`relative transition-[color,transform] duration-150 active:scale-90 ${
+            className={`relative transition-[color,transform] duration-150 ${
               showLyrics
                 ? "text-th-accent"
                 : "text-th-text-faint hover:text-th-text-primary"
@@ -513,8 +423,10 @@ function useLyricsTier() {
 
 const MaximizedLyrics = memo(function MaximizedLyrics({
   tier,
+  active,
 }: {
   tier: Tier;
+  active: boolean;
 }) {
   const currentTrack = useAtomValue(currentTrackAtom);
   const isPlaying = useAtomValue(isPlayingAtom);
@@ -590,7 +502,7 @@ const MaximizedLyrics = memo(function MaximizedLyrics({
 
   // Sync active line — rAF loop with interpolated position, pure DOM updates
   useEffect(() => {
-    if (lrcLines.length === 0 || !isPlaying) return;
+    if (!active || lrcLines.length === 0 || !isPlaying) return;
 
     const applyLine = (idx: number) => {
       const prev = activeLineRef.current;
@@ -636,7 +548,7 @@ const MaximizedLyrics = memo(function MaximizedLyrics({
 
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [lrcLines, isPlaying, lh, baseCls]);
+  }, [active, lrcLines, isPlaying, lh, baseCls]);
 
   if (loading) {
     return (
@@ -723,6 +635,10 @@ const MaximizedLyrics = memo(function MaximizedLyrics({
 
 export default function MaximizedPlayer() {
   const currentTrack = useAtomValue(currentTrackAtom);
+  const currentVideo = useAtomValue(currentVideoAtom);
+  const videoExpanded = useAtomValue(videoExpandedAtom);
+  const documentVisible = useDocumentVisible();
+  const active = documentVisible && !(currentVideo && videoExpanded);
   const setMaximized = useSetAtom(maximizedPlayerAtom);
   const favoriteTrackIds = useAtomValue(favoriteTrackIdsAtom);
   const setFavoriteTrackIds = useSetAtom(favoriteTrackIdsAtom);
@@ -744,13 +660,17 @@ export default function MaximizedPlayer() {
     if (!coverKey) return;
     setHiResReady(false);
     let cancelled = false;
-    fetchCachedImageUrl(getTidalImageUrl(coverKey, 1280))
+    const controller = new AbortController();
+    fetchCachedImageUrl(getTidalImageUrl(coverKey, 1280), {
+      signal: controller.signal,
+    })
       .then(() => {
         if (!cancelled) setHiResReady(true);
       })
       .catch(() => {});
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, [coverKey]);
 
@@ -893,6 +813,8 @@ export default function MaximizedPlayer() {
 
   if (!currentTrack) return null;
 
+  const wash = maximizedWashStyle(isDark, bgBaseRgb);
+
   return (
     <div
       role="dialog"
@@ -903,14 +825,13 @@ export default function MaximizedPlayer() {
     >
       {/* Blurred album art background — pre-rendered to canvas once, zero per-frame cost */}
       <div className="absolute inset-0 overflow-hidden">
-        <BlurredBackground coverUrl={currentTrack.album?.cover} />
+        <BlurredBackground
+          coverUrl={currentTrack.album?.cover}
+          isDark={isDark}
+        />
         <div
-          className={`absolute inset-0 ${!isDark ? "backdrop-brightness-[1.6] backdrop-saturate-50" : ""}`}
-          style={{
-            backgroundColor: isDark
-              ? "rgba(0,0,0,0.6)"
-              : `rgba(${bgBaseRgb},0.45)`,
-          }}
+          className={wash.className}
+          style={{ backgroundColor: wash.backgroundColor }}
         />
       </div>
 
@@ -951,6 +872,7 @@ export default function MaximizedPlayer() {
           >
             {animatedCover ? (
               <TidalVideoCover
+                active={active}
                 cover={coverKey}
                 videoCover={currentTrack.album?.videoCover}
                 size={1280}
@@ -959,7 +881,7 @@ export default function MaximizedPlayer() {
                 className="aspect-square rounded-lg overflow-hidden"
               />
             ) : (
-              <TiltCover className="aspect-square rounded-lg">
+              <TiltCover active={active} className="aspect-square rounded-lg">
                 <TidalImage
                   src={getTidalImageUrl(coverKey, hiResReady ? 1280 : 160)}
                   alt={currentTrack.album?.title || currentTrack.title}
@@ -1000,7 +922,7 @@ export default function MaximizedPlayer() {
           <div className="flex items-center gap-3">
             <button
               onClick={toggleLike}
-              className={`transition-[color,transform] duration-200 active:scale-90 ${
+              className={`transition-[color,transform] duration-200 ${
                 isLiked
                   ? "text-th-accent"
                   : `${isDark ? "text-th-text-faint" : "text-th-text-secondary"} hover:text-th-text-primary`
@@ -1025,7 +947,7 @@ export default function MaximizedPlayer() {
         {/* Right: Lyrics panel (only when toggled on) */}
         {showLyrics && (
           <div className="flex-1 h-[80vmin] max-h-[1000px] pointer-events-none">
-            <MaximizedLyrics tier={lyricsTier} />
+            <MaximizedLyrics tier={lyricsTier} active={active} />
           </div>
         )}
       </div>
@@ -1042,6 +964,7 @@ export default function MaximizedPlayer() {
 
       {/* Bottom bar — memo'd to isolate transport atom subscriptions */}
       <MaxTransportBar
+        active={active}
         currentTrack={currentTrack}
         controlsVisible={controlsVisible}
         isDraggingRef={isDraggingRef}

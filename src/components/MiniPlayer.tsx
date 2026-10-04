@@ -20,6 +20,10 @@ import {
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useMiniplayerBridge } from "../hooks/useMiniplayerBridge";
+import {
+  useMiniplayerPosition,
+  type MiniplayerClock,
+} from "../hooks/miniplayerClock";
 import { getTidalImageUrl, getTrackDisplayTitle } from "../types";
 import { formatTime } from "../lib/format";
 import { isNavigableSource } from "../lib/playbackSource";
@@ -594,12 +598,14 @@ function VolumeSlider({
 // ─── ProgressBar ────────────────────────────────────────────────────────────
 
 function ProgressBar({
-  displayPosition,
+  positionClock,
+  containerRef,
   duration,
   sendCommand,
   colors,
 }: {
-  displayPosition: number;
+  positionClock: MiniplayerClock;
+  containerRef: RefObject<HTMLDivElement | null>;
   duration: number;
   sendCommand: (action: string, value?: number) => void;
   colors: VibrantColors;
@@ -607,6 +613,27 @@ function ProgressBar({
   const barRef = useRef<HTMLDivElement>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [dragProgress, setDragProgress] = useState(0);
+  const [hovered, setHovered] = useState(false);
+
+  // The bar is visible only on window hover. Keep this subscription in the
+  // progress leaf so neither ticks nor hover changes render the artwork.
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const enter = () => setHovered(true);
+    const leave = () => setHovered(false);
+    setHovered(container.matches(":hover"));
+    container.addEventListener("mouseenter", enter);
+    container.addEventListener("mouseleave", leave);
+    return () => {
+      container.removeEventListener("mouseenter", enter);
+      container.removeEventListener("mouseleave", leave);
+    };
+  }, [containerRef]);
+  const displayPosition = useMiniplayerPosition(
+    positionClock,
+    duration > 0 && (hovered || isDragging),
+  );
 
   const getProgressFromMouse = useCallback(
     (clientX: number) => {
@@ -834,7 +861,7 @@ function NarrowTier({
         )}
         <button
           onClick={() => sendCommand("toggle-play")}
-          className="w-8 h-8 rounded-full flex items-center justify-center hover:scale-105 active:scale-95 transition-transform flex-shrink-0"
+          className="w-8 h-8 rounded-full flex items-center justify-center hover:scale-105 transition-transform flex-shrink-0"
           style={{ backgroundColor: colors.textPrimary, color: colors.bg }}
         >
           {isPlaying ? (
@@ -1021,7 +1048,7 @@ function CompactTier({
         </button>
         <button
           onClick={() => sendCommand("toggle-play")}
-          className="w-8 h-8 rounded-full flex items-center justify-center hover:scale-105 active:scale-95 transition-transform flex-shrink-0"
+          className="w-8 h-8 rounded-full flex items-center justify-center hover:scale-105 transition-transform flex-shrink-0"
           style={{ backgroundColor: colors.textPrimary, color: colors.bg }}
         >
           {isPlaying ? (
@@ -1076,7 +1103,8 @@ function FullTier({
   repeat,
   volume,
   bitPerfect,
-  displayPosition,
+  positionClock,
+  containerRef,
   duration,
   playbackSourceLabel,
   sendCommand,
@@ -1091,7 +1119,8 @@ function FullTier({
   repeat: number;
   volume: number;
   bitPerfect: boolean;
-  displayPosition: number;
+  positionClock: MiniplayerClock;
+  containerRef: RefObject<HTMLDivElement | null>;
   duration: number;
   playbackSourceLabel: { type: string; name: string } | null;
   sendCommand: (action: string, value?: number) => void;
@@ -1141,7 +1170,8 @@ function FullTier({
       {/* Progress bar — visible on hover */}
       <div className="flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity duration-200 mt-2">
         <ProgressBar
-          displayPosition={displayPosition}
+          positionClock={positionClock}
+          containerRef={containerRef}
           duration={duration}
           sendCommand={sendCommand}
           colors={colors}
@@ -1225,7 +1255,7 @@ function ErrorOverlay({ error }: { error?: string }) {
 export default function MiniPlayer() {
   const containerRef = useRef<HTMLDivElement>(null);
   const { tier, width, height } = useTier(containerRef);
-  const { state, displayPosition, isPlaying, sendCommand, sendVolume } =
+  const { state, positionClock, isPlaying, sendCommand, sendVolume } =
     useMiniplayerBridge();
   const colors = useVibrantColors(state.track?.album?.vibrantColor);
 
@@ -1315,7 +1345,8 @@ export default function MiniPlayer() {
             repeat={state.repeat}
             volume={state.volume}
             bitPerfect={state.bitPerfect}
-            displayPosition={displayPosition}
+            positionClock={positionClock}
+            containerRef={containerRef}
             duration={state.duration}
             playbackSourceLabel={state.playbackSourceLabel}
             sendCommand={sendCommand}

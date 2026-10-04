@@ -19,7 +19,7 @@ import { formatTime } from "../lib/format";
 import { isNavigableSource } from "../lib/playbackSource";
 import { getTrackArtistDisplay } from "../utils/itemHelpers";
 import TidalImage from "./TidalImage";
-import { useCallback, useRef, useState, useEffect, memo } from "react";
+import { useCallback, useRef, useState, memo } from "react";
 import { useAtomValue, useAtom, useSetAtom } from "jotai";
 import {
   currentTrackAtom,
@@ -32,12 +32,14 @@ import {
   currentVideoAtom,
   videoPlayingAtom,
   videoFullscreenAtom,
+  videoExpandedAtom,
 } from "../atoms/video";
 import { favoriteTrackIdsAtom, favoriteVideoIdsAtom } from "../atoms/favorites";
 import { maximizedPlayerAtom } from "../atoms/ui";
 import { usePlaybackActions } from "../hooks/usePlaybackActions";
 import { useVideoPlayback } from "../hooks/useVideoPlayback";
 import { useProgressScrub } from "../hooks/useProgressScrub";
+import { useVideoProgress } from "../hooks/useVideoProgress";
 import { videoElementRef } from "../lib/videoElement";
 import { useFavorites } from "../hooks/useFavorites";
 import { useDrawer } from "../hooks/useDrawer";
@@ -92,7 +94,7 @@ const TrackInfoSection = memo(function TrackInfoSection() {
           <TidalImage
             src={getTidalImageUrl(videoItem.imageId, 160)}
             alt={videoItem.title}
-            className="w-full h-full object-cover transform group-hover:scale-110 transition-transform duration-500"
+            className="w-full h-full object-cover transform group-hover:scale-110 transition-transform duration-300 ease-settle motion-reduce:transition-none"
           />
         </div>
         <div className="flex flex-col justify-center min-w-0">
@@ -125,7 +127,7 @@ const TrackInfoSection = memo(function TrackInfoSection() {
         <TidalImage
           src={getTidalImageUrl(currentTrack.album?.cover, 160)}
           alt={currentTrack.album?.title || currentTrack.title}
-          className="w-full h-full object-cover transform group-hover:scale-110 transition-transform duration-500"
+          className="w-full h-full object-cover transform group-hover:scale-110 transition-transform duration-300 ease-settle motion-reduce:transition-none"
         />
       </div>
       <div className="flex flex-col justify-center min-w-0">
@@ -202,7 +204,7 @@ const FavoriteButton = memo(function FavoriteButton() {
   return (
     <button
       onClick={toggleLike}
-      className={`ml-1 flex-shrink-0 transition-[color,transform] duration-200 active:scale-90 ${
+      className={`ml-1 flex-shrink-0 transition-[color,transform] duration-200 ${
         isLiked
           ? "text-th-accent"
           : "text-th-text-faint hover:text-th-text-primary"
@@ -231,7 +233,7 @@ const ContextMenuButton = memo(function ContextMenuButton() {
       <button
         ref={anchorRef}
         onClick={() => setShowMenu(true)}
-        className="ml-0.5 flex-shrink-0 text-th-text-faint hover:text-th-text-primary transition-colors duration-200 active:scale-90"
+        className="ml-0.5 flex-shrink-0 text-th-text-faint hover:text-th-text-primary transition-colors duration-200"
         title="More options"
       >
         <MoreHorizontal size={16} />
@@ -336,34 +338,23 @@ export const PlayingFromLabel = memo(function PlayingFromLabel() {
 });
 
 // ─── VideoProgressScrubber ─────────────────────────────────────────────────
-// Bound to the shared <video> element (not playbackPosition.ts). Polls via rAF
-// but throttles the React state update to ~150 ms — same rationale as the
-// overlay scrubber: a progress bar has no need for 60 Hz repaints.
+// Bound to the shared <video> element, active only while the bar is visible.
 
-const VideoProgressScrubber = memo(function VideoProgressScrubber() {
-  const [position, setPosition] = useState(0);
-  const [duration, setDuration] = useState(0);
+const VideoProgressScrubber = memo(function VideoProgressScrubber({
+  active,
+}: {
+  active: boolean;
+}) {
   const [dragging, setDragging] = useState(false);
   const [hovering, setHovering] = useState(false);
   const [showTimeLeft, setShowTimeLeft] = useState(false);
   const isDraggingRef = useRef(false);
   const trackRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    let raf: number;
-    let last = 0;
-    const tick = (now: number) => {
-      const v = videoElementRef.current;
-      if (v && !isDraggingRef.current && now - last >= 150) {
-        last = now;
-        setPosition(v.currentTime);
-        if (v.duration && !Number.isNaN(v.duration)) setDuration(v.duration);
-      }
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, []);
+  const { position, duration, setPosition } = useVideoProgress(
+    videoElementRef,
+    active,
+    isDraggingRef,
+  );
 
   const seekToClientX = useCallback(
     (clientX: number) => {
@@ -379,7 +370,7 @@ const VideoProgressScrubber = memo(function VideoProgressScrubber() {
       setPosition(target);
       v.currentTime = target;
     },
-    [duration],
+    [duration, setPosition],
   );
 
   const handleMouseDown = useCallback(
@@ -457,7 +448,11 @@ const VideoProgressScrubber = memo(function VideoProgressScrubber() {
 
 // ─── ProgressScrubber ──────────────────────────────────────────────────────
 
-const ProgressScrubber = memo(function ProgressScrubber() {
+const ProgressScrubber = memo(function ProgressScrubber({
+  active,
+}: {
+  active: boolean;
+}) {
   const {
     progressRef,
     currentTrack,
@@ -468,7 +463,7 @@ const ProgressScrubber = memo(function ProgressScrubber() {
     isHoveringProgress,
     setIsHoveringProgress,
     handleProgressMouseDown,
-  } = useProgressScrub();
+  } = useProgressScrub({ active });
   const [showTimeLeft, setShowTimeLeft] = useState(false);
 
   return (
@@ -528,6 +523,8 @@ const ProgressScrubber = memo(function ProgressScrubber() {
 // ─── TransportControls ─────────────────────────────────────────────────────
 
 const TransportControls = memo(function TransportControls() {
+  const maximized = useAtomValue(maximizedPlayerAtom);
+  const videoExpanded = useAtomValue(videoExpandedAtom);
   const isPlaying = useAtomValue(isPlayingAtom);
   const currentVideo = useAtomValue(currentVideoAtom);
   const currentTrack = useAtomValue(currentTrackAtom);
@@ -543,6 +540,7 @@ const TransportControls = memo(function TransportControls() {
   // queue exactly as for audio. Only play/pause + the scrubber target the
   // shared <video> element in video mode.
   const videoMode = !!currentVideo;
+  const progressActive = !maximized && !(videoMode && videoExpanded);
   const showPlaying = videoMode ? videoPlaying : isPlaying;
 
   const toggleVideoPlay = useCallback(() => {
@@ -564,7 +562,7 @@ const TransportControls = memo(function TransportControls() {
       <div className="flex items-center gap-4">
         <button
           onClick={toggleShuffle}
-          className={`w-8 h-8 flex items-center justify-center rounded-full transition-[color,background-color,transform] duration-200 active:scale-90 relative ${
+          className={`w-8 h-8 flex items-center justify-center rounded-full transition-[color,background-color,transform] duration-200 relative ${
             isShuffle
               ? "text-th-accent"
               : "text-th-text-secondary hover:text-th-text-primary hover:bg-th-border-subtle"
@@ -577,13 +575,13 @@ const TransportControls = memo(function TransportControls() {
         </button>
         <button
           onClick={playPrevious}
-          className="w-8 h-8 flex items-center justify-center rounded-full text-th-text-secondary hover:text-th-text-primary hover:bg-th-border-subtle transition-[color,background-color,transform] duration-150 active:scale-90"
+          className="w-8 h-8 flex items-center justify-center rounded-full text-th-text-secondary hover:text-th-text-primary hover:bg-th-border-subtle transition-[color,background-color,transform] duration-150"
         >
           <SkipBack size={18} fill="currentColor" />
         </button>
         <button
           onClick={onPlayPause}
-          className="w-9 h-9 bg-th-text-primary rounded-full flex items-center justify-center hover:scale-105 active:scale-95 transition-transform duration-150"
+          className="w-9 h-9 bg-th-text-primary rounded-full flex items-center justify-center hover:scale-105 transition-transform duration-150"
         >
           {showPlaying ? (
             <Pause size={17} fill="currentColor" className="text-th-base" />
@@ -597,13 +595,13 @@ const TransportControls = memo(function TransportControls() {
         </button>
         <button
           onClick={() => playNext({ explicit: true })}
-          className="w-8 h-8 flex items-center justify-center rounded-full text-th-text-secondary hover:text-th-text-primary hover:bg-th-border-subtle transition-[color,background-color,transform] duration-150 active:scale-90"
+          className="w-8 h-8 flex items-center justify-center rounded-full text-th-text-secondary hover:text-th-text-primary hover:bg-th-border-subtle transition-[color,background-color,transform] duration-150"
         >
           <SkipForward size={18} fill="currentColor" />
         </button>
         <button
           onClick={() => setRepeatMode((repeatMode + 1) % 3)}
-          className={`w-8 h-8 flex items-center justify-center rounded-full transition-[color,background-color,transform] duration-200 active:scale-90 relative ${
+          className={`w-8 h-8 flex items-center justify-center rounded-full transition-[color,background-color,transform] duration-200 relative ${
             repeatMode > 0
               ? "text-th-accent"
               : "text-th-text-secondary hover:text-th-text-primary hover:bg-th-border-subtle"
@@ -622,7 +620,11 @@ const TransportControls = memo(function TransportControls() {
       </div>
 
       {/* Progress bar */}
-      {videoMode ? <VideoProgressScrubber /> : <ProgressScrubber />}
+      {videoMode ? (
+        <VideoProgressScrubber active={progressActive} />
+      ) : (
+        <ProgressScrubber active={progressActive} />
+      )}
     </div>
   );
 });

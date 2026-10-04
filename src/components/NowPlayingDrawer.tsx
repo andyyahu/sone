@@ -41,7 +41,7 @@ import {
   maximizedPlayerAtom,
   videoCoversAtom,
 } from "../atoms/ui";
-import { currentVideoAtom } from "../atoms/video";
+import { currentVideoAtom, videoExpandedAtom } from "../atoms/video";
 import { usePlaybackActions } from "../hooks/usePlaybackActions";
 import { useVideoPlayback } from "../hooks/useVideoPlayback";
 import { useDrawer } from "../hooks/useDrawer";
@@ -61,6 +61,7 @@ import BioText from "./BioText";
 import { isTrackUnavailable } from "../lib/trackAvailability";
 import { COVER_TEXT_GAP, MAX_COVER_SIZE } from "../lib/coverFit";
 import { useFittedCoverSize } from "../hooks/useFittedCoverSize";
+import { useDocumentVisible } from "../hooks/useDocumentVisible";
 import {
   getTidalImageUrl,
   getTrackDisplayTitle,
@@ -646,7 +647,7 @@ function SuggestedTrackRow({
       <div
         onClick={handleRowClick}
         onContextMenu={handleRightClick}
-        className={`flex items-center gap-3 px-3 py-2 rounded-md cursor-pointer group transition-[background-color] duration-150 ${
+        className={`flex items-center gap-3 px-3 py-2 rounded-md cursor-pointer group transition-[background-color] duration-150 ease-settle motion-reduce:transition-none active:bg-th-hl-strong ${
           isActive ? "bg-th-hl-med" : "hover:bg-th-hl-faint"
         }`}
       >
@@ -959,7 +960,7 @@ const LyricsLine = memo(function LyricsLine({
   );
 });
 
-const LyricsTab = memo(function LyricsTab() {
+const LyricsTab = memo(function LyricsTab({ active }: { active: boolean }) {
   const currentTrack = useAtomValue(currentTrackAtom);
   const isPlaying = useAtomValue(isPlayingAtom);
   const [lyrics, setLyrics] = useState<Lyrics | null>(null);
@@ -1010,24 +1011,17 @@ const LyricsTab = memo(function LyricsTab() {
     };
   }, [currentTrack?.id]);
 
-  // Detect user-initiated scrolls vs programmatic scrolls
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el || lrcLines.length === 0) return;
-
-    const onScroll = () => {
-      if (isAutoScrolling.current) return;
-      setUserScrolled(true);
-      clearTimeout(scrollTimeout.current);
-    };
-
-    el.addEventListener("scroll", onScroll, { passive: true });
-    return () => el.removeEventListener("scroll", onScroll);
-  }, [lrcLines]);
+  // Attach with the actual scroll container. Lyrics and the loading placeholder
+  // can settle in separate commits, before an effect can observe its ref.
+  const handleScroll = useCallback(() => {
+    if (isAutoScrolling.current) return;
+    setUserScrolled(true);
+    clearTimeout(scrollTimeout.current);
+  }, []);
 
   // Sync active line with interpolated position — rAF loop, state update only on line change
   useEffect(() => {
-    if (lrcLines.length === 0 || !isPlaying) return;
+    if (!active || lrcLines.length === 0 || !isPlaying) return;
 
     let rafId: number;
     const tick = () => {
@@ -1049,7 +1043,7 @@ const LyricsTab = memo(function LyricsTab() {
 
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [lrcLines, isPlaying]);
+  }, [active, lrcLines, isPlaying]);
 
   // Auto-scroll to active line (only if user hasn't scrolled)
   const scrollToLine = useCallback((idx: number) => {
@@ -1065,8 +1059,8 @@ const LyricsTab = memo(function LyricsTab() {
   }, []);
 
   useEffect(() => {
-    if (activeLine >= 0 && !userScrolled) scrollToLine(activeLine);
-  }, [activeLine, userScrolled, scrollToLine]);
+    if (active && activeLine >= 0 && !userScrolled) scrollToLine(activeLine);
+  }, [active, activeLine, userScrolled, scrollToLine]);
 
   // "Sync lyrics" button handler
   const handleResync = useCallback(() => {
@@ -1111,6 +1105,7 @@ const LyricsTab = memo(function LyricsTab() {
       <div className="relative overflow-hidden h-full">
         <div
           ref={containerRef}
+          onScroll={handleScroll}
           className="h-full overflow-y-auto overflow-x-hidden flex flex-col gap-3 py-10 pr-0 scrollbar-thin scrollbar-thumb-th-button scrollbar-track-transparent"
           dir={lyrics?.isRightToLeft ? "rtl" : "ltr"}
         >
@@ -1135,7 +1130,7 @@ const LyricsTab = memo(function LyricsTab() {
         {userScrolled && (
           <button
             onClick={handleResync}
-            className="absolute bottom-4 right-8 flex items-center gap-2 px-4 py-2.5 bg-th-accent text-th-on-accent text-[12px] font-bold rounded-full shadow-lg shadow-black/40 hover:brightness-110 active:scale-95 transition-[filter,transform] duration-150 animate-fadeIn"
+            className="absolute bottom-4 right-8 flex items-center gap-2 px-4 py-2.5 bg-th-accent text-th-on-accent text-[12px] font-bold rounded-full shadow-lg shadow-black/40 hover:brightness-110 transition-[filter,transform] duration-150 animate-fadeIn"
           >
             <Mic2 size={14} />
             Sync lyrics
@@ -1401,7 +1396,7 @@ function TrackRow({
           e.stopPropagation();
           setContextMenu({ x: e.clientX, y: e.clientY });
         }}
-        className={`flex items-center gap-3 px-3 py-2 rounded-md transition-[background-color] duration-150 ${
+        className={`flex items-center gap-3 px-3 py-2 rounded-md transition-[background-color] duration-150 ease-settle motion-reduce:transition-none active:bg-th-hl-strong ${
           unavailable ? "cursor-default" : "cursor-pointer group"
         } ${
           isActive && !unavailable
@@ -1583,12 +1578,20 @@ export default function NowPlayingDrawer() {
     DISMISS_PRIORITY.drawer,
   );
   const setMaximized = useSetAtom(maximizedPlayerAtom);
+  const maximized = useAtomValue(maximizedPlayerAtom);
   const nativeChrome = useAtomValue(decorationsAtom);
   const hideTitleBar = useAtomValue(hideTitleBarAtom);
   // The custom title bar is in normal flow, so a top:0 overlay paints over its
   // drag region and window buttons — leave it uncovered when it's showing.
   const titleBarInset = !nativeChrome && !hideTitleBar ? TITLEBAR_HEIGHT : 0;
   const currentVideo = useAtomValue(currentVideoAtom);
+  const videoExpanded = useAtomValue(videoExpandedAtom);
+  const documentVisible = useDocumentVisible();
+  const active =
+    drawerOpen &&
+    documentVisible &&
+    !maximized &&
+    !(currentVideo && videoExpanded);
   const { fullscreenVideo } = useVideoPlayback();
   const {
     columnRef: coverColumnRef,
@@ -1661,6 +1664,7 @@ export default function NowPlayingDrawer() {
           >
             {animatedCover ? (
               <TidalVideoCover
+                active={active}
                 cover={currentTrack.album?.cover}
                 videoCover={currentTrack.album?.videoCover}
                 size={1280}
@@ -1669,7 +1673,7 @@ export default function NowPlayingDrawer() {
                 className="w-full h-full rounded-lg overflow-hidden"
               />
             ) : (
-              <TiltCover className="w-full h-full rounded-lg">
+              <TiltCover active={active} className="w-full h-full rounded-lg">
                 <TidalImage
                   src={getTidalImageUrl(trackCoverId(currentTrack), 640)}
                   alt={currentTrack.album?.title || currentTrack.title}
@@ -1740,7 +1744,7 @@ export default function NowPlayingDrawer() {
             )}
             {activeTab === "lyrics" && (
               <div className="absolute inset-0 overflow-y-auto pl-6 py-4 scrollbar-thin scrollbar-thumb-th-button scrollbar-track-transparent">
-                <LyricsTab />
+                <LyricsTab active={active} />
               </div>
             )}
             {activeTab === "credits" && (

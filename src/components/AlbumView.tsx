@@ -7,6 +7,9 @@ import {
   Share,
 } from "lucide-react";
 import { useState, useEffect, useCallback, useMemo } from "react";
+import { atom, useAtomValue } from "jotai";
+import { drawerOpenAtom, maximizedPlayerAtom } from "../atoms/ui";
+import { currentVideoAtom, videoExpandedAtom } from "../atoms/video";
 import { useToast } from "../contexts/ToastContext";
 import SourcePlayButton from "./SourcePlayButton";
 import { usePlaybackActions } from "../hooks/usePlaybackActions";
@@ -14,6 +17,7 @@ import { useFavorites } from "../hooks/useFavorites";
 import { useNavigation } from "../hooks/useNavigation";
 import { getAlbumPage } from "../api/tidal";
 import { getApiStatus, safeErrorMessage } from "../lib/errorUtils";
+import { headerActionClass } from "./headerChrome";
 import NotFoundPage from "./NotFoundPage";
 import {
   type Track,
@@ -45,6 +49,13 @@ interface AlbumViewProps {
   onBack: () => void;
 }
 
+const albumCoverActiveAtom = atom(
+  (get) =>
+    !get(drawerOpenAtom) &&
+    !get(maximizedPlayerAtom) &&
+    !(get(currentVideoAtom) && get(videoExpandedAtom)),
+);
+
 function formatReleaseDateLong(dateStr: string): string {
   try {
     const d = new Date(dateStr);
@@ -65,6 +76,7 @@ export default function AlbumView({
   albumInfo,
   onBack,
 }: AlbumViewProps) {
+  const coverActive = useAtomValue(albumCoverActiveAtom);
   const { playTrack, setShuffledQueue, playFromSource, playAllFromSource } =
     usePlaybackActions();
   const {
@@ -233,10 +245,10 @@ export default function AlbumView({
   );
   const qualityBadgeClass =
     qualityBadge?.tier === "max"
-      ? "bg-th-accent/20 backdrop-blur-md text-th-text-primary"
+      ? "bg-th-accent text-th-on-accent"
       : qualityBadge?.tier === "hifi"
-        ? "bg-th-accent/15 backdrop-blur-md text-th-text-primary"
-        : "bg-th-button-hover/40 backdrop-blur-md text-th-text-primary";
+        ? "bg-th-elevated text-th-accent"
+        : "bg-th-elevated text-th-text-primary";
 
   const albumMediaItem: MediaItemType = {
     id: albumId,
@@ -388,6 +400,7 @@ export default function AlbumView({
           <div className="px-8 pb-8 pt-8 flex items-end gap-7 relative z-10">
             <div className="w-[232px] h-[232px] shrink-0 rounded-lg overflow-hidden shadow-[0_16px_48px_8px_rgba(0,0,0,0.55)] bg-th-surface-hover">
               <TidalVideoCover
+                active={coverActive}
                 cover={displayCover}
                 videoCover={album?.videoCover}
                 size={640}
@@ -457,10 +470,7 @@ export default function AlbumView({
                 sourceId={albumId}
                 onPlay={handlePlayAll}
               />
-              <button
-                onClick={handleShuffle}
-                className="flex items-center gap-2 px-6 py-2.5 bg-th-button/40 backdrop-blur-md text-th-text-primary font-bold text-sm rounded-full hover:bg-th-button/60 hover:scale-[1.03] transition-[transform,filter,background-color] duration-150"
-              >
+              <button onClick={handleShuffle} className={headerActionClass}>
                 <Shuffle size={18} />
                 Shuffle
               </button>

@@ -32,6 +32,10 @@ import {
 } from "../atoms/video";
 import { useVideoPlayback, type VideoQuality } from "../hooks/useVideoPlayback";
 import { usePlaybackActions } from "../hooks/usePlaybackActions";
+import {
+  notifyVideoProgressSourceChanged,
+  useVideoProgress,
+} from "../hooks/useVideoProgress";
 import { useFavorites } from "../hooks/useFavorites";
 import { useEscapeDismiss } from "../hooks/useEscapeDismiss";
 import { DISMISS_PRIORITY } from "../lib/dismissStack";
@@ -136,39 +140,24 @@ function attachHls(
 // ─── Scrubber (bound to the <video> element, not playbackPosition.ts) ────────
 
 const VideoScrubber = memo(function VideoScrubber({
+  active,
   videoRef,
   resetHideTimer,
   isDraggingRef,
 }: {
+  active: boolean;
   videoRef: RefObject<HTMLVideoElement | null>;
   resetHideTimer: () => void;
   isDraggingRef: RefObject<boolean>;
 }) {
-  const [position, setPosition] = useState(0);
-  const [duration, setDuration] = useState(0);
+  const { position, duration, setPosition } = useVideoProgress(
+    videoRef,
+    active,
+    isDraggingRef,
+  );
   const [dragging, setDragging] = useState(false);
   const [hovering, setHovering] = useState(false);
   const trackRef = useRef<HTMLDivElement>(null);
-
-  // Poll the element's currentTime via rAF, but throttle the React state update to
-  // ~6-7 Hz. Updating every frame (60 Hz) re-renders + repaints the progress bar each
-  // frame, which at 4K fullscreen contends with video compositing and causes stutter.
-  // A progress bar has no need for 60 Hz; ~150 ms is visually identical and far cheaper.
-  useEffect(() => {
-    let raf: number;
-    let last = 0;
-    const tick = (now: number) => {
-      const v = videoRef.current;
-      if (v && !isDraggingRef.current && now - last >= 150) {
-        last = now;
-        setPosition(v.currentTime);
-        if (v.duration && !Number.isNaN(v.duration)) setDuration(v.duration);
-      }
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [videoRef, isDraggingRef]);
 
   const seekToClientX = useCallback(
     (clientX: number) => {
@@ -184,7 +173,7 @@ const VideoScrubber = memo(function VideoScrubber({
       setPosition(target);
       v.currentTime = target;
     },
-    [videoRef, duration],
+    [videoRef, duration, setPosition],
   );
 
   const handleMouseDown = useCallback(
@@ -332,8 +321,10 @@ export default function VideoPlayer() {
   // Publish the live element so the player bar can drive it when minimized.
   useEffect(() => {
     videoElementRef.current = videoRef.current;
+    notifyVideoProgressSourceChanged();
     return () => {
       videoElementRef.current = null;
+      notifyVideoProgressSourceChanged();
     };
   }, []);
 
@@ -561,6 +552,7 @@ export default function VideoPlayer() {
         }}
       >
         <VideoScrubber
+          active={expanded && controlsVisible}
           videoRef={videoRef}
           resetHideTimer={resetHideTimer}
           isDraggingRef={isDraggingRef}
@@ -593,7 +585,7 @@ export default function VideoPlayer() {
                 <button
                   ref={menuAnchorRef}
                   onClick={() => setMenuOpen(true)}
-                  className="text-th-text-faint hover:text-th-text-primary transition-colors duration-150 active:scale-90"
+                  className="text-th-text-faint hover:text-th-text-primary transition-colors duration-150"
                   title="More options"
                 >
                   <MoreHorizontal size={16} />
@@ -625,14 +617,14 @@ export default function VideoPlayer() {
             </button>
             <button
               onClick={playPrevious}
-              className="text-th-text-secondary hover:text-th-text-primary transition-colors duration-150 active:scale-90"
+              className="text-th-text-secondary hover:text-th-text-primary transition-colors duration-150"
               title="Previous"
             >
               <SkipBack size={18} fill="currentColor" />
             </button>
             <button
               onClick={togglePlay}
-              className="w-9 h-9 bg-th-text-primary rounded-full flex items-center justify-center hover:scale-105 active:scale-95 transition-transform duration-150"
+              className="w-9 h-9 bg-th-text-primary rounded-full flex items-center justify-center hover:scale-105 transition-transform duration-150"
             >
               {isPlaying ? (
                 <Pause size={17} fill="currentColor" className="text-th-base" />
@@ -646,7 +638,7 @@ export default function VideoPlayer() {
             </button>
             <button
               onClick={() => playNext({ explicit: true })}
-              className="text-th-text-secondary hover:text-th-text-primary transition-colors duration-150 active:scale-90"
+              className="text-th-text-secondary hover:text-th-text-primary transition-colors duration-150"
               title="Next"
             >
               <SkipForward size={18} fill="currentColor" />

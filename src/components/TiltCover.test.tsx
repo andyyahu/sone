@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { render } from "@testing-library/react";
-import TiltCover from "./TiltCover";
+import { TiltCover } from "./TiltCover";
 
 describe("TiltCover", () => {
   it("renders a canvas when enabled (default)", () => {

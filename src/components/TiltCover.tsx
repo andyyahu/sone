@@ -91,6 +91,8 @@ void main() {
 
 interface GlState {
   gl: WebGL2RenderingContext;
+  prog: WebGLProgram;
+  buf: WebGLBuffer | null;
   tex: WebGLTexture | null;
   maxAniso: number; // 0 if extension unavailable
   uAng: WebGLUniformLocation | null;
@@ -137,6 +139,9 @@ function initGl(canvas: HTMLCanvasElement): GlState | null {
     return null;
   }
   gl.useProgram(prog);
+  // The linked program retains its shaders; the source objects can be freed.
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
 
   const buf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, buf);
@@ -179,6 +184,8 @@ function initGl(canvas: HTMLCanvasElement): GlState | null {
   const u = (name: string) => gl.getUniformLocation(prog, name);
   return {
     gl,
+    prog,
+    buf,
     tex,
     maxAniso,
     uAng: u("uAng"),
@@ -203,6 +210,7 @@ interface TiltCoverProps {
   style?: CSSProperties;
   maxTilt?: number;
   perspective?: number;
+  active?: boolean;
 }
 
 export function TiltCover({
@@ -212,6 +220,7 @@ export function TiltCover({
   style,
   maxTilt = 12,
   perspective = 1000,
+  active = true,
 }: TiltCoverProps) {
   const outerRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -237,8 +246,10 @@ export function TiltCover({
   };
 
   useEffect(() => {
-    if (prefersReducedMotion) return;
+    if (prefersReducedMotion || !active) return;
     const canvas = canvasRef.current;
+    const root = rootRef.current;
+    const glare = glareRef.current;
     if (!canvas) return;
     glRef.current = initGl(canvas);
     const onLost = (e: Event) => {
@@ -255,10 +266,33 @@ export function TiltCover({
       canvas.removeEventListener("webglcontextrestored", onRestored);
       cancelAnimationFrame(rafRef.current);
       rafRef.current = 0;
-      glRef.current?.gl.getExtension("WEBGL_lose_context")?.loseContext();
+      // Keep the canvas context usable when the drawer opens again. Losing it
+      // here leaves getContext() returning the same lost context on re-entry.
+      const state = glRef.current;
+      if (state && !state.lost) {
+        state.gl.deleteTexture(state.tex);
+        state.gl.deleteBuffer(state.buf);
+        state.gl.deleteProgram(state.prog);
+      }
       glRef.current = null;
+      activeRef.current = false;
+      canvas.style.opacity = "0";
+      if (root) {
+        root.style.visibility = "";
+        root.style.transform = "";
+      }
+      if (glare) glare.style.opacity = "0";
+      cur.current = { rx: 0, ry: 0, gl: 0 };
+      tgt.current = {
+        rx: 0,
+        ry: 0,
+        gl: 0,
+        gx: 0.5,
+        gy: 0.5,
+        returning: false,
+      };
     };
-  }, []);
+  }, [active]);
 
   if (prefersReducedMotion) {
     return (
@@ -362,7 +396,9 @@ export function TiltCover({
     const canvas = canvasRef.current;
     if (canvas) {
       // Instant swap in (canvas matches the DOM cover at rest); soft fade out.
-      canvas.style.transition = on ? "none" : "opacity 150ms ease-out";
+      canvas.style.transition = on
+        ? "none"
+        : "opacity 150ms var(--ease-settle)";
       canvas.style.opacity = on ? "1" : "0";
     }
     // Hide the flat DOM cover while the canvas is active — otherwise the
@@ -428,6 +464,7 @@ export function TiltCover({
   };
 
   const onMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!active) return;
     const r = e.currentTarget.getBoundingClientRect();
     const fx = (e.clientX - r.left) / r.width;
     const fy = (e.clientY - r.top) / r.height;
@@ -456,6 +493,7 @@ export function TiltCover({
   };
 
   const onLeave = () => {
+    if (!active) return;
     const t = tgt.current;
     t.rx = 0;
     t.ry = 0;
@@ -488,7 +526,7 @@ export function TiltCover({
           style={{
             borderRadius: "inherit",
             opacity: 0,
-            transition: "opacity 250ms ease-out",
+            transition: "opacity 250ms var(--ease-settle)",
           }}
         />
       </div>
@@ -501,8 +539,6 @@ export function TiltCover({
     </div>
   );
 }
-
-export default TiltCover;
 
 // The WebGL context + compiled shaders are created in a useEffect([]) that Vite
 // fast-refresh does NOT re-run, so shader edits would otherwise keep the stale
