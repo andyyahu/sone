@@ -21,6 +21,7 @@ import MediaCard from "./MediaCard";
 import PageContainer from "./PageContainer";
 import { ProfilePageSkeleton } from "./PageSkeleton";
 import ProfileEditModal from "./ProfileEditModal";
+import { ProfileHeroFrost } from "./profileHeroFrost";
 import SocialLinks from "./SocialLinks";
 
 /**
@@ -268,13 +269,15 @@ export default function ProfilePage({ onBack }: ProfilePageProps) {
     setHeroBlob(null);
     if (!heroHref) return;
     let cancelled = false;
-    fetchCachedImageUrl(heroHref)
+    const controller = new AbortController();
+    fetchCachedImageUrl(heroHref, { signal: controller.signal })
       .then((b) => {
         if (!cancelled) setHeroBlob(b);
       })
       .catch(() => {});
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, [heroHref]);
 
@@ -347,8 +350,8 @@ export default function ProfilePage({ onBack }: ProfilePageProps) {
     }
   };
 
-  // The hero photo, tiled to fill the banner width. Reused for a sharp base
-  // layer and a blurred copy so only the bottom frosts (see the hero below).
+  // The hero photo, tiled to fill the banner width. The bottom frost is a
+  // separate baked bitmap, so these tiles stay sharp.
   const heroTiles = heroBlob
     ? [0, 1, 2, 3, 4, 5, 6].map((i) => (
         <img
@@ -365,27 +368,14 @@ export default function ProfilePage({ onBack }: ProfilePageProps) {
 
   return (
     <div className="flex-1 bg-linear-to-b from-th-surface to-th-base overflow-y-auto scrollbar-thin scrollbar-thumb-th-button scrollbar-track-transparent">
-      {/* Profile hero — sharp photo up top, real filter-blur frost at the bottom */}
+      {/* Profile hero — sharp tiles, frost baked once into a bitmap */}
       <div className="relative w-full h-[480px] overflow-hidden flex items-end mb-8">
         {heroBlob && (
           <>
             <div className="absolute inset-0 flex justify-center overflow-hidden">
               {heroTiles}
             </div>
-            {/* Blurred copy revealed only toward the bottom. Uses a real CSS
-                filter blur (WebKitGTK renders this; backdrop-filter it does not). */}
-            <div
-              aria-hidden
-              className="absolute inset-0 flex justify-center overflow-hidden blur-3xl scale-110 pointer-events-none"
-              style={{
-                maskImage:
-                  "linear-gradient(to bottom, transparent 0%, transparent 35%, #000 80%)",
-                WebkitMaskImage:
-                  "linear-gradient(to bottom, transparent 0%, transparent 35%, #000 80%)",
-              }}
-            >
-              {heroTiles}
-            </div>
+            <ProfileHeroFrost src={heroBlob} />
           </>
         )}
         {/* Theme-aware vignette — fade the photo into the theme base on every

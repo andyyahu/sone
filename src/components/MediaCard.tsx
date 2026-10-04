@@ -6,6 +6,7 @@ import {
   getItemSubtitle,
 } from "../utils/itemHelpers";
 import ExplicitBadge from "./ExplicitBadge";
+import ScheduledImage from "./ScheduledImage";
 
 interface MediaCardProps {
   item: any;
@@ -73,7 +74,7 @@ export default function MediaCard({
     <div
       onClick={onClick}
       onContextMenu={onContextMenu}
-      className={`p-3 bg-th-elevated hover:bg-th-surface-hover rounded-lg cursor-pointer group transition-[background-color] duration-300 ${
+      className={`p-3 bg-th-elevated hover:bg-th-surface-hover active:scale-[0.985] rounded-lg cursor-pointer group transition-[background-color,scale] duration-200 ease-settle motion-reduce:transition-none motion-reduce:active:scale-100 ${
         widthClass ?? ""
       }`}
     >
@@ -86,11 +87,12 @@ export default function MediaCard({
         {imageOverride ? (
           imageOverride
         ) : image ? (
-          <img
+          <ScheduledImage
             src={image}
             alt={title}
-            className="w-full h-full object-cover transform group-hover:scale-105 transition-transform duration-500 ease-out"
+            className="w-full h-full object-cover transform group-hover:scale-105 transition-transform duration-300 ease-settle motion-reduce:transition-none"
             loading="lazy"
+            decoding="async"
             onError={(e) => {
               (e.target as HTMLImageElement).style.display = "none";
             }}
@@ -109,25 +111,21 @@ export default function MediaCard({
             {isArtist ? (
               /* Artist: dark overlay on hover + centered play button */
               <>
-                <div className="absolute inset-0 rounded-full bg-black/20 opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
+                <div className="absolute inset-0 rounded-full bg-black/20 opacity-0 group-hover:opacity-100 transition-opacity duration-200 ease-settle motion-reduce:transition-none" />
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
                     if (onPlay) onPlay(e);
                     else onClick();
                   }}
-                  className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-12 h-12 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all duration-300 cursor-pointer"
+                  className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-12 h-12 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 hover:scale-110 transition-[opacity,scale] duration-200 ease-settle cursor-pointer motion-reduce:transition-none"
                 >
-                  <Play
-                    size={28}
-                    fill="white"
-                    className="text-white ml-0.5 transition-transform duration-200 hover:scale-110"
-                  />
+                  <Play size={28} fill="white" className="text-white ml-0.5" />
                 </button>
               </>
             ) : (
               <>
-                <div className="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
+                <div className="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 transition-opacity duration-200 ease-settle motion-reduce:transition-none" />
                 {/* Play button — bottom-left */}
                 <button
                   onClick={(e) => {
@@ -135,7 +133,7 @@ export default function MediaCard({
                     if (onPlay) onPlay(e);
                     else onClick();
                   }}
-                  className="absolute bottom-2 left-2 w-10 h-10 bg-th-accent rounded-full flex items-center justify-center shadow-xl opacity-0 group-hover:opacity-100 translate-y-2 group-hover:translate-y-0 transition-all duration-300 ease-out hover:brightness-110 hover:scale-110 hover:shadow-2xl"
+                  className="absolute bottom-2 left-2 w-10 h-10 bg-th-accent rounded-full flex items-center justify-center shadow-xl opacity-0 group-hover:opacity-100 translate-y-2 group-hover:translate-y-0 transition-[opacity,translate,scale,filter] duration-200 ease-settle hover:brightness-110 hover:scale-110 motion-reduce:transition-none"
                 >
                   <Play
                     size={20}
@@ -147,14 +145,14 @@ export default function MediaCard({
             )}
             {/* Right side icons — non-artist only */}
             {!isArtist && (
-              <div className="absolute bottom-2 right-2 flex items-center gap-1 opacity-0 group-hover:opacity-100 translate-y-2 group-hover:translate-y-0 transition-[opacity,transform,translate] duration-300">
+              <div className="absolute bottom-2 right-2 flex items-center gap-1 opacity-0 group-hover:opacity-100 translate-y-2 group-hover:translate-y-0 transition-[opacity,translate] duration-200 ease-settle motion-reduce:transition-none">
                 {onMoreClick && (
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
                       onMoreClick(e);
                     }}
-                    className="w-8 h-8 rounded-full bg-black/50 backdrop-blur-sm flex items-center justify-center hover:bg-black/70 transition-colors"
+                    className="w-8 h-8 rounded-full bg-black/70 flex items-center justify-center hover:bg-black/80 transition-colors"
                   >
                     <MoreHorizontal size={16} className="text-white" />
                   </button>
@@ -164,7 +162,7 @@ export default function MediaCard({
                     e.stopPropagation();
                     if (onFavoriteToggle) onFavoriteToggle(e);
                   }}
-                  className="w-8 h-8 rounded-full bg-black/50 backdrop-blur-sm flex items-center justify-center hover:bg-black/70 transition-colors"
+                  className="w-8 h-8 rounded-full bg-black/70 flex items-center justify-center hover:bg-black/80 transition-colors"
                 >
                   <Heart
                     size={16}

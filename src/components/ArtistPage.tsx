@@ -26,6 +26,7 @@ import { useNavigation } from "../hooks/useNavigation";
 import { useToast } from "../contexts/ToastContext";
 import { getArtistPage } from "../api/tidal";
 import { getApiStatus, safeErrorMessage } from "../lib/errorUtils";
+import { headerActionClass } from "./headerChrome";
 import NotFoundPage from "./NotFoundPage";
 import {
   getTidalImageUrl,
@@ -246,7 +247,8 @@ export default function ArtistPage({
     const s = heroSources[heroSrcIdx];
     if (!s) return;
     let cancelled = false;
-    fetchCachedImageUrl(heroSrcUrl(s, false))
+    const controller = new AbortController();
+    fetchCachedImageUrl(heroSrcUrl(s, false), { signal: controller.signal })
       .then((b) => {
         if (!cancelled) setLowBlob(b);
       })
@@ -256,6 +258,7 @@ export default function ArtistPage({
       });
     return () => {
       cancelled = true;
+      controller.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [heroSrcIdx, heroSourcesKey]);
@@ -266,13 +269,18 @@ export default function ArtistPage({
     const s = heroSources[heroSrcIdx];
     if (!s) return;
     let cancelled = false;
-    fetchCachedImageUrl(heroSrcUrl(s, true))
+    const controller = new AbortController();
+    fetchCachedImageUrl(heroSrcUrl(s, true), {
+      signal: controller.signal,
+      priority: "prefetch",
+    })
       .then((b) => {
         if (!cancelled) setHiBlob(b);
       })
       .catch(() => {});
     return () => {
       cancelled = true;
+      controller.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showLow]);
@@ -633,10 +641,7 @@ export default function ArtistPage({
                   )}
                   {artistPlaying ? "Pause" : "Play"}
                 </button>
-                <button
-                  onClick={handleShuffle}
-                  className="flex items-center gap-2 px-6 py-2.5 bg-th-button/40 backdrop-blur-md text-th-text-primary font-bold text-sm rounded-full hover:bg-th-button/60 hover:scale-[1.03] transition-[transform,filter,background-color] duration-150"
-                >
+                <button onClick={handleShuffle} className={headerActionClass}>
                   <Shuffle size={18} />
                   Shuffle
                 </button>

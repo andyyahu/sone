@@ -59,13 +59,15 @@ export default function ProfileEditModal({
       return;
     }
     let cancelled = false;
-    fetchCachedImageUrl(src)
+    const controller = new AbortController();
+    fetchCachedImageUrl(src, { signal: controller.signal })
       .then((b) => {
         if (!cancelled) setAvatar(b);
       })
       .catch(() => {});
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, [open, profile.pictureFiles]);
 
