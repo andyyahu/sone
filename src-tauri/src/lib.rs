@@ -863,13 +863,19 @@ pub fn run() {
                         .with_webview(|webview| {
                             let wv = webview.inner();
                             if let Some(settings) = wv.settings() {
-                                // Use OnDemand (default) — Always can cause severe lag
-                                // on dual-GPU systems (NVIDIA + iGPU) with WebKitGTK
+                                // Preserve our requested policy, then read back the
+                                // effective one: WebKit can normalize it to Always
+                                // or Never depending on capabilities/environment.
                                 settings.set_hardware_acceleration_policy(
                                     webkit2gtk::HardwareAccelerationPolicy::OnDemand,
                                 );
                                 settings.set_enable_webgl(true);
                                 settings.set_enable_smooth_scrolling(true);
+                                eprintln!(
+                                    "[sone] WebKit effective hardware-acceleration-policy={:?} smooth-scrolling={}",
+                                    settings.hardware_acceleration_policy(),
+                                    settings.enables_smooth_scrolling(),
+                                );
                             }
                         })
                         .ok();
