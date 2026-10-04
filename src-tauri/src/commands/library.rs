@@ -1,5 +1,6 @@
 use tauri::{Manager, State};
 
+use super::pages::artwork_cache_key;
 use crate::cache::{CacheResult, CacheTier};
 use crate::tidal_api::{
     AllFavoriteIds, PaginatedTracks, TidalAlbumDetail, TidalArtistDetail, TidalPlaylist,
@@ -198,7 +199,7 @@ pub async fn get_playlist_tracks(
 ) -> Result<Vec<TidalTrack>, SoneError> {
     log::debug!("[get_playlist_tracks]: playlist_id={}", playlist_id);
 
-    let cache_key = format!("playlist:{}", playlist_id);
+    let cache_key = artwork_cache_key(format_args!("playlist:{}", playlist_id));
     match state
         .disk_cache
         .get(&cache_key, CacheTier::UserContent)
@@ -285,7 +286,7 @@ pub async fn get_playlist_tracks_page(
         limit
     );
 
-    let cache_key = if order.is_some() && order_direction.is_some() {
+    let cache_key = artwork_cache_key(if order.is_some() && order_direction.is_some() {
         format!(
             "playlist-page:{}:{}:{}:{}:{}",
             playlist_id,
@@ -296,7 +297,7 @@ pub async fn get_playlist_tracks_page(
         )
     } else {
         format!("playlist-page:{}:{}:{}", playlist_id, offset, limit)
-    };
+    });
     match state
         .disk_cache
         .get(&cache_key, CacheTier::UserContent)
@@ -655,15 +656,30 @@ pub async fn remove_track_from_playlist(
     state: State<'_, AppState>,
     playlist_id: String,
     index: u32,
+    playlist_item_id: Option<String>,
+    resource_id: Option<String>,
+    resource_type: Option<String>,
 ) -> Result<(), SoneError> {
     log::debug!(
         "[remove_track_from_playlist]: playlist_id={}, index={}",
         playlist_id,
         index
     );
+    let known = match (playlist_item_id, resource_id, resource_type) {
+        (Some(item_id), Some(resource_id), Some(resource_type))
+            if !item_id.is_empty() && !resource_id.is_empty() && !resource_type.is_empty() =>
+        {
+            Some(crate::tidal_api::PlaylistItemRef {
+                item_id,
+                resource_id,
+                resource_type,
+            })
+        }
+        _ => None,
+    };
     let client = state.tidal_client.lock().await;
     client
-        .remove_track_from_playlist(&playlist_id, index)
+        .remove_track_from_playlist(&playlist_id, index, known.as_ref())
         .await?;
     drop(client);
     state
@@ -1126,10 +1142,10 @@ pub async fn get_favorite_mixes(
         order_direction
     );
 
-    let cache_key = format!(
+    let cache_key = artwork_cache_key(format_args!(
         "fav-mixes:{}:{}:{}:{}",
         offset, limit, order, order_direction
-    );
+    ));
     match state
         .disk_cache
         .get(&cache_key, CacheTier::UserContent)

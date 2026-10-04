@@ -41,3 +41,33 @@ pub async fn shutdown_bounded(cancel: CancellationToken, task: JoinHandle<()>, n
         }
     }
 }
+
+/// Byte-bounded preview that never cuts through a UTF-8 scalar. Callers keep
+/// their existing redaction rules; this helper only controls length.
+pub(crate) fn bounded_preview(text: &str, max_bytes: usize) -> &str {
+    let mut end = text.len().min(max_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::bounded_preview;
+
+    #[test]
+    fn every_boundary_of_multilingual_response_is_safe_and_bounded() {
+        let text = "API 音樂🎧 café response";
+        for limit in 0..=text.len() + 1 {
+            let preview = bounded_preview(text, limit);
+            assert!(preview.len() <= limit);
+            assert!(text.starts_with(preview));
+            if let Some(next) = text[preview.len()..].chars().next() {
+                assert!(preview.len() + next.len_utf8() > limit);
+            }
+        }
+        assert_eq!(bounded_preview(text, usize::MAX), text);
+        assert_eq!(bounded_preview("", 0), "");
+    }
+}

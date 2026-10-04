@@ -90,7 +90,7 @@ async fn resolve_playlist_uuid(
     owned
         .items
         .into_iter()
-        .chain(favorited.items.into_iter())
+        .chain(favorited.items)
         .find(|p| p.title.to_lowercase() == lower)
         .map(|p| p.uuid)
         .ok_or_else(|| ErrorData::invalid_params(format!("Playlist not found: {needle}"), None))
@@ -367,7 +367,7 @@ impl SoneMcpServer {
 
     #[rmcp::tool(
         name = "remove_track_from_playlist",
-        description = "Remove a track from a playlist by its 0-based index in the tracklist."
+        description = "Remove a track from a playlist by its 0-based index in the default tracklist order."
     )]
     async fn remove_track_from_playlist(
         &self,
@@ -376,7 +376,7 @@ impl SoneMcpServer {
         let state = self.app_handle.state::<AppState>();
         let client = state.tidal_client.lock().await;
         client
-            .remove_track_from_playlist(&args.playlist_uuid, args.index)
+            .remove_playlist_item_by_index(&args.playlist_uuid, args.index)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         state

@@ -160,6 +160,7 @@ mod tests {
             mixes: None,
             item_type: None,
             image_id: None,
+            playlist_item_id: None,
         }
     }
 

@@ -6,6 +6,7 @@ import {
   Trash2,
   ListMusic,
   Link,
+  AudioLines,
 } from "lucide-react";
 import { useState, useRef, useCallback } from "react";
 import { useToast } from "../contexts/ToastContext";
@@ -19,7 +20,7 @@ import { getTrackShareUrl, getVideoShareUrl } from "../utils/itemHelpers";
 import { isTrackUnavailable } from "../lib/trackAvailability";
 import AddToPlaylistMenu from "./AddToPlaylistMenu";
 import MenuPortal from "./MenuPortal";
-import { getTrack } from "../api/tidal";
+import { getSimilarTracks, getTrack } from "../api/tidal";
 
 interface TrackContextMenuProps {
   track: Track;
@@ -44,7 +45,7 @@ export default function TrackContextMenu({
   isUserPlaylist,
   onTrackRemoved,
 }: TrackContextMenuProps) {
-  const { addToQueue, playNextInQueue } = usePlaybackActions();
+  const { addToQueue, playNextInQueue, playFromSource } = usePlaybackActions();
   const { favoriteTrackIds, addFavoriteTrack, removeFavoriteTrack } =
     useFavorites();
   const { navigateToMix } = useNavigation();
@@ -53,6 +54,7 @@ export default function TrackContextMenu({
 
   const [showPlaylistSubmenu, setShowPlaylistSubmenu] = useState(false);
   const [radioLoading, setRadioLoading] = useState(false);
+  const [similarLoading, setSimilarLoading] = useState(false);
 
   // Fake anchor ref for AddToPlaylistMenu positioning — we'll use the menu itself
   const playlistBtnRef = useRef<HTMLButtonElement | null>(null);
@@ -155,7 +157,11 @@ export default function TrackContextMenu({
   const handleRemoveFromPlaylist = useCallback(async () => {
     if (!playlistId) return;
     try {
-      await removeTrackFromPlaylist(playlistId, index);
+      await removeTrackFromPlaylist(playlistId, index, {
+        playlistItemId: track.playlistItemId,
+        resourceId: track.id,
+        resourceType: track.itemType === "video" ? "videos" : "tracks",
+      });
       onTrackRemoved?.(index);
       showToast(`Removed "${trackLabel}" from playlist`);
     } catch (err) {
@@ -166,12 +172,47 @@ export default function TrackContextMenu({
   }, [
     playlistId,
     index,
+    track.id,
+    track.itemType,
+    track.playlistItemId,
     trackLabel,
     removeTrackFromPlaylist,
     onTrackRemoved,
     showToast,
     onClose,
   ]);
+
+  const handleSimilarTracks = useCallback(async () => {
+    if (similarLoading) return;
+    setSimilarLoading(true);
+    try {
+      const tracks = await getSimilarTracks(track.id);
+      if (tracks.length === 0) {
+        showToast("No similar tracks", "info");
+        onClose();
+        return;
+      }
+      await playFromSource(tracks[0], tracks, {
+        source: {
+          type: "mix",
+          id: `similar-${track.id}`,
+          name: `Similar to ${track.title}`,
+          image: track.album?.cover,
+          allTracks: tracks,
+        },
+      });
+      showToast(
+        `Playing ${tracks.length} similar ${tracks.length === 1 ? "track" : "tracks"}`,
+      );
+      onClose();
+    } catch (err) {
+      console.error("Failed to load similar tracks:", err);
+      showToast("Similar tracks unavailable", "error");
+      onClose();
+    } finally {
+      setSimilarLoading(false);
+    }
+  }, [similarLoading, track, playFromSource, showToast, onClose]);
 
   const handleShare = useCallback(async () => {
     try {
@@ -260,6 +301,19 @@ export default function TrackContextMenu({
               </button>
             </>
           )}
+
+        {track.itemType !== "video" && (
+          <button
+            className={`${menuItemClass} ${similarLoading ? "opacity-60 pointer-events-none" : ""}`}
+            onClick={handleSimilarTracks}
+            disabled={similarLoading}
+          >
+            <AudioLines size={18} className="shrink-0 text-th-text-muted" />
+            <span>
+              {similarLoading ? "Finding similar tracks…" : "Similar tracks"}
+            </span>
+          </button>
+        )}
 
         {/* Share */}
         <div className="my-1 border-t border-th-inset" />

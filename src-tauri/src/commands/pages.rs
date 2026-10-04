@@ -10,6 +10,12 @@ use crate::tidal_api::{
 use crate::AppState;
 use crate::SoneError;
 
+/// Bypass metadata written before official artwork IDs were resolved correctly.
+/// Keep the image tier and existing mutation tags intact across the upgrade.
+pub(super) fn artwork_cache_key(key: impl std::fmt::Display) -> String {
+    format!("artwork-v2:{key}")
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct HomePageCached {
@@ -24,7 +30,7 @@ pub async fn get_album_detail(
 ) -> Result<TidalAlbumDetail, SoneError> {
     log::debug!("[get_album_detail]: album_id={}", album_id);
 
-    let cache_key = format!("album:{}", album_id);
+    let cache_key = artwork_cache_key(format_args!("album:{}", album_id));
     match state
         .disk_cache
         .get(&cache_key, CacheTier::StaticMeta)
@@ -78,7 +84,7 @@ pub async fn get_album_page(
 ) -> Result<AlbumPageCached, SoneError> {
     log::debug!("[get_album_page]: album_id={}", album_id);
 
-    let cache_key = format!("album-page:{}", album_id);
+    let cache_key = artwork_cache_key(format_args!("album-page:{}", album_id));
     match state.disk_cache.get(&cache_key, CacheTier::Dynamic).await {
         CacheResult::Fresh(bytes) => {
             if let Ok(page) = serde_json::from_slice(&bytes) {
@@ -165,7 +171,10 @@ pub async fn get_album_tracks(
         limit
     );
 
-    let cache_key = format!("album-tracks:{}:{}:{}", album_id, offset, limit);
+    let cache_key = artwork_cache_key(format_args!(
+        "album-tracks:{}:{}:{}",
+        album_id, offset, limit
+    ));
     match state
         .disk_cache
         .get(&cache_key, CacheTier::StaticMeta)
@@ -439,7 +448,7 @@ pub async fn get_mix_items(
 ) -> Result<MixPageResult, SoneError> {
     log::debug!("[get_mix_items]: mix_id={}", mix_id);
 
-    let cache_key = format!("mix-page:{}", mix_id);
+    let cache_key = artwork_cache_key(format_args!("mix-page:{}", mix_id));
     match state.disk_cache.get(&cache_key, CacheTier::Dynamic).await {
         CacheResult::Fresh(bytes) | CacheResult::Stale(bytes) => {
             if let Ok(result) = serde_json::from_slice(&bytes) {
@@ -470,7 +479,7 @@ pub async fn get_artist_detail(
 ) -> Result<TidalArtistDetail, SoneError> {
     log::debug!("[get_artist_detail]: artist_id={}", artist_id);
 
-    let cache_key = format!("artist:{}", artist_id);
+    let cache_key = artwork_cache_key(format_args!("artist:{}", artist_id));
     match state
         .disk_cache
         .get(&cache_key, CacheTier::StaticMeta)
@@ -593,7 +602,7 @@ pub async fn get_artist_albums(
         limit
     );
 
-    let cache_key = format!("artist-albums:{}:{}", artist_id, limit);
+    let cache_key = artwork_cache_key(format_args!("artist-albums:{}:{}", artist_id, limit));
     match state
         .disk_cache
         .get(&cache_key, CacheTier::StaticMeta)
@@ -1096,10 +1105,116 @@ pub async fn debug_home_page_raw(state: State<'_, AppState>) -> Result<String, S
     Ok(summary)
 }
 
+#[tauri::command(rename_all = "camelCase")]
+pub async fn get_similar_albums(
+    state: State<'_, AppState>,
+    album_id: u64,
+) -> Result<Vec<TidalAlbumDetail>, SoneError> {
+    log::debug!("[get_similar_albums]: album_id={album_id}");
+    let mut client = state.tidal_client.lock().await;
+    client.similar_albums(album_id).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn get_similar_tracks(
+    state: State<'_, AppState>,
+    track_id: u64,
+) -> Result<Vec<TidalTrack>, SoneError> {
+    log::debug!("[get_similar_tracks]: track_id={track_id}");
+    let mut client = state.tidal_client.lock().await;
+    client.similar_tracks(track_id).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn get_user_mixes(state: State<'_, AppState>) -> Result<Vec<MixPageResult>, SoneError> {
+    log::debug!("[get_user_mixes]");
+    let mut client = state.tidal_client.lock().await;
+    client.list_user_mixes().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::DiskCache;
+    use crate::crypto::Crypto;
     use crate::tidal_api::HomePageSection;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn artwork_metadata_upgrade_preserves_images_and_mutation_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let crypto = Arc::new(Crypto::for_tests());
+        let cache = DiskCache::new(dir.path(), crypto.clone());
+        let entries = [
+            ("playlist:abc", CacheTier::UserContent, "playlist:abc"),
+            (
+                "playlist-page:abc:0:50",
+                CacheTier::UserContent,
+                "playlist:abc",
+            ),
+            (
+                "playlist-page:abc:0:50:DATE:DESC",
+                CacheTier::UserContent,
+                "playlist:abc",
+            ),
+            ("album:1", CacheTier::StaticMeta, "album:1"),
+            ("album-tracks:1:0:50", CacheTier::StaticMeta, "album:1"),
+            ("album-page:1", CacheTier::Dynamic, "album:1"),
+            ("artist:2", CacheTier::StaticMeta, "artist:2"),
+            ("artist-albums:2:50", CacheTier::StaticMeta, "artist:2"),
+            ("mix-page:abc", CacheTier::Dynamic, "mix-page"),
+            (
+                "fav-mixes:0:50:DATE:DESC",
+                CacheTier::UserContent,
+                "fav-mixes",
+            ),
+        ];
+        for (key, tier, tag) in entries {
+            cache
+                .put(key, b"old artwork metadata", tier, &[tag])
+                .await
+                .unwrap();
+        }
+        cache
+            .put("cover-url", b"valid image", CacheTier::Image, &["image"])
+            .await
+            .unwrap();
+        drop(cache);
+
+        // The upgrade must work after a restart without deleting existing files.
+        let cache = DiskCache::new(dir.path(), crypto);
+        for (old_key, tier, tag) in entries {
+            let key = artwork_cache_key(old_key);
+            assert!(matches!(cache.get(&key, tier).await, CacheResult::Miss));
+            assert!(matches!(
+                cache.get(old_key, tier).await,
+                CacheResult::Fresh(_)
+            ));
+            cache
+                .put(&key, b"resolved artwork", tier, &[tag])
+                .await
+                .unwrap();
+        }
+        for tag in [
+            "playlist:abc",
+            "album:1",
+            "artist:2",
+            "mix-page",
+            "fav-mixes",
+        ] {
+            cache.invalidate_tag(tag).await;
+        }
+        for (old_key, tier, _) in entries {
+            assert!(matches!(
+                cache.get(&artwork_cache_key(old_key), tier).await,
+                CacheResult::Miss
+            ));
+        }
+        assert!(matches!(
+            cache.get("cover-url", CacheTier::Image).await,
+            CacheResult::Fresh(bytes) if bytes == b"valid image"
+        ));
+    }
 
     fn section(title: &str) -> HomePageSection {
         HomePageSection {

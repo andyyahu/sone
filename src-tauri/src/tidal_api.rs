@@ -1,7 +1,7 @@
 use crate::SoneError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Playbackinfo sub-statuses occupy the 4xxx range. Auth failures use a
 /// different namespace (11002/11003 token, 6001 session, 1002 pending), so a
@@ -56,6 +56,11 @@ const TIDAL_API_URL: &str = "https://api.tidal.com/v1";
 const TIDAL_API_V2_URL: &str = "https://api.tidal.com/v2";
 const TIDAL_OPENAPI_URL: &str = "https://openapi.tidal.com/v2";
 const TIDAL_CLIENT_VERSION: &str = "2026.9.15";
+
+#[path = "openapi_catalog.rs"]
+mod openapi_catalog;
+
+pub use openapi_catalog::PlaylistItemRef;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AuthTokens {
@@ -132,6 +137,10 @@ pub struct TidalTrack {
     /// Video thumbnail UUID (videos carry `imageId` instead of `album.cover`).
     #[serde(default)]
     pub image_id: Option<String>,
+    /// Official playlist relationship `meta.itemId`. Present when the row was
+    /// loaded from openapi so a later delete can target that item, not an index.
+    #[serde(default)]
+    pub playlist_item_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -327,6 +336,11 @@ pub struct PaginatedResponse<T> {
     pub total_number_of_items: u32,
     pub offset: u32,
     pub limit: u32,
+    /// When set, the next page starts here instead of `offset + items.len()`.
+    /// Favorite mixes prepend user mixes onto page 0, and those extra rows must
+    /// not advance the private API offset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1263,6 +1277,10 @@ pub struct TidalClient {
     pub country_code: String,
     token_persist: Option<TokenPersist>,
     gate: Arc<crate::rate_gate::RateGate>,
+    /// Leftover official playlist items and the cursor after them.
+    /// Item lists have no `page[limit]`, so the next UI page continues here
+    /// instead of downloading the playlist from the first cursor again.
+    playlist_walk: Mutex<Option<openapi_catalog::PlaylistWalk>>,
 }
 
 impl TidalClient {
@@ -1275,6 +1293,7 @@ impl TidalClient {
             country_code: "US".to_string(),
             token_persist: None,
             gate: Arc::new(crate::rate_gate::RateGate::new()),
+            playlist_walk: Mutex::new(None),
         }
     }
 
@@ -1438,7 +1457,11 @@ impl TidalClient {
     ) -> Result<T, SoneError> {
         let body = self.api_get_body(path, query).await?;
         serde_json::from_str(&body).map_err(|e| {
-            SoneError::Parse(format!("{} - Body: {}", e, &body[..body.len().min(500)]))
+            SoneError::Parse(format!(
+                "{} - Body: {}",
+                e,
+                crate::http_util::bounded_preview(&body, 500)
+            ))
         })
     }
 
@@ -1478,7 +1501,7 @@ impl TidalClient {
                     "[api_get_body] {} -> status={} body={}",
                     url,
                     status,
-                    &body[..body.len().min(500)]
+                    crate::http_util::bounded_preview(&body, 500)
                 );
             }
             return Err(SoneError::Api {
@@ -1684,6 +1707,11 @@ impl TidalClient {
         &mut self,
         user_id: u64,
     ) -> Result<(String, Option<String>), SoneError> {
+        if let Some(profile) =
+            openapi_catalog::official_result("get_user_profile", self.official_user(user_id).await)?
+        {
+            return Ok(profile);
+        }
         let cc = self.country_code.clone();
         let body = self
             .api_get_body(&format!("/users/{}", user_id), &[("countryCode", &cc)])
@@ -1776,6 +1804,7 @@ impl TidalClient {
             total_number_of_items: data.total_number_of_items,
             offset,
             limit,
+            next_offset: None,
         })
     }
 
@@ -1814,7 +1843,11 @@ impl TidalClient {
         }
 
         let data: Resp = serde_json::from_str(&body).map_err(|e| {
-            SoneError::Parse(format!("{} - Body: {}", e, &body[..body.len().min(500)]))
+            SoneError::Parse(format!(
+                "{} - Body: {}",
+                e,
+                crate::http_util::bounded_preview(&body, 500)
+            ))
         })?;
         let playlists: Vec<TidalPlaylist> = data.items.into_iter().map(|p| p.into()).collect();
         Ok(PaginatedResponse {
@@ -1822,6 +1855,7 @@ impl TidalClient {
             total_number_of_items: data.total_number_of_items,
             offset,
             limit,
+            next_offset: None,
         })
     }
 
@@ -1864,7 +1898,7 @@ impl TidalClient {
         log::debug!(
             "[create_playlist]: status={}, response={}",
             status,
-            &body_text[..body_text.len().min(500)]
+            crate::http_util::bounded_preview(&body_text, 500)
         );
 
         if !status.is_success() {
@@ -1923,7 +1957,7 @@ impl TidalClient {
         log::debug!(
             "[update_playlist]: status={}, response={}",
             status,
-            &body_text[..body_text.len().min(500)]
+            crate::http_util::bounded_preview(&body_text, 500)
         );
 
         if !status.is_success() {
@@ -1961,6 +1995,16 @@ impl TidalClient {
         playlist_id: &str,
         track_id: u64,
     ) -> Result<(), SoneError> {
+        self.invalidate_playlist_walk(playlist_id);
+        if openapi_catalog::official_write_result(
+            "add_track_to_playlist",
+            self.official_add_playlist_tracks(playlist_id, &[track_id], "FAIL")
+                .await,
+        )?
+        .is_some()
+        {
+            return Ok(());
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
 
         // First, get the playlist ETag which is required for modifications
@@ -2009,6 +2053,42 @@ impl TidalClient {
         &self,
         playlist_id: &str,
         index: u32,
+        known: Option<&PlaylistItemRef>,
+    ) -> Result<(), SoneError> {
+        self.invalidate_playlist_walk(playlist_id);
+        if let Some(item) = known {
+            // Official rows may be sorted. Their visible index cannot safely
+            // address the private API's default playlist order, even when the
+            // official route explicitly rejects the request.
+            return self.official_remove_playlist_item(playlist_id, item).await;
+        }
+        self.remove_playlist_item_private(playlist_id, index).await
+    }
+
+    /// Resolve a 0-based index in the playlist's default `itemIndex` order and
+    /// delete that official item. A sorted on-screen index must not use this.
+    pub async fn remove_playlist_item_by_index(
+        &self,
+        playlist_id: &str,
+        index: u32,
+    ) -> Result<(), SoneError> {
+        self.invalidate_playlist_walk(playlist_id);
+        if openapi_catalog::official_write_result(
+            "remove_playlist_item_by_index",
+            self.official_remove_playlist_index(playlist_id, index)
+                .await,
+        )?
+        .is_some()
+        {
+            return Ok(());
+        }
+        self.remove_playlist_item_private(playlist_id, index).await
+    }
+
+    async fn remove_playlist_item_private(
+        &self,
+        playlist_id: &str,
+        index: u32,
     ) -> Result<(), SoneError> {
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
 
@@ -2053,6 +2133,15 @@ impl TidalClient {
     }
 
     pub async fn delete_playlist(&self, playlist_id: &str) -> Result<(), SoneError> {
+        self.invalidate_playlist_walk(playlist_id);
+        if openapi_catalog::official_write_result(
+            "delete_playlist",
+            self.official_delete_playlist(playlist_id).await,
+        )?
+        .is_some()
+        {
+            return Ok(());
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
 
         // First, get the playlist ETag which is required for modifications
@@ -2096,6 +2185,13 @@ impl TidalClient {
         &self,
         user_id: u64,
     ) -> Result<Vec<String>, SoneError> {
+        if let Some(ids) = openapi_catalog::official_result(
+            "get_favorite_playlist_uuids",
+            self.official_member_ids(openapi_catalog::CollectionKind::Playlists, user_id)
+                .await,
+        )? {
+            return Ok(ids);
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
         let (generation, client) = self.client_at()?;
         let req = client
@@ -2176,6 +2272,7 @@ impl TidalClient {
             total_number_of_items: data.total_number_of_items,
             offset,
             limit,
+            next_offset: None,
         })
     }
 
@@ -2183,6 +2280,12 @@ impl TidalClient {
         &mut self,
         playlist_id: &str,
     ) -> Result<Vec<TidalTrack>, SoneError> {
+        if let Some(tracks) = openapi_catalog::official_result(
+            "get_playlist_tracks",
+            self.official_playlist_tracks(playlist_id).await,
+        )? {
+            return Ok(tracks);
+        }
         // `/items` (not `/tracks`) returns the real entries: tracks AND videos,
         // each wrapped as `{ "item": {...}, "type": "track" | "video" }`.
         let path = format!("/playlists/{}/items", playlist_id);
@@ -2237,6 +2340,13 @@ impl TidalClient {
         order: Option<&str>,
         order_direction: Option<&str>,
     ) -> Result<PaginatedTracks, SoneError> {
+        if let Some(page) = openapi_catalog::official_result(
+            "get_playlist_tracks_page",
+            self.official_playlist_page(playlist_id, offset, limit, order, order_direction)
+                .await,
+        )? {
+            return Ok(page);
+        }
         let cc = self.country_code.clone();
         let limit_str = limit.to_string();
         let offset_str = offset.to_string();
@@ -2320,7 +2430,11 @@ impl TidalClient {
         }
 
         let data: RecommendationsResponse = serde_json::from_str(&body).map_err(|e| {
-            SoneError::Parse(format!("{} - Body: {}", e, &body[..body.len().min(500)]))
+            SoneError::Parse(format!(
+                "{} - Body: {}",
+                e,
+                crate::http_util::bounded_preview(&body, 500)
+            ))
         })?;
 
         let mut tracks: Vec<TidalTrack> = data.items.into_iter().map(|w| w.item).collect();
@@ -2337,6 +2451,12 @@ impl TidalClient {
     }
 
     pub async fn get_album_detail(&mut self, album_id: u64) -> Result<TidalAlbumDetail, SoneError> {
+        if let Some(album) = openapi_catalog::official_result(
+            "get_album_detail",
+            self.official_album(album_id).await,
+        )? {
+            return Ok(album);
+        }
         let cc = self.country_code.clone();
         self.api_get(&format!("/albums/{}", album_id), &[("countryCode", &cc)])
             .await
@@ -2348,6 +2468,12 @@ impl TidalClient {
         offset: u32,
         limit: u32,
     ) -> Result<PaginatedTracks, SoneError> {
+        if let Some(page) = openapi_catalog::official_result(
+            "get_album_tracks",
+            self.official_album_tracks(album_id, offset, limit).await,
+        )? {
+            return Ok(page);
+        }
         let cc = self.country_code.clone();
         let limit_str = limit.to_string();
         let offset_str = offset.to_string();
@@ -2445,7 +2571,66 @@ impl TidalClient {
         })
     }
 
+    async fn official_numeric_member_ids(
+        &self,
+        label: &str,
+        kind: openapi_catalog::CollectionKind,
+        user_id: u64,
+    ) -> Result<Option<Vec<u64>>, SoneError> {
+        let Some(ids) =
+            openapi_catalog::official_result(label, self.official_member_ids(kind, user_id).await)?
+        else {
+            return Ok(None);
+        };
+        let parsed: Option<Vec<u64>> = ids.into_iter().map(|id| id.parse().ok()).collect();
+        if parsed.is_none() {
+            log::warn!("[{label}] official collection ids were not numeric, using private api");
+        }
+        Ok(parsed)
+    }
+
+    async fn official_member_flag(
+        &self,
+        label: &str,
+        kind: openapi_catalog::CollectionKind,
+        user_id: u64,
+        id: u64,
+    ) -> Result<Option<bool>, SoneError> {
+        openapi_catalog::official_result(
+            label,
+            self.official_member_contains(kind, user_id, &id.to_string())
+                .await,
+        )
+    }
+
+    async fn official_member_mutation(
+        &self,
+        label: &str,
+        kind: openapi_catalog::CollectionKind,
+        user_id: u64,
+        id: &str,
+        add: bool,
+    ) -> Result<bool, SoneError> {
+        let result = if add {
+            self.official_member_add(kind, user_id, id).await
+        } else {
+            self.official_member_remove(kind, user_id, id).await
+        };
+        Ok(openapi_catalog::official_write_result(label, result)?.is_some())
+    }
+
     pub async fn is_track_favorited(&self, user_id: u64, track_id: u64) -> Result<bool, SoneError> {
+        if let Some(found) = self
+            .official_member_flag(
+                "is_track_favorited",
+                openapi_catalog::CollectionKind::Tracks,
+                user_id,
+                track_id,
+            )
+            .await?
+        {
+            return Ok(found);
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
         let (generation, client) = self.client_at()?;
         let req = client
@@ -2501,6 +2686,16 @@ impl TidalClient {
     }
 
     pub async fn get_favorite_track_ids(&self, user_id: u64) -> Result<Vec<u64>, SoneError> {
+        if let Some(ids) = self
+            .official_numeric_member_ids(
+                "get_favorite_track_ids",
+                openapi_catalog::CollectionKind::Tracks,
+                user_id,
+            )
+            .await?
+        {
+            return Ok(ids);
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
         let (generation, client) = self.client_at()?;
         let req = client
@@ -2546,6 +2741,18 @@ impl TidalClient {
     }
 
     pub async fn add_favorite_track(&self, user_id: u64, track_id: u64) -> Result<(), SoneError> {
+        if self
+            .official_member_mutation(
+                "add_favorite_track",
+                openapi_catalog::CollectionKind::Tracks,
+                user_id,
+                &track_id.to_string(),
+                true,
+            )
+            .await?
+        {
+            return Ok(());
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
         let track_id_str = track_id.to_string();
 
@@ -2578,6 +2785,18 @@ impl TidalClient {
         user_id: u64,
         track_id: u64,
     ) -> Result<(), SoneError> {
+        if self
+            .official_member_mutation(
+                "remove_favorite_track",
+                openapi_catalog::CollectionKind::Tracks,
+                user_id,
+                &track_id.to_string(),
+                false,
+            )
+            .await?
+        {
+            return Ok(());
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
 
         let (generation, client) = self.client_at()?;
@@ -2604,6 +2823,18 @@ impl TidalClient {
     }
 
     pub async fn add_favorite_video(&self, user_id: u64, video_id: u64) -> Result<(), SoneError> {
+        if self
+            .official_member_mutation(
+                "add_favorite_video",
+                openapi_catalog::CollectionKind::Videos,
+                user_id,
+                &video_id.to_string(),
+                true,
+            )
+            .await?
+        {
+            return Ok(());
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
         let video_id_str = video_id.to_string();
 
@@ -2639,6 +2870,18 @@ impl TidalClient {
         user_id: u64,
         video_id: u64,
     ) -> Result<(), SoneError> {
+        if self
+            .official_member_mutation(
+                "remove_favorite_video",
+                openapi_catalog::CollectionKind::Videos,
+                user_id,
+                &video_id.to_string(),
+                false,
+            )
+            .await?
+        {
+            return Ok(());
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
 
         let (generation, client) = self.client_at()?;
@@ -2665,6 +2908,16 @@ impl TidalClient {
     }
 
     pub async fn get_favorite_video_ids(&self, user_id: u64) -> Result<Vec<u64>, SoneError> {
+        if let Some(ids) = self
+            .official_numeric_member_ids(
+                "get_favorite_video_ids",
+                openapi_catalog::CollectionKind::Videos,
+                user_id,
+            )
+            .await?
+        {
+            return Ok(ids);
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
 
         // The favorites/videos content endpoint caps page size (a single
@@ -2788,6 +3041,17 @@ impl TidalClient {
     }
 
     pub async fn is_album_favorited(&self, user_id: u64, album_id: u64) -> Result<bool, SoneError> {
+        if let Some(found) = self
+            .official_member_flag(
+                "is_album_favorited",
+                openapi_catalog::CollectionKind::Albums,
+                user_id,
+                album_id,
+            )
+            .await?
+        {
+            return Ok(found);
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
         let (generation, client) = self.client_at()?;
         let req = client
@@ -2843,6 +3107,16 @@ impl TidalClient {
     }
 
     pub async fn get_favorite_album_ids(&self, user_id: u64) -> Result<Vec<u64>, SoneError> {
+        if let Some(ids) = self
+            .official_numeric_member_ids(
+                "get_favorite_album_ids",
+                openapi_catalog::CollectionKind::Albums,
+                user_id,
+            )
+            .await?
+        {
+            return Ok(ids);
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
         let (generation, client) = self.client_at()?;
         let req = client
@@ -2893,6 +3167,18 @@ impl TidalClient {
     }
 
     pub async fn add_favorite_album(&self, user_id: u64, album_id: u64) -> Result<(), SoneError> {
+        if self
+            .official_member_mutation(
+                "add_favorite_album",
+                openapi_catalog::CollectionKind::Albums,
+                user_id,
+                &album_id.to_string(),
+                true,
+            )
+            .await?
+        {
+            return Ok(());
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
         let album_id_str = album_id.to_string();
 
@@ -2925,6 +3211,18 @@ impl TidalClient {
         user_id: u64,
         album_id: u64,
     ) -> Result<(), SoneError> {
+        if self
+            .official_member_mutation(
+                "remove_favorite_album",
+                openapi_catalog::CollectionKind::Albums,
+                user_id,
+                &album_id.to_string(),
+                false,
+            )
+            .await?
+        {
+            return Ok(());
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
 
         let (generation, client) = self.client_at()?;
@@ -2955,6 +3253,18 @@ impl TidalClient {
         user_id: u64,
         playlist_uuid: &str,
     ) -> Result<(), SoneError> {
+        if self
+            .official_member_mutation(
+                "add_favorite_playlist",
+                openapi_catalog::CollectionKind::Playlists,
+                user_id,
+                playlist_uuid,
+                true,
+            )
+            .await?
+        {
+            return Ok(());
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
 
         let (generation, client) = self.client_at()?;
@@ -2986,6 +3296,18 @@ impl TidalClient {
         user_id: u64,
         playlist_uuid: &str,
     ) -> Result<(), SoneError> {
+        if self
+            .official_member_mutation(
+                "remove_favorite_playlist",
+                openapi_catalog::CollectionKind::Playlists,
+                user_id,
+                playlist_uuid,
+                false,
+            )
+            .await?
+        {
+            return Ok(());
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
 
         let (generation, client) = self.client_at()?;
@@ -3012,6 +3334,16 @@ impl TidalClient {
     }
 
     pub async fn get_favorite_artist_ids(&self, user_id: u64) -> Result<Vec<u64>, SoneError> {
+        if let Some(ids) = self
+            .official_numeric_member_ids(
+                "get_favorite_artist_ids",
+                openapi_catalog::CollectionKind::Artists,
+                user_id,
+            )
+            .await?
+        {
+            return Ok(ids);
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
         let (generation, client) = self.client_at()?;
         let req = client
@@ -3096,6 +3428,18 @@ impl TidalClient {
     }
 
     pub async fn add_favorite_artist(&self, user_id: u64, artist_id: u64) -> Result<(), SoneError> {
+        if self
+            .official_member_mutation(
+                "add_favorite_artist",
+                openapi_catalog::CollectionKind::Artists,
+                user_id,
+                &artist_id.to_string(),
+                true,
+            )
+            .await?
+        {
+            return Ok(());
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
         let artist_id_str = artist_id.to_string();
 
@@ -3128,6 +3472,18 @@ impl TidalClient {
         user_id: u64,
         artist_id: u64,
     ) -> Result<(), SoneError> {
+        if self
+            .official_member_mutation(
+                "remove_favorite_artist",
+                openapi_catalog::CollectionKind::Artists,
+                user_id,
+                &artist_id.to_string(),
+                false,
+            )
+            .await?
+        {
+            return Ok(());
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
 
         let (generation, client) = self.client_at()?;
@@ -3175,7 +3531,7 @@ impl TidalClient {
         log::debug!(
             "[add_favorite_mix]: status={}, body={}",
             status,
-            &body[..body.len().min(500)]
+            crate::http_util::bounded_preview(&body, 500)
         );
 
         if !status.is_success() {
@@ -3209,7 +3565,7 @@ impl TidalClient {
         log::debug!(
             "[remove_favorite_mix]: status={}, body={}",
             status,
-            &body[..body.len().min(500)]
+            crate::http_util::bounded_preview(&body, 500)
         );
 
         if !status.is_success() {
@@ -3224,20 +3580,21 @@ impl TidalClient {
 
     /// Fetch favorite mix IDs from api.tidal.com/v2/favorites/mixes.
     pub async fn get_favorite_mix_ids(&mut self) -> Result<Vec<String>, SoneError> {
-        let response = self.get_favorite_mixes(0, 50, "DATE", "DESC").await?;
-        let ids: Vec<String> = response.items.iter().map(|m| m.id.clone()).collect();
+        let items = self.fetch_favorite_mixes(0, 50, "DATE", "DESC").await?;
+        let ids: Vec<String> = items.into_iter().map(|mix| mix.id).collect();
         log::debug!("[get_favorite_mix_ids]: found {} mix IDs", ids.len());
         Ok(ids)
     }
 
-    /// Fetch full favorite mix objects from api.tidal.com/v2/favorites/mixes.
-    pub async fn get_favorite_mixes(
+    // Keep generated recommendations out of the membership query. The UI list
+    // may prepend them, but only this endpoint identifies explicitly saved mixes.
+    async fn fetch_favorite_mixes(
         &mut self,
         offset: u32,
         limit: u32,
         order: &str,
         order_direction: &str,
-    ) -> Result<PaginatedResponse<TidalFavoriteMix>, SoneError> {
+    ) -> Result<Vec<TidalFavoriteMix>, SoneError> {
         let url = format!("{}/favorites/mixes", TIDAL_API_V2_URL);
         let cc = self.country_code.clone();
         let limit_str = limit.to_string();
@@ -3259,7 +3616,7 @@ impl TidalClient {
 
         log::debug!(
             "[get_favorite_mixes]: body_preview={}",
-            &body[..body.len().min(500)]
+            crate::http_util::bounded_preview(&body, 500)
         );
 
         // v2 response is a wrapper object { items: [...] }; extract the inner array as raw Values first
@@ -3275,7 +3632,7 @@ impl TidalClient {
             } else {
                 log::warn!(
                     "[get_favorite_mixes]: parse failed - body: {}",
-                    &body[..body.len().min(500)]
+                    crate::http_util::bounded_preview(&body, 500)
                 );
                 Vec::new()
             };
@@ -3286,20 +3643,101 @@ impl TidalClient {
             .filter_map(|v| serde_json::from_value::<TidalFavoriteMix>(v).ok())
             .collect();
 
+        Ok(items)
+    }
+
+    /// Fetch full favorite mix objects from api.tidal.com/v2/favorites/mixes.
+    pub async fn get_favorite_mixes(
+        &mut self,
+        offset: u32,
+        limit: u32,
+        order: &str,
+        order_direction: &str,
+    ) -> Result<PaginatedResponse<TidalFavoriteMix>, SoneError> {
+        let items = self
+            .fetch_favorite_mixes(offset, limit, order, order_direction)
+            .await?;
+        let private_count = items.len() as u32;
+        let items = if offset == 0 {
+            self.prepend_user_mixes(items).await
+        } else {
+            items
+        };
         let count = items.len() as u32;
+        let extra = count.saturating_sub(private_count);
         log::debug!("[get_favorite_mixes]: found {} mixes", count);
-        // v2 API doesn't return totalNumberOfItems — this is a synthetic sentinel for hasMore logic only, not a displayable count
-        let estimated_total = if count == limit {
-            offset + count + 1
+        // v2 API doesn't return totalNumberOfItems — this is a synthetic sentinel for hasMore logic only, not a displayable count.
+        // Prepended user mixes sit in front of page 0, so the next private offset stays `offset + private_count`.
+        let more_private = private_count == limit;
+        let estimated_total = if more_private {
+            offset + private_count + extra + 1
         } else {
             offset + count
+        };
+        let next_offset = if offset == 0 && extra > 0 {
+            Some(if more_private {
+                offset + private_count
+            } else {
+                estimated_total
+            })
+        } else {
+            None
         };
         Ok(PaginatedResponse {
             items,
             total_number_of_items: estimated_total,
             offset,
             limit,
+            next_offset,
         })
+    }
+
+    fn favorite_mix_from_user_page(page: MixPageResult) -> TidalFavoriteMix {
+        let cover = page
+            .tracks
+            .iter()
+            .find_map(|track| track.album.as_ref().and_then(|album| album.cover.clone()));
+        let images = cover.map(|uuid| FavoriteMixImages {
+            small: Some(FavoriteMixImageUrl {
+                url: openapi_catalog::resource_image(&uuid, 160),
+            }),
+            medium: Some(FavoriteMixImageUrl {
+                url: openapi_catalog::resource_image(&uuid, 320),
+            }),
+            large: Some(FavoriteMixImageUrl {
+                url: openapi_catalog::resource_image(&uuid, 640),
+            }),
+        });
+        TidalFavoriteMix {
+            id: page.mix_id,
+            title: page.title,
+            sub_title: page.subtitle.filter(|text| !text.is_empty()),
+            mix_type: page.mix_type,
+            images,
+        }
+    }
+
+    async fn prepend_user_mixes(&mut self, items: Vec<TidalFavoriteMix>) -> Vec<TidalFavoriteMix> {
+        let pages = match self.list_user_mixes().await {
+            Ok(pages) => pages,
+            Err(err) => {
+                log::warn!("[get_favorite_mixes] official user mixes failed ({err})");
+                return items;
+            }
+        };
+        let mut prepended = Vec::new();
+        for page in pages {
+            if items.iter().any(|item| item.id == page.mix_id)
+                || prepended
+                    .iter()
+                    .any(|item: &TidalFavoriteMix| item.id == page.mix_id)
+            {
+                continue;
+            }
+            prepended.push(Self::favorite_mix_from_user_page(page));
+        }
+        prepended.extend(items);
+        prepended
     }
 
     /// Fetch playlist folders from v2/my-collection/playlists/folders.
@@ -3338,11 +3776,15 @@ impl TidalClient {
 
         log::debug!(
             "[get_playlist_folders]: body_preview={}",
-            &body[..body.len().min(1000)]
+            crate::http_util::bounded_preview(&body, 1000)
         );
 
         serde_json::from_str(&body).map_err(|e| {
-            SoneError::Parse(format!("{} - Body: {}", e, &body[..body.len().min(500)]))
+            SoneError::Parse(format!(
+                "{} - Body: {}",
+                e,
+                crate::http_util::bounded_preview(&body, 500)
+            ))
         })
     }
 
@@ -3377,7 +3819,11 @@ impl TidalClient {
 
             let body = self.api_get_body(&url, &params).await?;
             let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-                SoneError::Parse(format!("{} - Body: {}", e, &body[..body.len().min(500)]))
+                SoneError::Parse(format!(
+                    "{} - Body: {}",
+                    e,
+                    crate::http_util::bounded_preview(&body, 500)
+                ))
             })?;
 
             if let Some(items) = value.get("items").and_then(|v| v.as_array()) {
@@ -3439,7 +3885,7 @@ impl TidalClient {
         log::debug!(
             "[create_playlist_folder]: status={}, body={}",
             status,
-            &body[..body.len().min(500)]
+            crate::http_util::bounded_preview(&body, 500)
         );
 
         if !status.is_success() {
@@ -3487,7 +3933,7 @@ impl TidalClient {
         log::debug!(
             "[rename_playlist_folder]: status={}, body={}",
             status,
-            &body[..body.len().min(500)]
+            crate::http_util::bounded_preview(&body, 500)
         );
 
         if !status.is_success() {
@@ -3526,7 +3972,7 @@ impl TidalClient {
         log::debug!(
             "[delete_playlist_folder]: status={}, body={}",
             status,
-            &body[..body.len().min(500)]
+            crate::http_util::bounded_preview(&body, 500)
         );
 
         if !status.is_success() {
@@ -3574,7 +4020,7 @@ impl TidalClient {
         log::debug!(
             "[move_playlist_to_folder]: status={}, body={}",
             status,
-            &body[..body.len().min(500)]
+            crate::http_util::bounded_preview(&body, 500)
         );
 
         if !status.is_success() {
@@ -3592,6 +4038,16 @@ impl TidalClient {
         playlist_id: &str,
         track_ids: &[u64],
     ) -> Result<(), SoneError> {
+        self.invalidate_playlist_walk(playlist_id);
+        if openapi_catalog::official_write_result(
+            "add_tracks_to_playlist",
+            self.official_add_playlist_tracks(playlist_id, track_ids, "SKIP")
+                .await,
+        )?
+        .is_some()
+        {
+            return Ok(());
+        }
         let tokens = self.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
 
         // Get the playlist ETag which is required for modifications
@@ -3771,7 +4227,7 @@ impl TidalClient {
                 return Err(SoneError::Parse(format!(
                     "Unknown manifest format '{}': {}",
                     data.manifest_mime_type,
-                    &manifest_str[..manifest_str.len().min(300)]
+                    crate::http_util::bounded_preview(&manifest_str, 300)
                 )));
             }
         };
@@ -3856,6 +4312,11 @@ impl TidalClient {
     }
 
     pub async fn get_video(&mut self, video_id: u64) -> Result<TidalVideo, SoneError> {
+        if let Some(video) =
+            openapi_catalog::official_result("get_video", self.official_video(video_id).await)?
+        {
+            return Ok(video);
+        }
         let cc = self.country_code.clone();
         self.api_get(
             &format!("/videos/{}", video_id),
@@ -3881,6 +4342,12 @@ impl TidalClient {
         &mut self,
         playlist_id: &str,
     ) -> Result<serde_json::Value, SoneError> {
+        if let Some(playlist) = openapi_catalog::official_result(
+            "get_playlist_details",
+            self.official_playlist_details(playlist_id).await,
+        )? {
+            return Ok(playlist);
+        }
         let cc = self.country_code.clone();
         self.api_get(
             &format!("/playlists/{}", playlist_id),
@@ -3912,6 +4379,11 @@ impl TidalClient {
         query: &str,
         limit: u32,
     ) -> Result<TidalSearchResults, SoneError> {
+        if let Some(results) =
+            openapi_catalog::official_result("search", self.official_search(query, limit).await)?
+        {
+            return Ok(results);
+        }
         // Try the v2 API first (web app uses this, returns playlists properly)
         if let Ok(v2) = self.search_v2(query, limit).await {
             return Ok(v2);
@@ -4057,15 +4529,28 @@ impl TidalClient {
     /// Fetch suggestions from Tidal's v2 /suggestions/ endpoint.
     /// Returns a SuggestionsResponse with text suggestions AND direct hit entities,
     /// exactly as the webapp's mini-search dropdown uses.
-    pub async fn get_suggestions(&mut self, query: &str, limit: u32) -> SuggestionsResponse {
-        let empty = SuggestionsResponse {
-            text_suggestions: vec![],
-            direct_hits: vec![],
-        };
+    pub async fn get_suggestions(
+        &mut self,
+        query: &str,
+        limit: u32,
+    ) -> Result<SuggestionsResponse, SoneError> {
+        if let Some(result) = openapi_catalog::official_result(
+            "get_suggestions",
+            self.official_suggestions(query, limit).await,
+        )? {
+            return Ok(result);
+        }
+        self.suggestions_private(query, limit).await
+    }
+
+    async fn suggestions_private(
+        &mut self,
+        query: &str,
+        limit: u32,
+    ) -> Result<SuggestionsResponse, SoneError> {
         let url = format!("{}/suggestions/", TIDAL_API_V2_URL);
         let country_code = self.country_code.clone();
-
-        let resp = self
+        let response = self
             .authenticated_get(
                 &url,
                 &[
@@ -4075,26 +4560,17 @@ impl TidalClient {
                     ("hybrid", "true"),
                 ],
             )
-            .await;
-
-        match resp {
-            Ok(r) if r.status().is_success() => {
-                let body = r.text().await.unwrap_or_default();
-                if let Some(result) = Self::parse_v2_suggestions_full(&body, limit) {
-                    log::debug!(
-                        "suggestions v2: {} text, {} hits for '{}'",
-                        result.text_suggestions.len(),
-                        result.direct_hits.len(),
-                        query
-                    );
-                    return result;
-                }
-            }
-            Ok(r) => log::debug!("suggestions v2: HTTP {} for '{}'", r.status(), query),
-            Err(e) => log::debug!("suggestions v2: error: {} for '{}'", e, query),
+            .await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(SoneError::Api {
+                status: status.as_u16(),
+                body,
+            });
         }
-
-        empty
+        Self::parse_v2_suggestions_full(&body, limit)
+            .ok_or_else(|| SoneError::Parse(format!("suggestions v2 parse failed for '{query}'")))
     }
 
     /// Parse the full v2 /suggestions/ response into SuggestionsResponse.
@@ -4901,7 +5377,11 @@ impl TidalClient {
         }
 
         let data: FavResponse = serde_json::from_str(&body).map_err(|e| {
-            SoneError::Parse(format!("{} - Body: {}", e, &body[..body.len().min(500)]))
+            SoneError::Parse(format!(
+                "{} - Body: {}",
+                e,
+                crate::http_util::bounded_preview(&body, 500)
+            ))
         })?;
         let artists: Vec<TidalArtistDetail> = data.items.into_iter().map(|f| f.item).collect();
         log::debug!(
@@ -4914,6 +5394,7 @@ impl TidalClient {
             total_number_of_items: data.total_number_of_items,
             offset,
             limit,
+            next_offset: None,
         })
     }
 
@@ -4966,6 +5447,7 @@ impl TidalClient {
             total_number_of_items: data.total_number_of_items,
             offset,
             limit,
+            next_offset: None,
         })
     }
 
@@ -4976,6 +5458,12 @@ impl TidalClient {
         &mut self,
         artist_id: u64,
     ) -> Result<TidalArtistDetail, SoneError> {
+        if let Some(artist) = openapi_catalog::official_result(
+            "get_artist_detail",
+            self.official_artist(artist_id).await,
+        )? {
+            return Ok(artist);
+        }
         let cc = self.country_code.clone();
         self.api_get(&format!("/artists/{}", artist_id), &[("countryCode", &cc)])
             .await
@@ -5079,13 +5567,34 @@ impl TidalClient {
             .await
         {
             if let Some(result) = Self::parse_mix_page(mix_id, &body) {
-                return Ok(result);
+                if !result.tracks.is_empty() {
+                    return Ok(result);
+                }
             }
         }
 
         // Fallback: legacy /mixes/{id}/items (no metadata available)
-        let tracks = self.get_mix_items_legacy(mix_id).await?;
-        Ok(MixPageResult {
+        let legacy = match self.get_mix_items_legacy(mix_id).await {
+            Ok(tracks) if !tracks.is_empty() => {
+                return Ok(MixPageResult {
+                    mix_id: mix_id.to_string(),
+                    mix_type: None,
+                    title: None,
+                    subtitle: None,
+                    image: None,
+                    tracks,
+                });
+            }
+            other => other,
+        };
+
+        match self.official_mix_by_id(mix_id).await {
+            Ok(Some(page)) => return Ok(page),
+            Ok(None) => {}
+            Err(err) if !openapi_catalog::fallback_after(&err) => return Err(err),
+            Err(err) => log::warn!("[get_mix_items] official mix failed ({err})"),
+        }
+        legacy.map(|tracks| MixPageResult {
             mix_id: mix_id.to_string(),
             mix_type: None,
             title: None,
@@ -5145,7 +5654,11 @@ impl TidalClient {
         }
 
         let mut data: Resp = serde_json::from_str(&body).map_err(|e| {
-            SoneError::Parse(format!("{} - Body: {}", e, &body[..body.len().min(500)]))
+            SoneError::Parse(format!(
+                "{} - Body: {}",
+                e,
+                crate::http_util::bounded_preview(&body, 500)
+            ))
         })?;
         for t in &mut data.items {
             t.backfill_artist();
@@ -5159,6 +5672,12 @@ impl TidalClient {
         artist_id: u64,
         limit: u32,
     ) -> Result<Vec<TidalAlbumDetail>, SoneError> {
+        if let Some(albums) = openapi_catalog::official_result(
+            "get_artist_albums",
+            self.official_artist_albums(artist_id, limit).await,
+        )? {
+            return Ok(albums);
+        }
         let cc = self.country_code.clone();
         let limit_str = limit.to_string();
         let body = self
@@ -5174,7 +5693,11 @@ impl TidalClient {
         }
 
         let data: Resp = serde_json::from_str(&body).map_err(|e| {
-            SoneError::Parse(format!("{} - Body: {}", e, &body[..body.len().min(500)]))
+            SoneError::Parse(format!(
+                "{} - Body: {}",
+                e,
+                crate::http_util::bounded_preview(&body, 500)
+            ))
         })?;
         Ok(data.items)
     }
@@ -5460,7 +5983,42 @@ impl TidalClient {
                 ],
             )
             .await?;
-        self.parse_album_page(&body)
+        let mut page = self.parse_album_page(&body)?;
+        self.append_similar_albums(album_id, &mut page).await;
+        Ok(page)
+    }
+
+    async fn append_similar_albums(&mut self, album_id: u64, page: &mut AlbumPageResponse) {
+        let already = page.sections.iter().any(|section| {
+            section.section_type == "ALBUM_LIST"
+                && section.title.to_ascii_lowercase().contains("similar")
+        });
+        if already {
+            return;
+        }
+        let albums = match self.similar_albums(album_id).await {
+            Ok(albums) => albums,
+            Err(err) => {
+                log::warn!("[get_album_page] similar albums failed ({err})");
+                return;
+            }
+        };
+        if albums.is_empty() {
+            return;
+        }
+        let items: Vec<Value> = albums
+            .into_iter()
+            .filter_map(|album| serde_json::to_value(album).ok())
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        page.sections.push(AlbumPageSection {
+            title: "Similar Albums".into(),
+            section_type: "ALBUM_LIST".into(),
+            items,
+            api_path: None,
+        });
     }
 
     pub async fn get_page(&mut self, api_path: &str) -> Result<HomePageResponse, SoneError> {
@@ -5927,7 +6485,7 @@ impl TidalClient {
         log::debug!(
             "[mark_feed_seen] status={}, body={}",
             status,
-            &body[..body.len().min(500)]
+            crate::http_util::bounded_preview(&body, 500)
         );
 
         if !status.is_success() {

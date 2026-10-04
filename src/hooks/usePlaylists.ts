@@ -168,10 +168,29 @@ export function usePlaylists() {
   );
 
   const removeTrackFromPlaylist = useCallback(
-    async (playlistId: string, index: number): Promise<void> => {
+    async (
+      playlistId: string,
+      index: number,
+      item?: {
+        playlistItemId?: string | null;
+        resourceId?: string | number;
+        resourceType?: string;
+      },
+    ): Promise<void> => {
       updatePlaylistTrackCount(playlistId, -1);
       try {
-        await invoke("remove_track_from_playlist", { playlistId, index });
+        await invoke("remove_track_from_playlist", {
+          playlistId,
+          index,
+          playlistItemId: item?.playlistItemId || null,
+          resourceId:
+            item?.resourceId != null && item.playlistItemId
+              ? String(item.resourceId)
+              : null,
+          resourceType: item?.playlistItemId
+            ? (item.resourceType ?? null)
+            : null,
+        });
         invalidateCache(`playlist:${playlistId}`);
         invalidateCache(`playlist-page:${playlistId}`);
         refreshUserPlaylists();

@@ -765,6 +765,10 @@ export interface MixPageResult {
   tracks: Track[];
 }
 
+export async function getSimilarTracks(trackId: number): Promise<Track[]> {
+  return invoke<Track[]>("get_similar_tracks", { trackId });
+}
+
 export async function getMixItems(mixId: string): Promise<MixPageResult> {
   return cached(
     `mix-page:${mixId}`,
