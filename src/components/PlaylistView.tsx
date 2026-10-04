@@ -15,6 +15,7 @@ import {
   useMemo,
   useState,
   useCallback,
+  useLayoutEffect,
   useRef,
   startTransition,
 } from "react";
@@ -33,6 +34,7 @@ import {
   getPlaylistDetails,
 } from "../api/tidal";
 import { getApiStatus, safeErrorMessage } from "../lib/errorUtils";
+import { headerActionClass } from "./headerChrome";
 import {
   getShareUrl,
   formatTotalDuration,
@@ -64,6 +66,13 @@ interface PlaylistViewProps {
   onBack: () => void;
 }
 
+interface PlaylistMetadata {
+  key: string;
+  info?: PlaylistViewProps["playlistInfo"];
+  accessType?: string;
+  duration?: number;
+}
+
 export default function PlaylistView({
   playlistId,
   playlistInfo,
@@ -79,6 +88,18 @@ export default function PlaylistView({
     playFromSource,
     playAllFromSource,
   } = usePlaybackActions();
+  const { userPlaylists, addTrackToPlaylist, updatePlaylist } = usePlaylists();
+  const { showToast } = useToast();
+  const playlistKey = `${playlistId}:${userId ?? ""}`;
+  const activePlaylistKeyRef = useRef<string | undefined>(playlistKey);
+  const metadataEditVersionRef = useRef(0);
+
+  useLayoutEffect(() => {
+    activePlaylistKeyRef.current = playlistKey;
+    return () => {
+      activePlaylistKeyRef.current = undefined;
+    };
+  }, [playlistKey]);
 
   const PAGE_SIZE = 100;
 
@@ -88,14 +109,16 @@ export default function PlaylistView({
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notFound, setNotFound] = useState(false);
-  const [fetchedInfo, setFetchedInfo] =
-    useState<typeof playlistInfo>(undefined);
-  const [resolvedAccessType, setResolvedAccessType] = useState<
-    string | undefined
-  >();
-  const [metaDuration, setMetaDuration] = useState<number | undefined>(
-    undefined,
-  );
+  const [settledPlaylistKey, setSettledPlaylistKey] = useState<string>();
+  const initialLoading = loading || settledPlaylistKey !== playlistKey;
+  const [fetchedMetadata, setFetchedMetadata] = useState<PlaylistMetadata>();
+  const metadata =
+    fetchedMetadata?.key === playlistKey ? fetchedMetadata : undefined;
+  const fetchedInfo = metadata?.info;
+  const resolvedAccessType =
+    metadata?.accessType ??
+    userPlaylists.find((p) => p.uuid === playlistId)?.accessType;
+  const metaDuration = metadata?.duration;
   const savedSort = trackSortPrefs[playlistId];
   const [sortColumn, setSortColumn] = useState<string | null>(
     savedSort?.order ?? null,
@@ -105,60 +128,68 @@ export default function PlaylistView({
   );
   const [sortLoading, setSortLoading] = useState(false);
   const generationRef = useRef(0);
-  const prevPlaylistIdRef = useRef(playlistId);
+  const prevPlaylistKeyRef = useRef(playlistKey);
 
-  // Fetch playlist metadata when the navigation hint doesn't already tell us
-  // whether this is the user's own playlist (e.g. deep link, or "Playing from"
-  // which omits isUserPlaylist). Deriving ownership here — creator vs. current
-  // user, the same rule the sidebar uses — keeps the header correct on every
-  // entry path, not just the sidebar.
+  // The native API client serializes requests. Let the first songs finish
+  // before fetching the header details, and share one response for ownership,
+  // access and duration instead of putting three requests ahead of the songs.
   useEffect(() => {
-    if (playlistInfo?.isUserPlaylist !== undefined) return;
-    getPlaylistDetails(playlistId)
-      .then((p) => {
-        setFetchedInfo({
-          title: p.title,
-          image: p.squareImage || p.image,
-          description: p.description,
-          creatorName: p.creator?.name,
-          numberOfTracks: p.numberOfTracks,
-          numberOfVideos: p.numberOfVideos,
-          isUserPlaylist: userId != null ? p.creator?.id === userId : undefined,
-        });
-        setResolvedAccessType(p.accessType);
-      })
-      .catch(() => {});
-  }, [playlistId, playlistInfo, userId]);
-
-  // Resolve accessType for playlists not in the root userPlaylists atom (e.g. in folders)
-  useEffect(() => {
-    if (resolvedAccessType) return;
-    if (userPlaylists.find((p) => p.uuid === playlistId)?.accessType) return;
-    getPlaylistDetails(playlistId)
-      .then((p) => {
-        if (p.accessType) setResolvedAccessType(p.accessType);
-      })
-      .catch(() => {});
-  }, [playlistId]);
-
-  useEffect(() => {
+    if (initialLoading) return;
     let cancelled = false;
-    setMetaDuration(undefined);
+    const editVersion = metadataEditVersionRef.current;
     getPlaylistDetails(playlistId)
       .then((p) => {
-        if (!cancelled && typeof p.duration === "number") {
-          setMetaDuration(p.duration);
-        }
+        if (cancelled || activePlaylistKeyRef.current !== playlistKey) return;
+        const incoming: PlaylistMetadata = {
+          key: playlistKey,
+          info: {
+            title: p.title,
+            image: p.squareImage || p.image,
+            description: p.description,
+            creatorName: p.creator?.name,
+            numberOfTracks: p.numberOfTracks,
+            numberOfVideos: p.numberOfVideos,
+            isUserPlaylist:
+              userId != null && p.creator?.id != null
+                ? p.creator.id === userId
+                : undefined,
+          },
+          accessType: p.accessType,
+          duration: p.duration,
+        };
+        setFetchedMetadata((previous) => {
+          // An edit can complete while this request is pending. Keep the
+          // edited fields, while still accepting the fetched total duration.
+          if (
+            previous?.key === playlistKey &&
+            metadataEditVersionRef.current !== editVersion
+          ) {
+            return {
+              ...incoming,
+              ...previous,
+              info: { ...incoming.info!, ...previous.info! },
+              duration: incoming.duration ?? previous.duration,
+            };
+          }
+          return incoming;
+        });
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [playlistId]);
+  }, [playlistId, playlistKey, userId, initialLoading]);
 
   // fetchedInfo takes priority when set (e.g. after editing), otherwise use navigation prop
   const effectiveInfo = fetchedInfo
-    ? { ...playlistInfo, ...fetchedInfo }
+    ? {
+        ...playlistInfo,
+        ...Object.fromEntries(
+          Object.entries(fetchedInfo).filter(
+            ([, value]) => value !== undefined,
+          ),
+        ),
+      }
     : playlistInfo;
 
   const offsetRef = useRef(0);
@@ -174,10 +205,8 @@ export default function PlaylistView({
   const [recPageIndex, setRecPageIndex] = useState(0);
   const [recApiOffset, setRecApiOffset] = useState(0);
   const [loadingRecs, setLoadingRecs] = useState(false);
-  const { userPlaylists, addTrackToPlaylist, updatePlaylist } = usePlaylists();
-  const { showToast } = useToast();
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     allTracksRef.current = allTracks;
   }, [allTracks]);
 
@@ -195,10 +224,12 @@ export default function PlaylistView({
       } catch {
         return [];
       } finally {
-        setLoadingRecs(false);
+        if (activePlaylistKeyRef.current === playlistKey) {
+          setLoadingRecs(false);
+        }
       }
     },
-    [playlistId],
+    [playlistId, playlistKey],
   );
 
   // Current slice of recommendations to display
@@ -219,6 +250,7 @@ export default function PlaylistView({
       const newOffset = recApiOffset + RECS_BATCH;
       invalidateCache(`playlist-recs:${playlistId}`);
       const newTracks = await fetchRecBatch(newOffset);
+      if (activePlaylistKeyRef.current !== playlistKey) return;
       if (newTracks.length > 0) {
         setRecPool(newTracks);
         setRecApiOffset(newOffset);
@@ -226,12 +258,20 @@ export default function PlaylistView({
       } else {
         // API returned empty — wrap around to beginning
         const freshTracks = await fetchRecBatch(0);
+        if (activePlaylistKeyRef.current !== playlistKey) return;
         setRecPool(freshTracks);
         setRecApiOffset(0);
         setRecPageIndex(0);
       }
     }
-  }, [recPageIndex, recPool.length, recApiOffset, playlistId, fetchRecBatch]);
+  }, [
+    recPageIndex,
+    recPool.length,
+    recApiOffset,
+    playlistId,
+    playlistKey,
+    fetchRecBatch,
+  ]);
 
   const handleAddRecToPlaylist = useCallback(
     async (track: Track) => {
@@ -241,6 +281,7 @@ export default function PlaylistView({
         await addTrackToPlaylist(playlistId, track.id);
         showToast(`Added "${track.title}" to playlist`, "success");
       } catch {
+        if (activePlaylistKeyRef.current !== playlistKey) return;
         // Rollback: re-insert the track
         setRecPool((prev) => {
           if (prev.some((t) => t.id === track.id)) return prev;
@@ -249,7 +290,7 @@ export default function PlaylistView({
         showToast("Failed to add track", "error");
       }
     },
-    [playlistId, addTrackToPlaylist, showToast],
+    [playlistId, playlistKey, addTrackToPlaylist, showToast],
   );
 
   // Load first page only
@@ -257,15 +298,17 @@ export default function PlaylistView({
     const gen = ++generationRef.current;
     bgFetchingRef.current = false;
 
-    const isNewPlaylist = prevPlaylistIdRef.current !== playlistId;
-    prevPlaylistIdRef.current = playlistId;
+    const isNewPlaylist = prevPlaylistKeyRef.current !== playlistKey;
+    prevPlaylistKeyRef.current = playlistKey;
 
     if (isNewPlaylist) {
-      // Full page skeleton for playlist navigation
+      // Keep the navigation header visible while the new songs load.
       setLoading(true);
+      setLoadingMore(false);
       setError(null);
       setNotFound(false);
       setAllTracks([]);
+      setTotalTracks(0);
       // Load saved sort preference for the new playlist
       const newSort = trackSortPrefs[playlistId];
       const newCol = newSort?.order ?? null;
@@ -281,6 +324,7 @@ export default function PlaylistView({
 
     offsetRef.current = 0;
     hasMoreRef.current = true;
+    let cancelled = false;
 
     const loadFirstPage = async () => {
       try {
@@ -291,15 +335,15 @@ export default function PlaylistView({
           sortColumn ?? undefined,
           sortDirection ?? undefined,
         );
-        if (generationRef.current !== gen) return;
+        if (cancelled || generationRef.current !== gen) return;
 
         setAllTracks(firstPage.items);
         setTotalTracks(firstPage.totalNumberOfItems);
         offsetRef.current = firstPage.items.length;
         hasMoreRef.current =
           firstPage.items.length < firstPage.totalNumberOfItems;
-      } catch (err: any) {
-        if (generationRef.current !== gen) return;
+      } catch (err) {
+        if (cancelled || generationRef.current !== gen) return;
         console.error("Failed to load playlist:", err);
         if (getApiStatus(err) === 404) {
           setNotFound(true);
@@ -307,24 +351,27 @@ export default function PlaylistView({
           setError(safeErrorMessage(err, "Failed to load playlist"));
         }
       } finally {
-        if (generationRef.current !== gen) return;
-        setLoading(false);
-        setSortLoading(false);
+        if (!cancelled && generationRef.current === gen) {
+          setLoading(false);
+          setSortLoading(false);
+          setSettledPlaylistKey(playlistKey);
+        }
       }
     };
 
     loadFirstPage();
-  }, [playlistId, sortColumn, sortDirection]);
+    return () => {
+      cancelled = true;
+    };
+  }, [playlistId, playlistKey, sortColumn, sortDirection]);
 
-  // Fetch initial batch of recommendations when playlist changes
+  // Clear old recommendations immediately; fetch only once they can be shown.
   useEffect(() => {
     setRecPool([]);
     setRecPageIndex(0);
     setRecApiOffset(0);
-    fetchRecBatch(0).then((tracks) => {
-      setRecPool(tracks);
-    });
-  }, [playlistId, fetchRecBatch]);
+    setLoadingRecs(false);
+  }, [playlistKey]);
 
   // Fetch all remaining pages in the background
   const fetchRemaining = useCallback(
@@ -362,7 +409,7 @@ export default function PlaylistView({
       } catch (err) {
         console.error("Failed to background-fetch playlist tracks:", err);
       } finally {
-        bgFetchingRef.current = false;
+        if (generationRef.current === gen) bgFetchingRef.current = false;
       }
     },
     [playlistId, sortColumn, sortDirection],
@@ -394,16 +441,31 @@ export default function PlaylistView({
     } catch (err) {
       console.error("Failed to load more playlist tracks:", err);
     } finally {
-      setLoadingMore(false);
+      if (generationRef.current === gen) setLoadingMore(false);
     }
   }, [loadingMore, playlistId, sortColumn, sortDirection]);
 
   const tracks = allTracks;
   const hasMore = allTracks.length < totalTracks;
+  const hasTracks = tracks.length > 0;
+
+  useEffect(() => {
+    if (initialLoading || hasMore || !hasTracks) return;
+    let cancelled = false;
+    fetchRecBatch(0).then((items) => {
+      if (!cancelled) setRecPool(items);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [initialLoading, hasMore, hasTracks, fetchRecBatch]);
 
   // Lets an in-flight scroll restore pull the pages it needs directly, rather
   // than the viewport tripping the pagination sentinel page by page.
-  useRestoreLoader(loadMore, hasMore);
+  useRestoreLoader(
+    initialLoading ? undefined : loadMore,
+    !initialLoading && hasMore,
+  );
 
   // Local search / filter (debounce handled inside DebouncedFilterInput)
   const [searchQuery, setSearchQuery] = useState("");
@@ -451,19 +513,29 @@ export default function PlaylistView({
     [playlistId, setTrackSortPrefs],
   );
 
-  const playlistSource = (allTracks: Track[]) => ({
-    type: "playlist" as const,
-    id: playlistId,
-    name: effectiveInfo?.title || "Playlist",
-    image: effectiveInfo?.image,
-    allTracks,
-  });
+  const playlistSource = useCallback(
+    (allTracks: Track[]) => ({
+      type: "playlist" as const,
+      id: playlistId,
+      name: effectiveInfo?.title || "Playlist",
+      image: effectiveInfo?.image,
+      allTracks,
+    }),
+    [playlistId, effectiveInfo?.title, effectiveInfo?.image],
+  );
+
+  const handleTrackRemoved = useCallback((index: number) => {
+    setAllTracks((prev) => prev.filter((_, i) => i !== index));
+  }, []);
 
   const handlePlayTrack = useCallback(
     async (track: Track, _index: number) => {
       try {
-        await playFromSource(track, tracks, {
-          source: playlistSource(tracks),
+        // Appending a page must not change every existing row's play callback.
+        // Read the last committed collection when the user actually plays it.
+        const currentTracks = allTracksRef.current;
+        await playFromSource(track, currentTracks, {
+          source: playlistSource(currentTracks),
         });
 
         // Fire-and-forget: append remaining pages to queue as they arrive
@@ -474,7 +546,7 @@ export default function PlaylistView({
         console.error("Failed to play playlist track:", err);
       }
     },
-    [tracks, playlistSource, fetchRemaining, appendToQueue, playFromSource],
+    [playlistSource, fetchRemaining, appendToQueue, playFromSource],
   );
 
   const handlePlayRec = useCallback(
@@ -560,7 +632,12 @@ export default function PlaylistView({
   const handleToggleAccess = async () => {
     const newAccessType = isPublic ? "UNLISTED" : "PUBLIC";
     const prevAccessType = resolvedAccessType;
-    setResolvedAccessType(newAccessType);
+    metadataEditVersionRef.current++;
+    setFetchedMetadata((previous) => ({
+      ...(previous?.key === playlistKey ? previous : undefined),
+      key: playlistKey,
+      accessType: newAccessType,
+    }));
     try {
       await updatePlaylist(
         playlistId,
@@ -574,7 +651,12 @@ export default function PlaylistView({
           : "Playlist is now private",
       );
     } catch {
-      setResolvedAccessType(prevAccessType);
+      if (activePlaylistKeyRef.current !== playlistKey) return;
+      setFetchedMetadata((previous) => ({
+        ...previous,
+        key: playlistKey,
+        accessType: prevAccessType,
+      }));
     }
   };
 
@@ -599,7 +681,7 @@ export default function PlaylistView({
   // videos so the "Tracks" figure counts audio only.
   const videoCount = effectiveInfo?.numberOfVideos ?? 0;
   const displayTrackCount =
-    totalTracks > 0
+    !initialLoading && totalTracks > 0
       ? Math.max(0, totalTracks - videoCount)
       : (effectiveInfo?.numberOfTracks ?? 0);
 
@@ -623,15 +705,15 @@ export default function PlaylistView({
     }
   };
 
-  if (loading) {
+  if (initialLoading && !effectiveInfo) {
     return <DetailPageSkeleton type="playlist" />;
   }
 
-  if (notFound) {
+  if (!initialLoading && notFound) {
     return <NotFoundPage />;
   }
 
-  if (error) {
+  if (!initialLoading && error) {
     return (
       <div className="flex-1 bg-linear-to-b from-th-surface to-th-base flex items-center justify-center">
         <div className="flex flex-col items-center gap-4 text-center px-8">
@@ -714,18 +796,24 @@ export default function PlaylistView({
           <div className="px-8 py-5 flex items-center justify-between relative z-10">
             {/* Left — Play & Shuffle buttons */}
             <div className="flex items-center gap-3">
-              <SourcePlayButton
-                sourceType="playlist"
-                sourceId={playlistId}
-                onPlay={handlePlayAll}
-              />
-              <button
-                onClick={handleShuffle}
-                className="flex items-center gap-2 px-6 py-2.5 bg-th-button/40 backdrop-blur-md text-th-text-primary font-bold text-sm rounded-full hover:bg-th-button/60 hover:scale-[1.03] transition-[transform,filter,background-color] duration-150"
-              >
-                <Shuffle size={18} />
-                Shuffle
-              </button>
+              {initialLoading ? (
+                <>
+                  <div className="w-24 h-10 rounded-full bg-th-surface-hover" />
+                  <div className="w-28 h-10 rounded-full bg-th-surface-hover" />
+                </>
+              ) : (
+                <>
+                  <SourcePlayButton
+                    sourceType="playlist"
+                    sourceId={playlistId}
+                    onPlay={handlePlayAll}
+                  />
+                  <button onClick={handleShuffle} className={headerActionClass}>
+                    <Shuffle size={18} />
+                    Shuffle
+                  </button>
+                </>
+              )}
             </div>
             {/* Right — labelled action buttons */}
             <div className="flex items-end gap-6 relative">
@@ -830,19 +918,23 @@ export default function PlaylistView({
       <PageContainer>
         {/* Search / Filter bar */}
         <div className="px-8 pb-4">
-          <DebouncedFilterInput
-            placeholder="Filter playlist on title, artist or album"
-            onChange={setSearchQuery}
-            onFocus={handleSearchFocus}
-          />
+          {initialLoading ? (
+            <div className="w-full h-9 rounded-md bg-th-surface-hover" />
+          ) : (
+            <DebouncedFilterInput
+              placeholder="Filter playlist on title, artist or album"
+              onChange={setSearchQuery}
+              onFocus={handleSearchFocus}
+            />
+          )}
         </div>
 
         <div className="px-8 pb-8">
           <TrackList
             tracks={filteredTracks}
             onPlay={handlePlayTrack}
-            onLoadMore={isFiltering ? undefined : loadMore}
-            hasMore={isFiltering ? false : hasMore}
+            onLoadMore={initialLoading || isFiltering ? undefined : loadMore}
+            hasMore={!initialLoading && !isFiltering && hasMore}
             loadingMore={isFiltering ? false : loadingMore}
             trackDisplayNumbers={displayNumbers}
             showDateAdded={!!effectiveInfo?.isUserPlaylist}
@@ -856,45 +948,46 @@ export default function PlaylistView({
             sortColumn={sortColumn}
             sortDirection={sortDirection}
             onSort={handleSort}
-            sortLoading={sortLoading}
-            onTrackRemoved={(index) => {
-              setAllTracks((prev) => prev.filter((_, i) => i !== index));
-            }}
+            sortLoading={initialLoading || sortLoading}
+            onTrackRemoved={handleTrackRemoved}
             virtualize
           />
 
           {/* Recommended Tracks */}
-          {tracks.length > 0 && !hasMore && visibleRecs.length > 0 && (
-            <div className="mt-10">
-              <h2 className="text-[18px] font-bold text-th-text-primary mb-4">
-                {RECOMMENDED_TRACKS_LABEL}
-              </h2>
-              <TrackList
-                tracks={visibleRecs}
-                onPlay={handlePlayRec}
-                showArtist={true}
-                showAlbum={true}
-                showCover={true}
-                context="playlist"
-                onAddToCurrentPlaylist={handleAddRecToPlaylist}
-              />
-              <div className="flex justify-end mt-6">
-                <button
-                  onClick={handleRefreshRecs}
-                  disabled={loadingRecs}
-                  className="flex items-center gap-2 px-5 py-2 bg-th-button text-th-text-primary font-semibold text-sm rounded-full hover:bg-th-button-hover hover:scale-[1.03] transition-[transform,background-color] duration-150 disabled:opacity-50"
-                >
-                  <RefreshCw
-                    size={16}
-                    className={loadingRecs ? "animate-spin" : ""}
-                  />
-                  Refresh
-                </button>
+          {!initialLoading &&
+            hasTracks &&
+            !hasMore &&
+            visibleRecs.length > 0 && (
+              <div className="mt-10">
+                <h2 className="text-[18px] font-bold text-th-text-primary mb-4">
+                  {RECOMMENDED_TRACKS_LABEL}
+                </h2>
+                <TrackList
+                  tracks={visibleRecs}
+                  onPlay={handlePlayRec}
+                  showArtist={true}
+                  showAlbum={true}
+                  showCover={true}
+                  context="playlist"
+                  onAddToCurrentPlaylist={handleAddRecToPlaylist}
+                />
+                <div className="flex justify-end mt-6">
+                  <button
+                    onClick={handleRefreshRecs}
+                    disabled={loadingRecs}
+                    className="flex items-center gap-2 px-5 py-2 bg-th-button text-th-text-primary font-semibold text-sm rounded-full hover:bg-th-button-hover hover:scale-[1.03] transition-[transform,background-color] duration-150 disabled:opacity-50"
+                  >
+                    <RefreshCw
+                      size={16}
+                      className={loadingRecs ? "animate-spin" : ""}
+                    />
+                    Refresh
+                  </button>
+                </div>
               </div>
-            </div>
-          )}
+            )}
 
-          {tracks.length === 0 && (
+          {!initialLoading && tracks.length === 0 && (
             <div className="py-16 text-center">
               <Music size={48} className="text-th-text-disabled mx-auto mb-4" />
               <p className="text-th-text-primary font-semibold text-lg mb-2">
@@ -917,7 +1010,7 @@ export default function PlaylistView({
           <div
             className="bg-th-elevated rounded-xl shadow-2xl max-w-[700px] w-[90%] max-h-[80vh] flex flex-col overflow-hidden"
             onClick={(e) => e.stopPropagation()}
-            style={{ animation: "slideUp 0.2s ease-out" }}
+            style={{ animation: "slideUp 0.2s var(--ease-settle)" }}
           >
             {/* Header: cover + title + close */}
             <div className="flex items-center gap-3 px-6 pt-5 pb-4">
@@ -979,14 +1072,20 @@ export default function PlaylistView({
           }}
           onClose={() => setShowEditModal(false)}
           onUpdated={(updated) => {
+            if (activePlaylistKeyRef.current !== playlistKey) return;
             setShowEditModal(false);
-            if (updated.accessType) setResolvedAccessType(updated.accessType);
-            setFetchedInfo({
-              ...playlistInfo,
-              title: updated.title,
-              description: updated.description,
-              isUserPlaylist: true,
-            });
+            metadataEditVersionRef.current++;
+            setFetchedMetadata((previous) => ({
+              ...(previous?.key === playlistKey ? previous : undefined),
+              key: playlistKey,
+              accessType: updated.accessType ?? resolvedAccessType,
+              info: {
+                ...effectiveInfo,
+                title: updated.title,
+                description: updated.description,
+                isUserPlaylist: true,
+              },
+            }));
           }}
         />
       )}

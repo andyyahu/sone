@@ -11,6 +11,7 @@ import {
 import SortDropdown from "./SortDropdown";
 import { useInfiniteScroll } from "../hooks/useInfiniteScroll";
 import SidebarSkeleton from "./SidebarSkeleton";
+import VirtualSidebarItems from "./VirtualSidebarItems";
 import {
   getPlaylistFolders,
   normalizePlaylistFolders,
@@ -65,6 +66,9 @@ import { sidebarCollapsedAtom, feedUnseenCountAtom } from "../atoms/ui";
 import { currentViewAtom } from "../atoms/navigation";
 
 export default function Sidebar() {
+  const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(
+    null,
+  );
   const {
     navigateToPlaylist,
     navigateToAlbum,
@@ -554,7 +558,10 @@ export default function Sidebar() {
         )}
 
         {/* Library List */}
-        <div className="flex-1 overflow-y-auto px-1.5 pb-2 custom-scrollbar">
+        <div
+          ref={setScrollElement}
+          className="relative flex-1 overflow-y-auto px-1.5 pb-2 custom-scrollbar"
+        >
           {activeFilter === "playlists" ? (
             /* Playlists view */
             playlistsLoading ? (
@@ -605,108 +612,112 @@ export default function Sidebar() {
                   )}
                 </button>
 
-                {visiblePlaylistItems.map((entry) => {
-                  if (entry.kind === "folder") {
-                    const folderName =
-                      renamedFolders.get(entry.data.id) ?? entry.data.name;
+                <VirtualSidebarItems scrollElement={scrollElement}>
+                  {visiblePlaylistItems.map((entry) => {
+                    if (entry.kind === "folder") {
+                      const folderName =
+                        renamedFolders.get(entry.data.id) ?? entry.data.name;
+                      return (
+                        <button
+                          key={entry.data.id}
+                          onClick={() =>
+                            navigateToPlaylistFolder(entry.data.id, folderName)
+                          }
+                          onContextMenu={(e) =>
+                            handleFolderContextMenu(e, {
+                              ...entry.data,
+                              name: folderName,
+                            })
+                          }
+                          className={`w-full flex items-center gap-2.5 px-1.5 py-2 rounded-md transition-colors duration-150 group hover:bg-th-border-subtle ${isCollapsed ? "justify-center" : ""}`}
+                          title={folderName}
+                        >
+                          <div
+                            className={`bg-th-surface-hover shrink-0 overflow-hidden rounded flex items-center justify-center ${isCollapsed ? "w-10 h-10" : "w-10 h-10"}`}
+                          >
+                            <FolderOpen
+                              size={18}
+                              className="text-th-text-faint"
+                            />
+                          </div>
+                          {!isCollapsed && (
+                            <div className="flex-1 min-w-0 text-left">
+                              <div className="text-[14px] font-medium text-th-text-primary truncate leading-snug">
+                                {folderName}
+                              </div>
+                              <div className="text-[12px] text-th-text-faint truncate leading-snug mt-0.5">
+                                {folderSubtitle(
+                                  (entry.data.totalNumberOfItems ?? 0) +
+                                    (countAdjustments.get(entry.data.id) ?? 0),
+                                )}
+                              </div>
+                            </div>
+                          )}
+                        </button>
+                      );
+                    }
+
+                    const playlistUpdate = updatedPlaylists.get(
+                      entry.data.uuid,
+                    );
+                    const playlist = playlistUpdate
+                      ? { ...entry.data, title: playlistUpdate.title }
+                      : entry.data;
+                    const own = isOwnPlaylist(playlist);
+                    const trackCount = playlist.numberOfTracks;
+                    const creatorLabel = own ? "You" : getCreatorName(playlist);
+                    const countLabel =
+                      trackCount != null
+                        ? playlistCountLabel(
+                            playlist.numberOfTracks,
+                            playlist.numberOfVideos,
+                          )
+                        : "";
+                    let subtitle = [creatorLabel, countLabel]
+                      .filter(Boolean)
+                      .join(" \u00B7 ");
+                    if (!subtitle) {
+                      subtitle = "Playlist";
+                    }
+
                     return (
                       <button
-                        key={entry.data.id}
-                        onClick={() =>
-                          navigateToPlaylistFolder(entry.data.id, folderName)
-                        }
+                        key={playlist.uuid}
+                        onClick={() => handlePlaylistClick(playlist)}
                         onContextMenu={(e) =>
-                          handleFolderContextMenu(e, {
-                            ...entry.data,
-                            name: folderName,
-                          })
+                          handlePlaylistContextMenu(e, playlist)
                         }
-                        className={`w-full flex items-center gap-2.5 px-1.5 py-2 rounded-md transition-colors duration-150 group hover:bg-th-border-subtle ${isCollapsed ? "justify-center" : ""}`}
-                        title={folderName}
+                        className={`w-full flex items-center gap-2.5 px-1.5 py-2 rounded-md transition-colors duration-150 group ${
+                          currentView.type === "playlist" &&
+                          currentView.playlistId === playlist.uuid
+                            ? "bg-th-hl-med"
+                            : "hover:bg-th-border-subtle"
+                        } ${isCollapsed ? "justify-center" : ""}`}
+                        title={playlist.title}
                       >
                         <div
-                          className={`bg-th-surface-hover shrink-0 overflow-hidden rounded flex items-center justify-center ${isCollapsed ? "w-10 h-10" : "w-10 h-10"}`}
+                          className={`bg-th-surface-hover shrink-0 overflow-hidden rounded ${isCollapsed ? "w-10 h-10" : "w-10 h-10"}`}
                         >
-                          <FolderOpen
-                            size={18}
-                            className="text-th-text-faint"
+                          <TidalImage
+                            src={getTidalImageUrl(playlist.image, 80)}
+                            alt={playlist.title}
+                            type="playlist"
                           />
                         </div>
                         {!isCollapsed && (
                           <div className="flex-1 min-w-0 text-left">
                             <div className="text-[14px] font-medium text-th-text-primary truncate leading-snug">
-                              {folderName}
+                              {playlist.title}
                             </div>
                             <div className="text-[12px] text-th-text-faint truncate leading-snug mt-0.5">
-                              {folderSubtitle(
-                                (entry.data.totalNumberOfItems ?? 0) +
-                                  (countAdjustments.get(entry.data.id) ?? 0),
-                              )}
+                              {subtitle}
                             </div>
                           </div>
                         )}
                       </button>
                     );
-                  }
-
-                  const playlistUpdate = updatedPlaylists.get(entry.data.uuid);
-                  const playlist = playlistUpdate
-                    ? { ...entry.data, title: playlistUpdate.title }
-                    : entry.data;
-                  const own = isOwnPlaylist(playlist);
-                  const trackCount = playlist.numberOfTracks;
-                  const creatorLabel = own ? "You" : getCreatorName(playlist);
-                  const countLabel =
-                    trackCount != null
-                      ? playlistCountLabel(
-                          playlist.numberOfTracks,
-                          playlist.numberOfVideos,
-                        )
-                      : "";
-                  let subtitle = [creatorLabel, countLabel]
-                    .filter(Boolean)
-                    .join(" \u00B7 ");
-                  if (!subtitle) {
-                    subtitle = "Playlist";
-                  }
-
-                  return (
-                    <button
-                      key={playlist.uuid}
-                      onClick={() => handlePlaylistClick(playlist)}
-                      onContextMenu={(e) =>
-                        handlePlaylistContextMenu(e, playlist)
-                      }
-                      className={`w-full flex items-center gap-2.5 px-1.5 py-2 rounded-md transition-colors duration-150 group ${
-                        currentView.type === "playlist" &&
-                        currentView.playlistId === playlist.uuid
-                          ? "bg-th-hl-med"
-                          : "hover:bg-th-border-subtle"
-                      } ${isCollapsed ? "justify-center" : ""}`}
-                      title={playlist.title}
-                    >
-                      <div
-                        className={`bg-th-surface-hover shrink-0 overflow-hidden rounded ${isCollapsed ? "w-10 h-10" : "w-10 h-10"}`}
-                      >
-                        <TidalImage
-                          src={getTidalImageUrl(playlist.image, 80)}
-                          alt={playlist.title}
-                          type="playlist"
-                        />
-                      </div>
-                      {!isCollapsed && (
-                        <div className="flex-1 min-w-0 text-left">
-                          <div className="text-[14px] font-medium text-th-text-primary truncate leading-snug">
-                            {playlist.title}
-                          </div>
-                          <div className="text-[12px] text-th-text-faint truncate leading-snug mt-0.5">
-                            {subtitle}
-                          </div>
-                        </div>
-                      )}
-                    </button>
-                  );
-                })}
+                  })}
+                </VirtualSidebarItems>
                 {playlistsHasMore && <div ref={playlistsSentinelRef} />}
                 {playlistsLoadingMore && <SidebarSkeleton count={2} />}
               </div>
@@ -725,54 +736,56 @@ export default function Sidebar() {
               </div>
             ) : (
               <div className="space-y-px">
-                {allAlbums.map((album) => (
-                  <button
-                    key={album.id}
-                    onClick={() =>
-                      navigateToAlbum(album.id, {
-                        title: album.title,
-                        cover: album.cover,
-                        artistName: album.artist?.name,
-                      })
-                    }
-                    className={`w-full flex items-center gap-2.5 px-1.5 py-2 rounded-md transition-colors duration-150 group ${
-                      currentView.type === "album" &&
-                      currentView.albumId === album.id
-                        ? "bg-th-hl-med"
-                        : "hover:bg-th-border-subtle"
-                    } ${isCollapsed ? "justify-center" : ""}`}
-                    title={album.title}
-                  >
-                    <div
-                      className={`bg-th-surface-hover shrink-0 overflow-hidden rounded ${
-                        isCollapsed ? "w-10 h-10" : "w-10 h-10"
-                      }`}
+                <VirtualSidebarItems scrollElement={scrollElement}>
+                  {allAlbums.map((album) => (
+                    <button
+                      key={album.id}
+                      onClick={() =>
+                        navigateToAlbum(album.id, {
+                          title: album.title,
+                          cover: album.cover,
+                          artistName: album.artist?.name,
+                        })
+                      }
+                      className={`w-full flex items-center gap-2.5 px-1.5 py-2 rounded-md transition-colors duration-150 group ${
+                        currentView.type === "album" &&
+                        currentView.albumId === album.id
+                          ? "bg-th-hl-med"
+                          : "hover:bg-th-border-subtle"
+                      } ${isCollapsed ? "justify-center" : ""}`}
+                      title={album.title}
                     >
-                      {album.cover ? (
-                        <TidalImage
-                          src={getTidalImageUrl(album.cover, 80)}
-                          alt={album.title}
-                          type="album"
-                        />
-                      ) : (
-                        <div className="w-full h-full flex items-center justify-center">
-                          <Music size={16} className="text-th-text-faint" />
+                      <div
+                        className={`bg-th-surface-hover shrink-0 overflow-hidden rounded ${
+                          isCollapsed ? "w-10 h-10" : "w-10 h-10"
+                        }`}
+                      >
+                        {album.cover ? (
+                          <TidalImage
+                            src={getTidalImageUrl(album.cover, 80)}
+                            alt={album.title}
+                            type="album"
+                          />
+                        ) : (
+                          <div className="w-full h-full flex items-center justify-center">
+                            <Music size={16} className="text-th-text-faint" />
+                          </div>
+                        )}
+                      </div>
+
+                      {!isCollapsed && (
+                        <div className="flex-1 min-w-0 text-left">
+                          <div className="text-[14px] font-medium text-th-text-primary truncate leading-snug">
+                            {album.title}
+                          </div>
+                          <div className="text-[12px] text-th-text-faint truncate leading-snug mt-0.5">
+                            {getTrackArtistDisplay(album)}
+                          </div>
                         </div>
                       )}
-                    </div>
-
-                    {!isCollapsed && (
-                      <div className="flex-1 min-w-0 text-left">
-                        <div className="text-[14px] font-medium text-th-text-primary truncate leading-snug">
-                          {album.title}
-                        </div>
-                        <div className="text-[12px] text-th-text-faint truncate leading-snug mt-0.5">
-                          {getTrackArtistDisplay(album)}
-                        </div>
-                      </div>
-                    )}
-                  </button>
-                ))}
+                    </button>
+                  ))}
+                </VirtualSidebarItems>
                 {albumsHasMore && <div ref={albumsSentinelRef} />}
                 {albumsLoadingMore && <SidebarSkeleton count={2} />}
               </div>
@@ -791,66 +804,68 @@ export default function Sidebar() {
               </div>
             ) : (
               <div className="space-y-px">
-                {allArtists.map((artist) => (
-                  <button
-                    key={artist.id}
-                    onClick={() =>
-                      navigateToArtist(artist.id, {
-                        name: artist.name,
-                        picture: artist.picture,
-                      })
-                    }
-                    onContextMenu={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      setContextMenu({
-                        item: {
-                          type: "artist",
-                          id: artist.id,
+                <VirtualSidebarItems scrollElement={scrollElement}>
+                  {allArtists.map((artist) => (
+                    <button
+                      key={artist.id}
+                      onClick={() =>
+                        navigateToArtist(artist.id, {
                           name: artist.name,
                           picture: artist.picture,
-                        },
-                        position: { x: e.clientX, y: e.clientY },
-                      });
-                    }}
-                    className={`w-full flex items-center gap-2.5 px-1.5 py-2 rounded-md transition-colors duration-150 group ${
-                      currentView.type === "artist" &&
-                      currentView.artistId === artist.id
-                        ? "bg-th-hl-med"
-                        : "hover:bg-th-border-subtle"
-                    } ${isCollapsed ? "justify-center" : ""}`}
-                    title={artist.name}
-                  >
-                    <div
-                      className={`bg-th-surface-hover shrink-0 overflow-hidden rounded-full ${
-                        isCollapsed ? "w-10 h-10" : "w-10 h-10"
-                      }`}
+                        })
+                      }
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setContextMenu({
+                          item: {
+                            type: "artist",
+                            id: artist.id,
+                            name: artist.name,
+                            picture: artist.picture,
+                          },
+                          position: { x: e.clientX, y: e.clientY },
+                        });
+                      }}
+                      className={`w-full flex items-center gap-2.5 px-1.5 py-2 rounded-md transition-colors duration-150 group ${
+                        currentView.type === "artist" &&
+                        currentView.artistId === artist.id
+                          ? "bg-th-hl-med"
+                          : "hover:bg-th-border-subtle"
+                      } ${isCollapsed ? "justify-center" : ""}`}
+                      title={artist.name}
                     >
-                      {getArtistImage(artist, 160) ? (
-                        <TidalImage
-                          src={getArtistImage(artist, 160)}
-                          alt={artist.name}
-                          type="artist"
-                        />
-                      ) : (
-                        <div className="w-full h-full flex items-center justify-center">
-                          <User size={16} className="text-th-text-faint" />
+                      <div
+                        className={`bg-th-surface-hover shrink-0 overflow-hidden rounded-full ${
+                          isCollapsed ? "w-10 h-10" : "w-10 h-10"
+                        }`}
+                      >
+                        {getArtistImage(artist, 160) ? (
+                          <TidalImage
+                            src={getArtistImage(artist, 160)}
+                            alt={artist.name}
+                            type="artist"
+                          />
+                        ) : (
+                          <div className="w-full h-full flex items-center justify-center">
+                            <User size={16} className="text-th-text-faint" />
+                          </div>
+                        )}
+                      </div>
+
+                      {!isCollapsed && (
+                        <div className="flex-1 min-w-0 text-left">
+                          <div className="text-[14px] font-medium text-th-text-primary truncate leading-snug">
+                            {artist.name}
+                          </div>
+                          <div className="text-[12px] text-th-text-faint truncate leading-snug mt-0.5">
+                            Artist
+                          </div>
                         </div>
                       )}
-                    </div>
-
-                    {!isCollapsed && (
-                      <div className="flex-1 min-w-0 text-left">
-                        <div className="text-[14px] font-medium text-th-text-primary truncate leading-snug">
-                          {artist.name}
-                        </div>
-                        <div className="text-[12px] text-th-text-faint truncate leading-snug mt-0.5">
-                          Artist
-                        </div>
-                      </div>
-                    )}
-                  </button>
-                ))}
+                    </button>
+                  ))}
+                </VirtualSidebarItems>
                 {artistsHasMore && <div ref={artistsSentinelRef} />}
                 {artistsLoadingMore && <SidebarSkeleton count={2} />}
               </div>
@@ -868,68 +883,70 @@ export default function Sidebar() {
             </div>
           ) : (
             <div className="space-y-px">
-              {allMixes.map((mix) => (
-                <button
-                  key={mix.id}
-                  onClick={() =>
-                    navigateToMix(mix.id, {
-                      title: mix.title,
-                      image: mix.images?.MEDIUM?.url,
-                      subtitle: mix.subTitle,
-                      mixType: mix.mixType,
-                    })
-                  }
-                  onContextMenu={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    setContextMenu({
-                      item: {
-                        type: "mix",
-                        mixId: mix.id,
+              <VirtualSidebarItems scrollElement={scrollElement}>
+                {allMixes.map((mix) => (
+                  <button
+                    key={mix.id}
+                    onClick={() =>
+                      navigateToMix(mix.id, {
                         title: mix.title,
                         image: mix.images?.MEDIUM?.url,
                         subtitle: mix.subTitle,
-                      },
-                      position: { x: e.clientX, y: e.clientY },
-                    });
-                  }}
-                  className={`w-full flex items-center gap-2.5 px-1.5 py-2 rounded-md transition-colors duration-150 group ${
-                    currentView.type === "mix" && currentView.mixId === mix.id
-                      ? "bg-th-hl-med"
-                      : "hover:bg-th-border-subtle"
-                  } ${isCollapsed ? "justify-center" : ""}`}
-                  title={mix.title}
-                >
-                  <div
-                    className={`bg-th-surface-hover shrink-0 overflow-hidden rounded ${
-                      isCollapsed ? "w-10 h-10" : "w-10 h-10"
-                    }`}
+                        mixType: mix.mixType,
+                      })
+                    }
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setContextMenu({
+                        item: {
+                          type: "mix",
+                          mixId: mix.id,
+                          title: mix.title,
+                          image: mix.images?.MEDIUM?.url,
+                          subtitle: mix.subTitle,
+                        },
+                        position: { x: e.clientX, y: e.clientY },
+                      });
+                    }}
+                    className={`w-full flex items-center gap-2.5 px-1.5 py-2 rounded-md transition-colors duration-150 group ${
+                      currentView.type === "mix" && currentView.mixId === mix.id
+                        ? "bg-th-hl-med"
+                        : "hover:bg-th-border-subtle"
+                    } ${isCollapsed ? "justify-center" : ""}`}
+                    title={mix.title}
                   >
-                    {mix.images?.SMALL?.url ? (
-                      <img
-                        src={mix.images.SMALL.url}
-                        alt={mix.title}
-                        className="w-full h-full object-cover"
-                      />
-                    ) : (
-                      <div className="w-full h-full flex items-center justify-center">
-                        <Music size={16} className="text-th-text-faint" />
+                    <div
+                      className={`bg-th-surface-hover shrink-0 overflow-hidden rounded ${
+                        isCollapsed ? "w-10 h-10" : "w-10 h-10"
+                      }`}
+                    >
+                      {mix.images?.SMALL?.url ? (
+                        <img
+                          src={mix.images.SMALL.url}
+                          alt={mix.title}
+                          className="w-full h-full object-cover"
+                        />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center">
+                          <Music size={16} className="text-th-text-faint" />
+                        </div>
+                      )}
+                    </div>
+
+                    {!isCollapsed && (
+                      <div className="flex-1 min-w-0 text-left">
+                        <div className="text-[14px] font-medium text-th-text-primary truncate leading-snug">
+                          {mix.title}
+                        </div>
+                        <div className="text-[12px] text-th-text-faint truncate leading-snug mt-0.5">
+                          {mix.subTitle || "Mix"}
+                        </div>
                       </div>
                     )}
-                  </div>
-
-                  {!isCollapsed && (
-                    <div className="flex-1 min-w-0 text-left">
-                      <div className="text-[14px] font-medium text-th-text-primary truncate leading-snug">
-                        {mix.title}
-                      </div>
-                      <div className="text-[12px] text-th-text-faint truncate leading-snug mt-0.5">
-                        {mix.subTitle || "Mix"}
-                      </div>
-                    </div>
-                  )}
-                </button>
-              ))}
+                  </button>
+                ))}
+              </VirtualSidebarItems>
               {mixesHasMore && <div ref={mixesSentinelRef} />}
               {mixesLoadingMore && <SidebarSkeleton count={2} />}
             </div>

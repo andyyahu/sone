@@ -76,6 +76,12 @@ const CONFIG = {
 
 const PAGE_SIZE = 50;
 
+interface LibraryPage {
+  items: any[];
+  totalNumberOfItems: number;
+  nextOffset?: number;
+}
+
 export default function LibraryViewAll({
   libraryType,
   folderId,
@@ -151,10 +157,7 @@ export default function LibraryViewAll({
   // ==================== Data Fetching ====================
 
   const fetchPage = useCallback(
-    async (
-      offset: number,
-      limit: number,
-    ): Promise<{ items: any[]; totalNumberOfItems: number }> => {
+    async (offset: number, limit: number): Promise<LibraryPage> => {
       switch (libraryType) {
         case "playlists": {
           const cursor =
@@ -211,6 +214,16 @@ export default function LibraryViewAll({
     [libraryType, userId, currentSort?.order, currentSort?.direction, folderId],
   );
 
+  const updatePagination = useCallback((page: LibraryPage, offset: number) => {
+    // Personalized mixes may be prepended without consuming favorite offsets.
+    const nextOffset = page.nextOffset ?? offset + page.items.length;
+    offsetRef.current = nextOffset;
+    hasMoreRef.current =
+      page.items.length > 0 &&
+      nextOffset > offset &&
+      nextOffset < page.totalNumberOfItems;
+  }, []);
+
   // Load first page
   useEffect(() => {
     cancelledRef.current = false;
@@ -228,9 +241,9 @@ export default function LibraryViewAll({
         if (cancelledRef.current) return;
         setItems(page.items);
         setTotalCount(page.totalNumberOfItems);
-        offsetRef.current = page.items.length;
-        hasMoreRef.current = page.items.length < page.totalNumberOfItems;
+        updatePagination(page, 0);
       } catch (err) {
+        hasMoreRef.current = false;
         console.error("Failed to load library items:", err);
       } finally {
         if (!cancelledRef.current) setLoading(false);
@@ -240,7 +253,7 @@ export default function LibraryViewAll({
     return () => {
       cancelledRef.current = true;
     };
-  }, [fetchPage]);
+  }, [fetchPage, updatePagination]);
 
   // Background fetch remaining
   const fetchRemaining = useCallback(async () => {
@@ -248,7 +261,8 @@ export default function LibraryViewAll({
     bgFetchingRef.current = true;
     try {
       while (hasMoreRef.current && !cancelledRef.current) {
-        const page = await fetchPage(offsetRef.current, PAGE_SIZE);
+        const offset = offsetRef.current;
+        const page = await fetchPage(offset, PAGE_SIZE);
         if (cancelledRef.current) return;
         startTransition(() => {
           setItems((prev) => {
@@ -272,22 +286,22 @@ export default function LibraryViewAll({
           });
           setTotalCount(page.totalNumberOfItems);
         });
-        offsetRef.current += page.items.length;
-        hasMoreRef.current = offsetRef.current < page.totalNumberOfItems;
+        updatePagination(page, offset);
       }
     } catch (err) {
       console.error("Failed to background-fetch library items:", err);
     } finally {
       bgFetchingRef.current = false;
     }
-  }, [fetchPage, libraryType]);
+  }, [fetchPage, libraryType, updatePagination]);
 
   // Load more (infinite scroll trigger)
   const loadMore = useCallback(async () => {
     if (loadingMore || !hasMoreRef.current || bgFetchingRef.current) return;
     setLoadingMore(true);
     try {
-      const page = await fetchPage(offsetRef.current, PAGE_SIZE);
+      const offset = offsetRef.current;
+      const page = await fetchPage(offset, PAGE_SIZE);
       if (cancelledRef.current) return;
       setItems((prev) => {
         if (libraryType === "playlists") {
@@ -307,14 +321,13 @@ export default function LibraryViewAll({
         }
       });
       setTotalCount(page.totalNumberOfItems);
-      offsetRef.current += page.items.length;
-      hasMoreRef.current = offsetRef.current < page.totalNumberOfItems;
+      updatePagination(page, offset);
     } catch (err) {
       console.error("Failed to load more:", err);
     } finally {
       setLoadingMore(false);
     }
-  }, [loadingMore, fetchPage, libraryType]);
+  }, [loadingMore, fetchPage, libraryType, updatePagination]);
 
   // Infinite scroll observer
   useEffect(() => {
@@ -626,7 +639,7 @@ export default function LibraryViewAll({
 
   // ==================== Render ====================
 
-  const hasMore = !isFiltering && items.length < totalCount;
+  const hasMore = !loading && !isFiltering && hasMoreRef.current;
 
   // Lets an in-flight scroll restore pull the pages it needs directly, rather
   // than the viewport tripping the pagination sentinel page by page.
@@ -637,6 +650,96 @@ export default function LibraryViewAll({
     : libraryType === "playlists"
       ? playlistApiTotalRef.current || displayItems.length
       : totalCount || displayItems.length;
+
+  // Request progress does not change the cards. Reuse their elements so
+  // pagination flags cannot rebuild a large collection before virtualization.
+  const mediaGrid = useMemo(
+    () => (
+      <MediaGrid>
+        {(filteredItems as any[]).map((item: any) => {
+          // Folder rendering
+          if (
+            libraryType === "playlists" &&
+            (item as PlaylistOrFolder).kind === "folder"
+          ) {
+            const folder = (
+              item as Extract<PlaylistOrFolder, { kind: "folder" }>
+            ).data;
+            const displayName = renamedFolders.get(folder.id) ?? folder.name;
+            return (
+              <MediaCard
+                key={folder.id}
+                item={{
+                  title: displayName,
+                  subTitle: folderSubtitle(
+                    (folder.totalNumberOfItems ?? 0) +
+                      (countAdjustments.get(folder.id) ?? 0),
+                  ),
+                }}
+                onClick={() => navigateToPlaylistFolder(folder.id, displayName)}
+                onContextMenu={(e: React.MouseEvent) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setFolderContextMenu({
+                    folderId: folder.id,
+                    folderName: displayName,
+                    position: { x: e.clientX, y: e.clientY },
+                  });
+                }}
+                titleOverride={displayName}
+                imageOverride={
+                  <div className="w-full h-full flex items-center justify-center bg-th-surface-hover">
+                    <FolderOpen size={32} className="text-th-text-faint" />
+                  </div>
+                }
+                showPlayButton={false}
+              />
+            );
+          }
+
+          const key =
+            libraryType === "playlists"
+              ? (item as Extract<PlaylistOrFolder, { kind: "playlist" }>).data
+                  .uuid
+              : item.uuid || item.id?.toString() || item.mixId;
+
+          const actualItem =
+            libraryType === "playlists"
+              ? (item as Extract<PlaylistOrFolder, { kind: "playlist" }>).data
+              : item;
+
+          return (
+            <MediaCard
+              key={key}
+              item={actualItem}
+              isArtist={isArtist}
+              userId={libraryType === "playlists" ? userId : undefined}
+              onClick={() => handleItemClick(item)}
+              onContextMenu={(e) => handleContextMenu(e, actualItem)}
+              onPlay={(e) => handlePlay(e, actualItem)}
+              isFavorited={isFavorited(item)}
+              onFavoriteToggle={(e) => handleFavoriteToggle(e, item)}
+              onMoreClick={(e) => handleContextMenu(e, actualItem)}
+            />
+          );
+        })}
+      </MediaGrid>
+    ),
+    [
+      filteredItems,
+      libraryType,
+      renamedFolders,
+      countAdjustments,
+      navigateToPlaylistFolder,
+      isArtist,
+      userId,
+      handleItemClick,
+      handleContextMenu,
+      handlePlay,
+      isFavorited,
+      handleFavoriteToggle,
+    ],
+  );
 
   if (loading) {
     return (
@@ -730,82 +833,7 @@ export default function LibraryViewAll({
               }
             />
           ) : (
-            <MediaGrid>
-              {(filteredItems as any[]).map((item: any) => {
-                // Folder rendering
-                if (
-                  libraryType === "playlists" &&
-                  (item as PlaylistOrFolder).kind === "folder"
-                ) {
-                  const folder = (
-                    item as Extract<PlaylistOrFolder, { kind: "folder" }>
-                  ).data;
-                  const displayName =
-                    renamedFolders.get(folder.id) ?? folder.name;
-                  return (
-                    <MediaCard
-                      key={folder.id}
-                      item={{
-                        title: displayName,
-                        subTitle: folderSubtitle(
-                          (folder.totalNumberOfItems ?? 0) +
-                            (countAdjustments.get(folder.id) ?? 0),
-                        ),
-                      }}
-                      onClick={() =>
-                        navigateToPlaylistFolder(folder.id, displayName)
-                      }
-                      onContextMenu={(e: React.MouseEvent) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        setFolderContextMenu({
-                          folderId: folder.id,
-                          folderName: displayName,
-                          position: { x: e.clientX, y: e.clientY },
-                        });
-                      }}
-                      titleOverride={displayName}
-                      imageOverride={
-                        <div className="w-full h-full flex items-center justify-center bg-th-surface-hover">
-                          <FolderOpen
-                            size={32}
-                            className="text-th-text-faint"
-                          />
-                        </div>
-                      }
-                      showPlayButton={false}
-                    />
-                  );
-                }
-
-                const key =
-                  libraryType === "playlists"
-                    ? (item as Extract<PlaylistOrFolder, { kind: "playlist" }>)
-                        .data.uuid
-                    : item.uuid || item.id?.toString() || item.mixId;
-
-                const actualItem =
-                  libraryType === "playlists"
-                    ? (item as Extract<PlaylistOrFolder, { kind: "playlist" }>)
-                        .data
-                    : item;
-
-                return (
-                  <MediaCard
-                    key={key}
-                    item={actualItem}
-                    isArtist={isArtist}
-                    userId={libraryType === "playlists" ? userId : undefined}
-                    onClick={() => handleItemClick(item)}
-                    onContextMenu={(e) => handleContextMenu(e, actualItem)}
-                    onPlay={(e) => handlePlay(e, actualItem)}
-                    isFavorited={isFavorited(item)}
-                    onFavoriteToggle={(e) => handleFavoriteToggle(e, item)}
-                    onMoreClick={(e) => handleContextMenu(e, actualItem)}
-                  />
-                );
-              })}
-            </MediaGrid>
+            mediaGrid
           )}
 
           {/* Infinite scroll sentinel */}

@@ -20,6 +20,7 @@ import {
   getPageSection,
 } from "../api/tidal";
 import { safeErrorMessage } from "../lib/errorUtils";
+import { headerActionClass } from "./headerChrome";
 import {
   buildMediaItem,
   getItemTitle,
@@ -661,7 +662,7 @@ export default function FavoritesView({ onBack }: FavoritesViewProps) {
             />
             <button
               onClick={tab === "videos" ? handleShuffleVideos : handleShuffle}
-              className="flex items-center gap-2 px-6 py-2.5 bg-th-button/40 backdrop-blur-md text-th-text-primary font-bold text-sm rounded-full hover:bg-th-button/60 hover:scale-[1.03] transition-[transform,filter,background-color] duration-150"
+              className={headerActionClass}
             >
               <Shuffle size={18} />
               Shuffle

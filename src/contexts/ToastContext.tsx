@@ -3,6 +3,7 @@ import {
   useContext,
   useState,
   useCallback,
+  useMemo,
   type ReactNode,
 } from "react";
 import { Check, X, AlertCircle } from "lucide-react";
@@ -61,9 +62,12 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   const dismiss = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
+  // Toasts update only the stack. A fresh context object would also render
+  // every action consumer, including all mounted song rows, on show/dismiss.
+  const actions = useMemo(() => ({ showToast }), [showToast]);
 
   return (
-    <ToastContext.Provider value={{ showToast }}>
+    <ToastContext.Provider value={actions}>
       {children}
       <Toaster toasts={toasts} onDismiss={dismiss} />
     </ToastContext.Provider>
@@ -87,7 +91,7 @@ function Toaster({
         <div
           key={toast.id}
           className="pointer-events-auto flex items-center gap-2.5 pl-3.5 pr-2.5 py-2.5 bg-th-surface border border-th-inset rounded-xl shadow-2xl max-w-[380px] min-w-[220px]"
-          style={{ animation: "toastIn 0.25s ease-out" }}
+          style={{ animation: "toastIn 0.25s var(--ease-settle)" }}
         >
           {/* Icon */}
           <div className="shrink-0">

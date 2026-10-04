@@ -7,6 +7,7 @@ import { getArtistTopTracksAll } from "../api/tidal";
 import type { Track } from "../types";
 import TrackList from "./TrackList";
 import PageContainer from "./PageContainer";
+import { headerActionClass } from "./headerChrome";
 
 const PAGE_SIZE = 50;
 
@@ -142,14 +143,11 @@ export default function ArtistTracksPage({
       <div className="flex-1 bg-linear-to-b from-th-surface to-th-base overflow-y-auto">
         <PageContainer>
           <div className="px-8 pt-6 pb-4">
-            <div className="h-8 w-48 bg-th-surface-hover rounded animate-pulse mb-6" />
+            <div className="h-8 w-48 bg-th-surface-hover rounded mb-6" />
           </div>
           <div className="px-8 flex flex-col gap-1">
             {Array.from({ length: 10 }).map((_, i) => (
-              <div
-                key={i}
-                className="h-14 bg-th-surface-hover/50 rounded animate-pulse"
-              />
+              <div key={i} className="h-14 bg-th-surface-hover/50 rounded" />
             ))}
           </div>
         </PageContainer>
@@ -186,10 +184,7 @@ export default function ArtistTracksPage({
             sourceId={artistId}
             onPlay={handlePlayAll}
           />
-          <button
-            onClick={handleShuffle}
-            className="flex items-center gap-2 px-6 py-2.5 bg-th-button/40 backdrop-blur-md text-th-text-primary font-bold text-sm rounded-full hover:bg-th-button/60 hover:scale-[1.03] transition-[transform,filter,background-color] duration-150"
-          >
+          <button onClick={handleShuffle} className={headerActionClass}>
             <Shuffle size={18} />
             Shuffle
           </button>
@@ -216,6 +211,7 @@ export default function ArtistTracksPage({
               onLoadMore={handleLoadMore}
               hasMore={hasMore}
               loadingMore={loadingMore}
+              virtualize
             />
           )}
         </div>

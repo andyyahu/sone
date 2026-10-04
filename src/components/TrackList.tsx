@@ -20,6 +20,10 @@ import {
   useState,
   memo,
   useMemo,
+  useCallback,
+  createContext,
+  useContext,
+  type Key,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useAtomValue, atom } from "jotai";
@@ -30,11 +34,12 @@ import {
 } from "../atoms/playback";
 import { favoriteTrackIdsAtom, favoriteVideoIdsAtom } from "../atoms/favorites";
 import { useNavigation } from "../hooks/useNavigation";
-import { useFavorites } from "../hooks/useFavorites";
+import { useFavoriteActions } from "../hooks/useFavorites";
 import { useToast } from "../contexts/ToastContext";
 import { usePageScrollElement } from "../contexts/PageScrollContext";
 import { isTrackUnavailable } from "../lib/trackAvailability";
 import { TrackArtists } from "./TrackArtists";
+import { formatDateAdded } from "../lib/formatDateAdded";
 
 interface TrackListProps {
   tracks: Track[];
@@ -71,23 +76,16 @@ function formatDuration(seconds: number): string {
   return `${mins}:${secs.toString().padStart(2, "0")}`;
 }
 
-function formatDate(dateString?: string): string {
-  if (!dateString) return "";
-  const date = new Date(dateString);
-  const now = new Date();
-  const diffTime = Math.abs(now.getTime() - date.getTime());
-  const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+type TrackRowActions = Pick<
+  ReturnType<typeof useFavoriteActions>,
+  | "addFavoriteTrack"
+  | "removeFavoriteTrack"
+  | "addFavoriteVideo"
+  | "removeFavoriteVideo"
+> &
+  Pick<ReturnType<typeof useNavigation>, "navigateToAlbum">;
 
-  if (diffDays <= 7) return "This week";
-  if (diffDays <= 14) return "Last week";
-  if (diffDays <= 30) return "Last month";
-
-  return date.toLocaleDateString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-  });
-}
+const TrackRowActionsContext = createContext<TrackRowActions | null>(null);
 
 // ─── Memoized TrackRow ─────────────────────────────────────────────────────
 
@@ -106,6 +104,8 @@ interface TrackRowProps {
   isUserPlaylist?: boolean;
   onTrackRemoved?: (index: number) => void;
   onAddToCurrentPlaylist?: (track: Track) => void;
+  /** Fast scrolling turns hover transitions off on rows that stay mounted. */
+  quiet?: boolean;
 }
 
 const TrackRow = memo(function TrackRow({
@@ -123,19 +123,30 @@ const TrackRow = memo(function TrackRow({
   isUserPlaylist,
   onTrackRemoved,
   onAddToCurrentPlaylist,
+  quiet = false,
 }: TrackRowProps) {
-  const favoriteTrackIds = useAtomValue(favoriteTrackIdsAtom);
-  const favoriteVideoIds = useAtomValue(favoriteVideoIdsAtom);
-  const { navigateToAlbum } = useNavigation();
+  const rowActions = useContext(TrackRowActionsContext);
+  if (!rowActions) throw new Error("TrackRow requires TrackList actions");
   const {
+    navigateToAlbum,
     addFavoriteTrack,
     removeFavoriteTrack,
     addFavoriteVideo,
     removeFavoriteVideo,
-  } = useFavorites();
+  } = rowActions;
   const { showToast } = useToast();
 
   const isVideo = track.itemType === "video";
+  const isFavoriteAtom = useMemo(
+    () =>
+      atom((get) =>
+        get(isVideo ? favoriteVideoIdsAtom : favoriteTrackIdsAtom).has(
+          track.id,
+        ),
+      ),
+    [track.id, isVideo],
+  );
+  const isFav = useAtomValue(isFavoriteAtom);
 
   const [playlistMenuOpen, setPlaylistMenuOpen] = useState(false);
   const [contextMenuOpen, setContextMenuOpen] = useState(false);
@@ -170,10 +181,6 @@ const TrackRow = memo(function TrackRow({
   // never gated on audio stream flags.
   const isUnavailable = !isVideo && isTrackUnavailable(track) && !isActive;
   const isInactive = isBlocked || isUnavailable;
-
-  const isFav = isVideo
-    ? favoriteVideoIds.has(track.id)
-    : favoriteTrackIds.has(track.id);
 
   const toggleFavorite = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -226,15 +233,22 @@ const TrackRow = memo(function TrackRow({
         onPlay(track, index);
       }}
       onContextMenu={isBlocked ? undefined : handleRowContextMenu}
-      className={`grid gap-4 px-4 py-2.5 rounded-md transition-colors items-center ${
+      data-track-row="full"
+      className={`grid gap-4 px-4 py-2.5 rounded-md items-center ${
         isInactive
           ? "opacity-40 cursor-default"
-          : `cursor-pointer group ${isActive ? "bg-th-hl-faint" : "hover:bg-th-hl-faint"}`
+          : `cursor-pointer ${isActive ? "bg-th-hl-faint" : ""} ${
+              /* Hover curves stay off while the list is moving. A transition
+                 on every visible row is extra work on the fullscreen path. */
+              quiet
+                ? ""
+                : "group transition-[background-color,color] duration-150 ease-settle hover:bg-th-hl-faint active:bg-th-hl-med motion-reduce:transition-none"
+            }`
       }`}
       style={{ gridTemplateColumns: gridCols }}
     >
       {/* Track Number / Playing Indicator */}
-      <div className="flex items-center justify-end">
+      <div className="relative flex items-center justify-end">
         {playing ? (
           <div className="flex items-end gap-[3px] h-4">
             <span className="w-[3px] h-full bg-th-accent rounded-full playing-bar" />
@@ -250,9 +264,11 @@ const TrackRow = memo(function TrackRow({
         ) : (
           <>
             <span
-              className={`text-[15px] tabular-nums group-hover:hidden ${
-                isActive ? "text-th-accent" : "text-th-text-muted"
-              }`}
+              className={`text-[15px] tabular-nums ${
+                quiet
+                  ? ""
+                  : "transition-opacity duration-150 ease-settle motion-reduce:transition-none group-hover:opacity-0"
+              } ${isActive ? "text-th-accent" : "text-th-text-muted"}`}
             >
               {displayNumber != null
                 ? displayNumber
@@ -260,11 +276,13 @@ const TrackRow = memo(function TrackRow({
                   ? (track.trackNumber ?? index + 1)
                   : index + 1}
             </span>
-            <Play
-              size={14}
-              fill="currentColor"
-              className="text-th-text-primary hidden group-hover:block"
-            />
+            {!quiet && (
+              <Play
+                size={14}
+                fill="currentColor"
+                className="absolute right-0 text-th-text-primary opacity-0 group-hover:opacity-100 transition-opacity duration-150 ease-settle motion-reduce:transition-none"
+              />
+            )}
           </>
         )}
       </div>
@@ -354,7 +372,7 @@ const TrackRow = memo(function TrackRow({
       {showDateAdded && (
         <div className="flex items-center min-w-0">
           <span className="text-[14px] text-th-text-muted truncate">
-            {formatDate(track.dateAdded)}
+            {formatDateAdded(track.dateAdded)}
           </span>
         </div>
       )}
@@ -373,7 +391,9 @@ const TrackRow = memo(function TrackRow({
               ? "hidden"
               : contextMenuOpen
                 ? "text-th-text-primary opacity-100"
-                : "text-th-text-muted hover:text-th-text-primary opacity-0 group-hover:opacity-100"
+                : quiet
+                  ? "text-th-text-muted opacity-0"
+                  : "text-th-text-muted hover:text-th-text-primary opacity-0 group-hover:opacity-100"
           }`}
           title="More options"
           onClick={handleDotsClick}
@@ -439,6 +459,117 @@ const TrackRow = memo(function TrackRow({
   );
 });
 
+function artistLabel(track: Track): string {
+  if (track.artists && track.artists.length > 0) {
+    return track.artists.map((artist) => artist.name).join(", ");
+  }
+  return track.artist?.name || "Unknown Artist";
+}
+
+// Text-only stand-in for a row that enters during a fast flick. Same grid and
+// row height as TrackRow, without images, favorite subscriptions, or menus.
+const TrackRowShell = memo(function TrackRowShell({
+  track,
+  index,
+  displayNumber,
+  gridCols,
+  showCover,
+  showArtist,
+  showAlbum,
+  showDateAdded,
+  context,
+  onPlay,
+  allowExplicit,
+  currentTrackId,
+}: TrackRowProps & {
+  allowExplicit: boolean;
+  currentTrackId: number | null;
+}) {
+  const number =
+    displayNumber != null
+      ? displayNumber
+      : context === "album"
+        ? (track.trackNumber ?? index + 1)
+        : index + 1;
+  const blocked = !allowExplicit && !!track.explicit;
+  const unavailable =
+    track.itemType !== "video" &&
+    isTrackUnavailable(track) &&
+    currentTrackId !== track.id;
+  const inactive = blocked || unavailable;
+  const artists = artistLabel(track);
+
+  return (
+    <div
+      data-track-row="shell"
+      onClick={() => {
+        if (inactive) return;
+        onPlay(track, index);
+      }}
+      className={`grid gap-4 px-4 py-2.5 rounded-md items-center ${
+        inactive
+          ? "opacity-40 cursor-default"
+          : "cursor-pointer active:bg-th-hl-faint"
+      }`}
+      style={{ gridTemplateColumns: gridCols }}
+    >
+      <div className="flex items-center justify-end">
+        <span className="text-[15px] tabular-nums text-th-text-muted">
+          {number}
+        </span>
+      </div>
+      <div className="flex items-center gap-3 min-w-0">
+        {showCover && (
+          <div className="w-10 h-10 shrink-0 rounded bg-th-surface-hover" />
+        )}
+        <div className="flex flex-col justify-center min-w-0">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <span className="text-[15px] font-medium truncate leading-snug text-th-text-primary">
+              {getTrackDisplayTitle(track)}
+            </span>
+            {track.itemType === "video" && (
+              <span className="shrink-0 inline-flex items-center justify-center px-1 h-[15px] rounded-[3px] bg-th-text-faint/15 text-th-text-muted text-[9px] font-bold leading-none tracking-wide">
+                VIDEO
+              </span>
+            )}
+            {track.explicit && <ExplicitBadge />}
+          </div>
+          {!showArtist && (
+            <span className="text-[13px] text-th-text-muted truncate leading-snug">
+              {artists}
+            </span>
+          )}
+        </div>
+      </div>
+      {showArtist && (
+        <div className="flex items-center min-w-0">
+          <span className="text-[14px] text-th-text-muted truncate">
+            {artists}
+          </span>
+        </div>
+      )}
+      {showAlbum && (
+        <div className="flex items-center min-w-0">
+          <span className="text-[14px] text-th-text-muted truncate">
+            {track.album?.title || ""}
+          </span>
+        </div>
+      )}
+      {showDateAdded && (
+        <div className="flex items-center min-w-0">
+          <span className="text-[14px] text-th-text-muted truncate">
+            {formatDateAdded(track.dateAdded)}
+          </span>
+        </div>
+      )}
+      <div className="flex items-center justify-end text-[14px] text-th-text-muted tabular-nums">
+        {formatDuration(track.duration)}
+      </div>
+      <div />
+    </div>
+  );
+});
+
 // ─── VirtualTrackRows ──────────────────────────────────────────────────────
 
 interface VirtualTrackRowsProps {
@@ -481,6 +612,13 @@ function VirtualTrackRows({
   const parentRef = useRef<HTMLDivElement>(null);
   const scrollEl = usePageScrollElement();
   const [scrollMargin, setScrollMargin] = useState(0);
+  const allowExplicit = useAtomValue(allowExplicitAtom);
+  const currentTrackId = useAtomValue(currentTrackAtom)?.id ?? null;
+  // Keys mounted as full rows before this gesture. The virtualizer re-renders
+  // only when the index range changes, and each entering playlist row is one
+  // mount. Home's feed does not virtualize, so it pays nothing here.
+  const idleKeysRef = useRef<Set<Key>>(new Set());
+  const heldFullKeysRef = useRef<Set<Key> | null>(null);
 
   // Maintain scrollMargin: the list's offset within the scroll container.
   // Summed from the offsetParent chain rather than from rects plus scrollTop:
@@ -515,22 +653,45 @@ function VirtualTrackRows({
   // The 48 branch is unexercised — no caller passes no-cover — and is not
   // derived; a real no-cover row is ~50px with showArtist, ~58px without.
   const rowHeight = showCover ? 60 : 48;
+  // Virtual-core invalidates every row measurement when this callback changes.
+  // Scrolling must reuse it; replacing/reordering tracks must invalidate it.
+  const getItemKey = useCallback(
+    (index: number) => tracks[index]?.id ?? index,
+    [tracks],
+  );
 
   const virtualizer = useVirtualizer({
     count: tracks.length,
     getScrollElement: () => scrollEl,
     estimateSize: () => rowHeight,
     overscan: 8,
+    // Covers return this long after the last scroll event.
+    isScrollingResetDelay: 120,
     scrollMargin,
     // The virtualizer scrolls its element to initialOffset once on attach, and
     // the default 0 would wipe a restored offset the moment this list mounts.
     // Resolved once and memoised on first read, so this relies on Layout's
     // element already being attached before any virtualized list first renders.
     initialOffset: () => scrollEl?.scrollTop ?? 0,
-    getItemKey: (i) => tracks[i]?.id ?? i,
+    getItemKey,
   });
 
   const virtualItems = virtualizer.getVirtualItems();
+  const scrolling = virtualizer.isScrolling;
+  if (!scrolling) {
+    heldFullKeysRef.current = null;
+  } else if (heldFullKeysRef.current === null) {
+    heldFullKeysRef.current = idleKeysRef.current;
+  }
+  const heldFullKeys = heldFullKeysRef.current;
+  if (scrolling && heldFullKeys) {
+    const visible = new Set(virtualItems.map((item) => item.key));
+    for (const key of heldFullKeys) {
+      if (!visible.has(key)) heldFullKeys.delete(key);
+    }
+  } else {
+    idleKeysRef.current = new Set(virtualItems.map((item) => item.key));
+  }
 
   // Sentinel-based load trigger: an IntersectionObserver watches a sentinel
   // positioned near the end of the virtualized spacer. Mirrors the
@@ -569,6 +730,21 @@ function VirtualTrackRows({
         {virtualItems.map((v) => {
           const track = tracks[v.index];
           if (!track) return null;
+          // Rows already on screen stay full. Rows that enter while the list
+          // is moving are text, including ones that scrolled away and came back.
+          const shell = scrolling && !heldFullKeys?.has(v.key);
+          const rowProps = {
+            track,
+            index: v.index,
+            displayNumber: trackDisplayNumbers?.[v.index],
+            gridCols,
+            showCover,
+            showArtist,
+            showAlbum,
+            showDateAdded,
+            context,
+            onPlay,
+          };
           return (
             // Deliberately unmeasured: estimateSize is exact for a fixed-height
             // row, and a hidden list would measure every row as 0 and make the
@@ -578,28 +754,33 @@ function VirtualTrackRows({
               data-index={v.index}
               style={{
                 position: "absolute",
-                top: 0,
+                // translateY would promote every row to its own full-width
+                // composited layer. That stack's pixel cost follows the window,
+                // so a fullscreen playlist misses frames on WebKitGTK while a
+                // half or quarter window still scrolls. Document `top` stays
+                // inside the single scroll layer.
+                top: v.start - virtualizer.options.scrollMargin,
                 left: 0,
                 right: 0,
-                transform: `translateY(${v.start - virtualizer.options.scrollMargin}px)`,
+                height: rowHeight,
               }}
             >
-              <TrackRow
-                track={track}
-                index={v.index}
-                displayNumber={trackDisplayNumbers?.[v.index]}
-                gridCols={gridCols}
-                showCover={showCover}
-                showArtist={showArtist}
-                showAlbum={showAlbum}
-                showDateAdded={showDateAdded}
-                context={context}
-                onPlay={onPlay}
-                playlistId={playlistId}
-                isUserPlaylist={isUserPlaylist}
-                onTrackRemoved={onTrackRemoved}
-                onAddToCurrentPlaylist={onAddToCurrentPlaylist}
-              />
+              {shell ? (
+                <TrackRowShell
+                  {...rowProps}
+                  allowExplicit={allowExplicit}
+                  currentTrackId={currentTrackId}
+                />
+              ) : (
+                <TrackRow
+                  {...rowProps}
+                  quiet={scrolling}
+                  playlistId={playlistId}
+                  isUserPlaylist={isUserPlaylist}
+                  onTrackRemoved={onTrackRemoved}
+                  onAddToCurrentPlaylist={onAddToCurrentPlaylist}
+                />
+              )}
             </div>
           );
         })}
@@ -629,34 +810,34 @@ function VirtualTrackRows({
               style={{ gridTemplateColumns: gridCols }}
             >
               <div className="flex items-center justify-end">
-                <div className="h-4 w-5 bg-th-surface-hover rounded animate-pulse" />
+                <div className="h-4 w-5 bg-th-surface-hover rounded" />
               </div>
               <div className="flex items-center gap-3 min-w-0">
                 {showCover && (
-                  <div className="w-10 h-10 shrink-0 rounded bg-th-surface-hover animate-pulse" />
+                  <div className="w-10 h-10 shrink-0 rounded bg-th-surface-hover" />
                 )}
                 <div className="flex flex-col gap-1.5 min-w-0 flex-1">
-                  <div className="h-4 w-3/5 bg-th-surface-hover rounded animate-pulse" />
-                  <div className="h-3 w-2/5 bg-th-surface-hover/60 rounded animate-pulse" />
+                  <div className="h-4 w-3/5 bg-th-surface-hover rounded" />
+                  <div className="h-3 w-2/5 bg-th-surface-hover/60 rounded" />
                 </div>
               </div>
               {showArtist && (
                 <div className="flex items-center">
-                  <div className="h-3.5 w-3/5 bg-th-surface-hover/60 rounded animate-pulse" />
+                  <div className="h-3.5 w-3/5 bg-th-surface-hover/60 rounded" />
                 </div>
               )}
               {showAlbum && (
                 <div className="flex items-center">
-                  <div className="h-3.5 w-3/5 bg-th-surface-hover/60 rounded animate-pulse" />
+                  <div className="h-3.5 w-3/5 bg-th-surface-hover/60 rounded" />
                 </div>
               )}
               {showDateAdded && (
                 <div className="flex items-center">
-                  <div className="h-3.5 w-2/5 bg-th-surface-hover/60 rounded animate-pulse" />
+                  <div className="h-3.5 w-2/5 bg-th-surface-hover/60 rounded" />
                 </div>
               )}
               <div className="flex items-center justify-end">
-                <div className="h-3.5 w-8 bg-th-surface-hover/60 rounded animate-pulse" />
+                <div className="h-3.5 w-8 bg-th-surface-hover/60 rounded" />
               </div>
               <div />
             </div>
@@ -679,7 +860,7 @@ function SortIndicator({ direction }: { direction: "ASC" | "DESC" }) {
 
 // ─── TrackList ─────────────────────────────────────────────────────────────
 
-export default memo(function TrackList({
+const TrackListContent = memo(function TrackListContent({
   tracks,
   onPlay,
   showDateAdded = false,
@@ -856,34 +1037,34 @@ export default memo(function TrackList({
               style={{ gridTemplateColumns: gridCols }}
             >
               <div className="flex items-center justify-end">
-                <div className="h-4 w-5 bg-th-surface-hover rounded animate-pulse" />
+                <div className="h-4 w-5 bg-th-surface-hover rounded" />
               </div>
               <div className="flex items-center gap-3 min-w-0">
                 {showCover && (
-                  <div className="w-10 h-10 shrink-0 rounded bg-th-surface-hover animate-pulse" />
+                  <div className="w-10 h-10 shrink-0 rounded bg-th-surface-hover" />
                 )}
                 <div className="flex flex-col gap-1.5 min-w-0 flex-1">
-                  <div className="h-4 w-3/5 bg-th-surface-hover rounded animate-pulse" />
-                  <div className="h-3 w-2/5 bg-th-surface-hover/60 rounded animate-pulse" />
+                  <div className="h-4 w-3/5 bg-th-surface-hover rounded" />
+                  <div className="h-3 w-2/5 bg-th-surface-hover/60 rounded" />
                 </div>
               </div>
               {showArtist && (
                 <div className="flex items-center">
-                  <div className="h-3.5 w-3/5 bg-th-surface-hover/60 rounded animate-pulse" />
+                  <div className="h-3.5 w-3/5 bg-th-surface-hover/60 rounded" />
                 </div>
               )}
               {showAlbum && (
                 <div className="flex items-center">
-                  <div className="h-3.5 w-3/5 bg-th-surface-hover/60 rounded animate-pulse" />
+                  <div className="h-3.5 w-3/5 bg-th-surface-hover/60 rounded" />
                 </div>
               )}
               {showDateAdded && (
                 <div className="flex items-center">
-                  <div className="h-3.5 w-2/5 bg-th-surface-hover/60 rounded animate-pulse" />
+                  <div className="h-3.5 w-2/5 bg-th-surface-hover/60 rounded" />
                 </div>
               )}
               <div className="flex items-center justify-end">
-                <div className="h-3.5 w-8 bg-th-surface-hover/60 rounded animate-pulse" />
+                <div className="h-3.5 w-8 bg-th-surface-hover/60 rounded" />
               </div>
               <div />
             </div>
@@ -943,34 +1124,34 @@ export default memo(function TrackList({
                   style={{ gridTemplateColumns: gridCols }}
                 >
                   <div className="flex items-center justify-end">
-                    <div className="h-4 w-5 bg-th-surface-hover rounded animate-pulse" />
+                    <div className="h-4 w-5 bg-th-surface-hover rounded" />
                   </div>
                   <div className="flex items-center gap-3 min-w-0">
                     {showCover && (
-                      <div className="w-10 h-10 shrink-0 rounded bg-th-surface-hover animate-pulse" />
+                      <div className="w-10 h-10 shrink-0 rounded bg-th-surface-hover" />
                     )}
                     <div className="flex flex-col gap-1.5 min-w-0 flex-1">
-                      <div className="h-4 w-3/5 bg-th-surface-hover rounded animate-pulse" />
-                      <div className="h-3 w-2/5 bg-th-surface-hover/60 rounded animate-pulse" />
+                      <div className="h-4 w-3/5 bg-th-surface-hover rounded" />
+                      <div className="h-3 w-2/5 bg-th-surface-hover/60 rounded" />
                     </div>
                   </div>
                   {showArtist && (
                     <div className="flex items-center">
-                      <div className="h-3.5 w-3/5 bg-th-surface-hover/60 rounded animate-pulse" />
+                      <div className="h-3.5 w-3/5 bg-th-surface-hover/60 rounded" />
                     </div>
                   )}
                   {showAlbum && (
                     <div className="flex items-center">
-                      <div className="h-3.5 w-3/5 bg-th-surface-hover/60 rounded animate-pulse" />
+                      <div className="h-3.5 w-3/5 bg-th-surface-hover/60 rounded" />
                     </div>
                   )}
                   {showDateAdded && (
                     <div className="flex items-center">
-                      <div className="h-3.5 w-2/5 bg-th-surface-hover/60 rounded animate-pulse" />
+                      <div className="h-3.5 w-2/5 bg-th-surface-hover/60 rounded" />
                     </div>
                   )}
                   <div className="flex items-center justify-end">
-                    <div className="h-3.5 w-8 bg-th-surface-hover/60 rounded animate-pulse" />
+                    <div className="h-3.5 w-8 bg-th-surface-hover/60 rounded" />
                   </div>
                   <div />
                 </div>
@@ -982,5 +1163,39 @@ export default memo(function TrackList({
         </div>
       )}
     </div>
+  );
+});
+
+export default memo(function TrackList(props: TrackListProps) {
+  // Virtual rows mount throughout a scroll. Keep the full navigation/favorite
+  // action hooks at the list boundary instead of rebuilding them in every row.
+  const { navigateToAlbum } = useNavigation();
+  const {
+    addFavoriteTrack,
+    removeFavoriteTrack,
+    addFavoriteVideo,
+    removeFavoriteVideo,
+  } = useFavoriteActions();
+  const rowActions = useMemo(
+    () => ({
+      navigateToAlbum,
+      addFavoriteTrack,
+      removeFavoriteTrack,
+      addFavoriteVideo,
+      removeFavoriteVideo,
+    }),
+    [
+      navigateToAlbum,
+      addFavoriteTrack,
+      removeFavoriteTrack,
+      addFavoriteVideo,
+      removeFavoriteVideo,
+    ],
+  );
+
+  return (
+    <TrackRowActionsContext.Provider value={rowActions}>
+      <TrackListContent {...props} />
+    </TrackRowActionsContext.Provider>
   );
 });

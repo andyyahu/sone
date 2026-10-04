@@ -106,3 +106,100 @@ describe("useNavigation scroll memory stamping", () => {
     expect(pushed.__navId).toBe(store.get(currentViewAtom).__navId);
   });
 });
+
+describe("useNavigation shared actions", () => {
+  beforeEach(() => {
+    vi.spyOn(window.history, "pushState").mockImplementation(() => {});
+  });
+
+  it("shares stable actions across consumers and remounted rows in one store", () => {
+    const store = createStore();
+    const wrapper = ({ children }: PropsWithChildren) => (
+      <Provider store={store}>{children}</Provider>
+    );
+    const first = renderHook(() => useNavigation(), { wrapper });
+    const second = renderHook(() => useNavigation(), { wrapper });
+    const actions = first.result.current;
+
+    expect(second.result.current).toBe(actions);
+    first.rerender();
+    expect(first.result.current).toBe(actions);
+    first.unmount();
+
+    const remounted = renderHook(() => useNavigation(), { wrapper });
+    expect(remounted.result.current).toBe(actions);
+    expect(remounted.result.current.navigateToArtist).toBe(
+      second.result.current.navigateToArtist,
+    );
+  });
+
+  it("keeps navigation and overlay updates isolated between stores", () => {
+    const firstStore = createStore();
+    const secondStore = createStore();
+    for (const store of [firstStore, secondStore]) {
+      store.set(drawerOpenAtom, true);
+      store.set(maximizedPlayerAtom, true);
+    }
+    const first = renderHook(() => useNavigation(), {
+      wrapper: ({ children }: PropsWithChildren) => (
+        <Provider store={firstStore}>{children}</Provider>
+      ),
+    });
+    const second = renderHook(() => useNavigation(), {
+      wrapper: ({ children }: PropsWithChildren) => (
+        <Provider store={secondStore}>{children}</Provider>
+      ),
+    });
+    expect(first.result.current).not.toBe(second.result.current);
+
+    const playlistInfo = { title: "My playlist", numberOfTracks: 23 };
+    const callsBefore = vi.mocked(window.history.pushState).mock.calls.length;
+    act(() => {
+      second.result.current.navigateToPlaylist("playlist-2", playlistInfo);
+    });
+
+    expect(firstStore.get(currentViewAtom)).toEqual({ type: "home" });
+    expect(firstStore.get(drawerOpenAtom)).toBe(true);
+    expect(firstStore.get(maximizedPlayerAtom)).toBe(true);
+    expect(secondStore.get(drawerOpenAtom)).toBe(false);
+    expect(secondStore.get(maximizedPlayerAtom)).toBe(false);
+    const view = secondStore.get(currentViewAtom);
+    expect(view).toMatchObject({
+      type: "playlist",
+      playlistId: "playlist-2",
+      playlistInfo,
+    });
+    expect(window.history.pushState).toHaveBeenCalledTimes(callsBefore + 1);
+    expect(window.history.pushState).toHaveBeenLastCalledWith(view, "");
+    expect(scrollKey(view)).not.toBe(null);
+  });
+
+  it("uses the new store when the surrounding Provider changes stores", () => {
+    const originalStore = createStore();
+    const nextStore = createStore();
+    let activeStore = originalStore;
+    const wrapper = ({ children }: PropsWithChildren) => (
+      <Provider store={activeStore}>{children}</Provider>
+    );
+    const { result, rerender } = renderHook(() => useNavigation(), { wrapper });
+    const originalActions = result.current;
+    activeStore = nextStore;
+    rerender();
+    expect(result.current).not.toBe(originalActions);
+
+    act(() => {
+      result.current.navigateToPlaylistFolder("folder-1", "Folder");
+    });
+    expect(originalStore.get(currentViewAtom)).toEqual({ type: "home" });
+    expect(nextStore.get(currentViewAtom)).toMatchObject({
+      type: "libraryViewAll",
+      libraryType: "playlists",
+      folderId: "folder-1",
+      folderName: "Folder",
+    });
+
+    activeStore = originalStore;
+    rerender();
+    expect(result.current).toBe(originalActions);
+  });
+});
