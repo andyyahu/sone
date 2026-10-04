@@ -15,10 +15,7 @@ pub fn read_logging_preference(path: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return true;
     };
-    match text.trim() {
-        "false" => false,
-        _ => true,
-    }
+    text.trim() != "false"
 }
 
 use flexi_logger::{
@@ -30,7 +27,7 @@ use std::path::PathBuf;
 /// before any `log::*!` macros are invoked.
 ///
 /// - `file_enabled = true`  → writes to `<log_dir>/sone_rCURRENT.log` (rotated)
-///                            AND duplicates output to stderr.
+///   AND duplicates output to stderr.
 /// - `file_enabled = false` → stderr only (current behavior pre-toggle).
 ///
 /// Returns a `LoggerHandle`. The caller MUST keep this alive for the

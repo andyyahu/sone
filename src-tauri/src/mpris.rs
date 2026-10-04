@@ -5,39 +5,29 @@ use tauri::{Emitter, Manager};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
+pub struct MprisMetadata {
+    pub track_id: u64,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub art_url: String,
+    pub duration_secs: f64,
+    pub url: Option<String>,
+    pub album_artist: Option<String>,
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
+    pub content_created: Option<String>,
+    pub user_rating: Option<f64>,
+}
+
 pub enum MprisCommand {
-    SetMetadata {
-        track_id: u64,
-        title: String,
-        artist: String,
-        album: String,
-        art_url: String,
-        duration_secs: f64,
-        url: Option<String>,
-        album_artist: Option<String>,
-        track_number: Option<u32>,
-        disc_number: Option<u32>,
-        content_created: Option<String>,
-        user_rating: Option<f64>,
-    },
-    SetPlaybackStatus {
-        is_playing: bool,
-    },
-    SetVolume {
-        volume: f64,
-    },
-    Seeked {
-        position_secs: f64,
-    },
-    SetShuffle {
-        enabled: bool,
-    },
-    SetLoopStatus {
-        mode: u8,
-    },
-    SetFullscreen {
-        fullscreen: bool,
-    },
+    SetMetadata(Box<MprisMetadata>),
+    SetPlaybackStatus { is_playing: bool },
+    SetVolume { volume: f64 },
+    Seeked { position_secs: f64 },
+    SetShuffle { enabled: bool },
+    SetLoopStatus { mode: u8 },
+    SetFullscreen { fullscreen: bool },
     Stop,
 }
 
@@ -225,20 +215,21 @@ impl MprisHandle {
                 // Process commands from the main app
                 while let Some(cmd) = rx.recv().await {
                     match cmd {
-                        MprisCommand::SetMetadata {
-                            track_id,
-                            title,
-                            artist,
-                            album,
-                            art_url,
-                            duration_secs,
-                            url,
-                            album_artist,
-                            track_number,
-                            disc_number,
-                            content_created,
-                            user_rating,
-                        } => {
+                        MprisCommand::SetMetadata(payload) => {
+                            let MprisMetadata {
+                                track_id,
+                                title,
+                                artist,
+                                album,
+                                art_url,
+                                duration_secs,
+                                url,
+                                album_artist,
+                                track_number,
+                                disc_number,
+                                content_created,
+                                user_rating,
+                            } = *payload;
                             let mut metadata = Metadata::new();
                             let track_path = format!("/org/mpris/MediaPlayer2/Track/{}", track_id);
                             if let Ok(tid) = TrackId::try_from(track_path.as_str()) {

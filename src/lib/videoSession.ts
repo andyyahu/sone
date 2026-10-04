@@ -11,7 +11,7 @@ import type { TidalVideo, VideoStreamInfo } from "../types";
 
 type Store = ReturnType<typeof createStore>;
 
-export interface VideoSessionInput {
+interface VideoSessionInput {
   id: number;
   title?: string;
   imageId?: string;

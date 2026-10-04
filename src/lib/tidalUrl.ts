@@ -1,6 +1,6 @@
 import type { AppView } from "../types";
 
-export type DeepLinkAction =
+type DeepLinkAction =
   | { kind: "navigate"; view: AppView }
   | { kind: "playTrack"; trackId: number };
 

@@ -4,7 +4,7 @@ import { safeErrorMessage } from "../lib/errorUtils";
 import { PROXY_SAVED_EVENT, type ProxySettings } from "../atoms/proxy";
 
 /** The serialized `proxy::ProxyStatus`, `#[serde(tag = "state")]`. */
-export type ProxyStatus =
+type ProxyStatus =
   | { state: "off" }
   | { state: "active"; degraded: string[] }
   | { state: "unreachable"; endpoint: string }
@@ -46,7 +46,7 @@ const PROBE_CMD = "probe_proxy_reachability";
  *  is the tab to land on. */
 export const OPEN_SETTINGS_EVENT = "sone:open-settings";
 
-export interface ProxyNotice {
+interface ProxyNotice {
   /** Red for "nothing was sent", amber for "something was sent and vanished". */
   tone: "blocked" | "unreachable";
   headline: string;

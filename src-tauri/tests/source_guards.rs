@@ -388,13 +388,13 @@ fn the_startup_proxy_scrub_stays_gated_on_the_launch_sidecar() {
         });
 
     assert!(
-        block_of(&body, gate).contains(&removal),
+        block_of(body, gate).contains(&removal),
         "src/main.rs: `env::remove_var` is not inside the \
          `if should_scrub_proxy_env(...)` block. Sitting beside the gate is not \
          being gated — it scrubs on every launch."
     );
     assert!(
-        block_of(&body, loop_at).contains(&removal),
+        block_of(body, loop_at).contains(&removal),
         "src/main.rs: `env::remove_var` is not inside the `for v in \
          SCRUBBED_PROXY_ENV_VARS` loop, so it is removing something other \
          than the audited list"
@@ -417,7 +417,7 @@ fn the_startup_proxy_scrub_stays_gated_on_the_launch_sidecar() {
             )
         });
     assert!(
-        block_of(&body, gate).contains(&capture),
+        block_of(body, gate).contains(&capture),
         "src/main.rs: `remember_scrubbed_env` is outside the \
          `if should_scrub_proxy_env(...)` block, so it records an environment \
          nothing is about to remove"

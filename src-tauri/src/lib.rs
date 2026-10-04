@@ -96,30 +96,20 @@ pub struct ScrobbleSettings {
 /// Tracks which embedded credential pair the saved tokens belong to,
 /// so refresh-token requests use the matching client_id/secret.
 /// Only relevant when the user has not provided custom credentials.
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
+    #[default]
     LoginCode,
     Pkce,
 }
 
-impl Default for AuthMethod {
-    fn default() -> Self {
-        Self::LoginCode
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyType {
+    #[default]
     Http,
     Socks5,
-}
-
-impl Default for ProxyType {
-    fn default() -> Self {
-        Self::Http
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -605,14 +595,15 @@ pub fn run() {
         )
         .setup(|app| {
             // Single-instance: focus existing window if launched again
-            app.handle()
-                .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            app.handle().plugin(
+                tauri_plugin_single_instance::init(|app, _args, _cwd| {
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.show();
                         let _ = window.unminimize();
                         let _ = window.set_focus();
                     }
-                }))?;
+                }),
+            )?;
             // Deep link: register tidal:// scheme handler
             app.handle().plugin(tauri_plugin_deep_link::init())?;
             #[cfg(target_os = "linux")]
@@ -723,9 +714,8 @@ pub fn run() {
 
                         // ListenBrainz
                         if let Some(ref creds) = settings.scrobble.listenbrainz {
-                            let provider = crate::scrobble::listenbrainz::ListenBrainzProvider::new(
-                                http_client.clone(),
-                            );
+                            let provider =
+                                crate::scrobble::listenbrainz::ListenBrainzProvider::new(http_client.clone());
                             provider
                                 .set_token(creds.token.clone(), creds.username.clone())
                                 .await;
@@ -886,43 +876,43 @@ pub fn run() {
 
             Ok(())
         })
-        .on_window_event(|window, event| match event {
-            tauri::WindowEvent::CloseRequested { api, .. } => {
-                if window.label() == "main" {
-                    let app = window.app_handle();
-                    let state = app.state::<AppState>();
-                    if state.minimize_to_tray.load(Ordering::Relaxed) {
-                        api.prevent_close();
-                        let _ = window.hide();
+        .on_window_event(|window, event| {
+            match event {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    if window.label() == "main" {
+                        let app = window.app_handle();
+                        let state = app.state::<AppState>();
+                        if state.minimize_to_tray.load(Ordering::Relaxed) {
+                            api.prevent_close();
+                            let _ = window.hide();
+                        }
+                    } else if window.label() == "miniplayer" {
+                        let _ = window.app_handle().emit_to("main", "miniplayer-closed", ());
                     }
-                } else if window.label() == "miniplayer" {
-                    let _ = window.app_handle().emit_to("main", "miniplayer-closed", ());
                 }
-            }
-            tauri::WindowEvent::Destroyed => {
-                if window.label() == "miniplayer" {
-                    let _ = window.app_handle().emit_to("main", "miniplayer-closed", ());
-                } else if window.label() == "pkce-login" {
-                    commands::auth::on_pkce_window_closed(window.app_handle());
+                tauri::WindowEvent::Destroyed => {
+                    if window.label() == "miniplayer" {
+                        let _ = window.app_handle().emit_to("main", "miniplayer-closed", ());
+                    } else if window.label() == "pkce-login" {
+                        commands::auth::on_pkce_window_closed(window.app_handle());
+                    }
                 }
-            }
-            #[cfg(target_os = "linux")]
-            tauri::WindowEvent::Focused(true) => {
-                if window.label() == "miniplayer" {
-                    if let Some(ww) = window.app_handle().get_webview_window("miniplayer") {
-                        let _ = ww.with_webview(|webview| {
-                            use gtk::prelude::WidgetExt;
-                            let wv: webkit2gtk::WebView = webview.inner();
-                            if let Some(toplevel) = wv.toplevel() {
-                                if let Some(gdk_win) = toplevel.window() {
-                                    gdk_win.set_shadow_width(12, 12, 12, 12);
+                #[cfg(target_os = "linux")]
+                tauri::WindowEvent::Focused(true) if window.label() == "miniplayer" => {
+                        if let Some(ww) = window.app_handle().get_webview_window("miniplayer") {
+                            let _ = ww.with_webview(|webview| {
+                                use gtk::prelude::WidgetExt;
+                                let wv: webkit2gtk::WebView = webview.inner();
+                                if let Some(toplevel) = wv.toplevel() {
+                                    if let Some(gdk_win) = toplevel.window() {
+                                        gdk_win.set_shadow_width(12, 12, 12, 12);
+                                    }
                                 }
-                            }
-                        });
-                    }
+                            });
+                        }
                 }
+                _ => {}
             }
-            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             // theme file
@@ -1127,9 +1117,7 @@ pub fn run() {
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
                 let state = app.state::<AppState>();
-                state
-                    .discord
-                    .send(crate::discord::DiscordCommand::Disconnect);
+                state.discord.send(crate::discord::DiscordCommand::Disconnect);
                 tauri::async_runtime::block_on(async {
                     state.idle_inhibitor.lock().await.uninhibit().await;
                     state.scrobble_manager.flush().await;

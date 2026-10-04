@@ -1,5 +1,4 @@
 {
-  "ignore": ["src-tauri/**"],
   "ignoreDependencies": ["autoprefixer"],
-  "entry": ["src/hooks/usePlayback.ts"]
+  "entry": ["src/miniplayer-main.tsx", "src/hooks/usePlayback.ts"]
 }

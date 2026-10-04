@@ -738,10 +738,7 @@ pub fn get_enable_logging() -> bool {
     let Ok(text) = std::fs::read_to_string(&path) else {
         return true;
     };
-    match text.trim() {
-        "false" => false,
-        _ => true,
-    }
+    text.trim() != "false"
 }
 
 #[tauri::command]

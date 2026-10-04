@@ -330,7 +330,7 @@ export const THEME_STORAGE_KEY = "sone.theme.v1";
 
 /** The `"preset"` meaning "use the `custom` colors". Mirrors `CUSTOM_PRESET`
  *  in `src-tauri/src/theme_config.rs`. */
-export const CUSTOM_PRESET = "custom";
+const CUSTOM_PRESET = "custom";
 
 const PRESET_NAMES = new Set(PRESET_THEMES.map((p) => p.name));
 

@@ -448,24 +448,28 @@ pub fn update_mpris_metadata(
     metadata: MprisMetadata,
 ) -> Result<(), SoneError> {
     #[cfg(target_os = "linux")]
-    state.mpris.send(crate::mpris::MprisCommand::SetMetadata {
-        track_id: metadata.track_id,
-        title: metadata.title.clone(),
-        artist: metadata.artist.clone(),
-        album: metadata.album.clone(),
-        art_url: metadata.art_url.clone(),
-        duration_secs: metadata.duration_secs,
-        url: if metadata.url.is_empty() {
-            None
-        } else {
-            Some(metadata.url.clone())
-        },
-        album_artist: metadata.album_artist.clone(),
-        track_number: metadata.track_number,
-        disc_number: metadata.disc_number,
-        content_created: metadata.content_created.clone(),
-        user_rating: metadata.user_rating,
-    });
+    state
+        .mpris
+        .send(crate::mpris::MprisCommand::SetMetadata(Box::new(
+            crate::mpris::MprisMetadata {
+                track_id: metadata.track_id,
+                title: metadata.title.clone(),
+                artist: metadata.artist.clone(),
+                album: metadata.album.clone(),
+                art_url: metadata.art_url.clone(),
+                duration_secs: metadata.duration_secs,
+                url: if metadata.url.is_empty() {
+                    None
+                } else {
+                    Some(metadata.url.clone())
+                },
+                album_artist: metadata.album_artist.clone(),
+                track_number: metadata.track_number,
+                disc_number: metadata.disc_number,
+                content_created: metadata.content_created.clone(),
+                user_rating: metadata.user_rating,
+            },
+        )));
     state
         .discord
         .send(crate::discord::DiscordCommand::SetMetadata {

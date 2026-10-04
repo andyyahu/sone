@@ -245,7 +245,7 @@ export function isDeepLinkItem(item: any): boolean {
   return item?.type === "DEEP_LINK" || item?._itemType === "DEEP_LINK";
 }
 
-export function isVideoItem(item: any, sectionType?: string): boolean {
+function isVideoItem(item: any, sectionType?: string): boolean {
   const t = getItemType(item);
   // v2 typed lists use "VIDEO"; the v1 catalog object uses "Music Video".
   return sectionType === "VIDEO_LIST" || t === "VIDEO" || t === "Music Video";
@@ -485,7 +485,7 @@ export function folderSubtitle(count: number | undefined | null): string {
   return `${n} playlist${n !== 1 ? "s" : ""}`;
 }
 
-export type AudioQualityTier = "max" | "hifi" | "high";
+type AudioQualityTier = "max" | "hifi" | "high";
 
 export function getAudioQualityBadge(
   audioQuality: string | undefined,

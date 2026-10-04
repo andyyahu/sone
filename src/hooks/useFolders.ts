@@ -28,7 +28,7 @@ export function getRecentFolderIds(): string[] {
   return [];
 }
 
-export function pushRecentFolderId(folderId: string) {
+function pushRecentFolderId(folderId: string) {
   const ids = getRecentFolderIds().filter((id) => id !== folderId);
   ids.unshift(folderId);
   if (ids.length > MAX_RECENT_FOLDERS) ids.length = MAX_RECENT_FOLDERS;
@@ -37,7 +37,7 @@ export function pushRecentFolderId(folderId: string) {
   } catch {}
 }
 
-export interface MovePlaylistOptions {
+interface MovePlaylistOptions {
   playlistUuid: string;
   targetFolderId: string;
   sourceFolderId?: string;

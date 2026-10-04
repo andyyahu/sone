@@ -511,7 +511,7 @@ export type HomeFeedItem =
   | (HomeFeedMix & { _itemType?: "MIX" });
 
 /** Promo/magazine card (uploads feed). Wraps an artifact (e.g. a playlist). */
-export interface HomeMagazineItem {
+interface HomeMagazineItem {
   type: "MAGAZINE";
   data: {
     id: number;
@@ -526,7 +526,7 @@ export interface HomeMagazineItem {
 }
 
 /** Deep-link shortcut (static feed shortcuts grid). */
-export interface HomeDeepLinkItem {
+interface HomeDeepLinkItem {
   type: "DEEP_LINK";
   data: {
     title: string;
@@ -783,14 +783,14 @@ export interface PlaylistFolderItem {
   data: PlaylistFolderData;
 }
 
-export interface PlaylistFolderCreator {
+interface PlaylistFolderCreator {
   id: number;
   name: string | null;
   picture: string | null;
   type: "TIDAL" | "USER";
 }
 
-export interface PlaylistFolderPromotedArtist {
+interface PlaylistFolderPromotedArtist {
   id: number;
   name: string;
   type: string;
