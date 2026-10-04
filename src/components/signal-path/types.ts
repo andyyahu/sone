@@ -8,7 +8,7 @@ export interface SignalPathViewProps {
   onClose: () => void;
 }
 
-export const EPS = 1e-3;
+const EPS = 1e-3;
 
 /** ALSA naming → canonical GStreamer naming. Pure mapping table. */
 const ALSA_TO_GSTREAMER: Record<string, string> = {
@@ -113,124 +113,165 @@ export function dacDisplayName(sp: SignalPath | null): string | null {
   return sp?.outputDevice ?? null;
 }
 
-/**
- * Effective audio-bit precision per sample for a PCM format. Endianness is
- * ignored on purpose — LE↔BE swaps are bit-exact byte reorders, not
- * quantizations. Float is treated as 24-bit equivalent (24-bit mantissa
- * captures the precision of any integer source FLAC produces).
- */
-function audioBitDepth(format: string | null | undefined): number {
-  if (!format) return 0;
-  switch (toGstreamerFormat(format)) {
-    case "S16LE":
-    case "S16BE":
-      return 16;
-    case "S24LE":
-    case "S24BE":
-    case "S24_32LE":
-    case "S24_32BE":
-      return 24;
-    case "S32LE":
-    case "S32BE":
-      return 32;
-    case "F32LE":
-    case "F32BE":
-      return 24;
-    default:
-      return 0;
-  }
+/** Keep valid bits separate from container width; floats are not integers. */
+function pcmFormat(format: string | null | undefined) {
+  if (!format) return null;
+  const name = toGstreamerFormat(format);
+  const match = /^(S16|S24_32|S24|S32|F32|F64)(LE|BE)$/.exec(name);
+  if (!match) return null;
+  const kind = match[1].startsWith("F") ? "float" : "integer";
+  const depth = Number(match[1].slice(1).split("_")[0]);
+  return { name, kind, depth, width: match[1] === "S24_32" ? 32 : depth };
 }
 
-/**
- * Classify a PCM format/rate transition between two pipeline stages.
- *
- * Lossy ONLY when audio bits are discarded — i.e. the destination has fewer
- * audio bits than the source (narrowing), or the sample rate changes (a
- * resample alters the timeline). Bit-depth WIDENING (16/24 → 32) and pure
- * container/byte-layout repacks (S24_32LE ↔ S24LE) preserve every audio bit
- * and are therefore "altered" (lossless), not "lossy".
- *
- * Mirrors the `lossyFormatChange` rule used by `deriveAlterations` so the
- * detailed flow view and the minimalist verdict agree.
- */
-export function conversionState(
+type Preservation = "preserved" | "modified" | "unknown";
+const measured = (value: number | null | undefined): value is number =>
+  typeof value === "number" && Number.isInteger(value) && value > 0;
+
+export function classifyConversion(
   fromFmt: string | null | undefined,
   toFmt: string | null | undefined,
   fromRate: number | null | undefined,
   toRate: number | null | undefined,
-): "altered" | "lossy" {
-  const rateChanged = fromRate != null && toRate != null && fromRate !== toRate;
-  const narrowed = audioBitDepth(toFmt) < audioBitDepth(fromFmt);
-  return rateChanged || narrowed ? "lossy" : "altered";
+  fromChannels: number | null | undefined,
+  toChannels: number | null | undefined,
+): Preservation {
+  if (
+    (measured(fromRate) && measured(toRate) && fromRate !== toRate) ||
+    (measured(fromChannels) &&
+      measured(toChannels) &&
+      fromChannels !== toChannels)
+  )
+    return "modified";
+  const from = pcmFormat(fromFmt);
+  const to = pcmFormat(toFmt);
+  // A confirmed reduction remains a modification even if another measurement
+  // is absent. Missing evidence must never upgrade it to an unknown/pass-through.
+  if (
+    from?.kind === "integer" &&
+    to?.kind === "integer" &&
+    to.depth < from.depth
+  )
+    return "modified";
+  if (
+    !from ||
+    !to ||
+    !measured(fromRate) ||
+    !measured(toRate) ||
+    !measured(fromChannels) ||
+    !measured(toChannels)
+  )
+    return "unknown";
+  if (from.name === to.name) return "preserved";
+  if (from.kind !== "integer" || to.kind !== "integer") return "unknown";
+  return "preserved";
+}
+
+export function conversionState(
+  ...args: Parameters<typeof classifyConversion>
+): "altered" | "lossy" | "unknown" {
+  const result = classifyConversion(...args);
+  return result === "preserved"
+    ? "altered"
+    : result === "modified"
+      ? "lossy"
+      : "unknown";
 }
 
 export function deriveAlterations(sp: SignalPath | null) {
-  const userVol = sp?.userVolume ?? 1.0;
-  const normFactor = sp?.normGainFactor ?? 1.0;
-  const userVolAltered = Math.abs(userVol - 1.0) > EPS;
+  const userVol = sp?.userVolume ?? 1;
+  const normFactor = sp?.normGainFactor ?? 1;
+  const userVolKnown =
+    typeof sp?.userVolume === "number" &&
+    Number.isFinite(sp.userVolume) &&
+    sp.userVolume >= 0;
+  const normKnown =
+    typeof sp?.normGainFactor === "number" &&
+    Number.isFinite(sp.normGainFactor) &&
+    sp.normGainFactor >= 0;
+  // Even a small non-unity gain changes PCM samples; display rounding must not
+  // be used to decide whether the audio is untouched.
+  const userVolAltered = userVolKnown && userVol !== 1;
   const normAltered =
-    !!sp?.volumeNormalization && Math.abs(normFactor - 1.0) > EPS;
+    !!sp?.volumeNormalization && normKnown && normFactor !== 1;
+  const gainsKnown =
+    userVolKnown &&
+    typeof sp?.volumeNormalization === "boolean" &&
+    (!sp.volumeNormalization || normKnown);
   const isDirectAlsa = sp?.backend === "DirectAlsa";
-
-  // "Pristine" means: every audio sample the decoder produced reaches the
-  // DAC with all its bits intact. Empirical, not mode-based — a non-bit-
-  // perfect chain can still be pristine if no lossy stage actually fired.
-  // Requires:
-  //  - DirectAlsa backend (we own the ALSA device; OS mixer is bypassed)
-  //  - exclusiveMode (no shared access could mix into our stream)
-  //  - No rate change (resample alters the timeline)
-  //  - No ALSA format fallback recorded
-  //  - No user-volume / ReplayGain scaling (any non-unity multiply is
-  //    destructive on integer PCM)
-  //  - No bit-depth narrowing between decoded and output (S24_32LE → S32LE
-  //    or S24_32LE → S24LE are lossless container changes and DO NOT
-  //    disqualify; S32LE → S16LE narrows and DOES)
-  //  - DAC kernel hw_params matches our pipeline's output format/rate
-  //    (or no DAC info available, in which case we don't punish)
-  // What feeds the kernel? DirectAlsa: our pipeline's appsink output (we own
-  // the ALSA device directly). Normal: the OS mixer's per-sink spec
-  // (PipeWire/Pulse owns the device, our pipeline only hands off audio).
-  const upstreamFormat = isDirectAlsa
-    ? sp?.outputFormat
-    : (sp?.osMixer?.sinkFormat ?? sp?.outputFormat);
-  const upstreamRate = isDirectAlsa
-    ? sp?.outputRate
-    : (sp?.osMixer?.sinkRate ?? sp?.outputRate);
-
-  const dacMatchesPipeline =
-    !sp?.dac ||
-    sp.dac.state !== "Active" ||
-    (formatsEquivalent(sp.dac.format, upstreamFormat ?? null) &&
-      sp.dac.rate === upstreamRate);
-
-  // Lossless format conversions (container repack, bit-width widening) keep
-  // all audio bits; only the byte layout changes. A conversion is lossy iff
-  // the destination has fewer audio bits than the source.
+  const conversion = classifyConversion(
+    sp?.decodedFormat,
+    sp?.outputFormat,
+    sp?.decodedRate,
+    sp?.outputRate,
+    sp?.decodedChannels,
+    sp?.outputChannels,
+  );
   const formatChanged =
     !!sp?.decodedFormat &&
     !!sp?.outputFormat &&
     !formatsEquivalent(sp.decodedFormat, sp.outputFormat);
+  const from = pcmFormat(sp?.decodedFormat);
+  const to = pcmFormat(sp?.outputFormat);
   const lossyFormatChange =
-    formatChanged &&
-    audioBitDepth(sp!.outputFormat) < audioBitDepth(sp!.decodedFormat);
-
-  // A format change that preserved every audio bit (widening to a larger
-  // container, or a same-depth byte-layout repack). Used to distinguish a
-  // truly untouched pristine path from one that stayed bit-transparent
-  // through a lossless promotion.
-  const losslessPromotion = formatChanged && !lossyFormatChange;
-
+    !!from &&
+    !!to &&
+    from.kind === "integer" &&
+    to.kind === "integer" &&
+    to.depth < from.depth;
+  const losslessPromotion = formatChanged && conversion === "preserved";
+  const mixer = !isDirectAlsa ? sp?.osMixer : null;
+  const mixerConversion = mixer
+    ? classifyConversion(
+        sp?.outputFormat,
+        mixer.sinkFormat,
+        sp?.outputRate,
+        mixer.sinkRate,
+        sp?.outputChannels,
+        mixer.sinkChannels,
+      )
+    : "unknown";
+  const dacConversion =
+    sp?.dac?.state === "Active"
+      ? classifyConversion(
+          mixer?.sinkFormat ?? sp.outputFormat,
+          sp.dac.format,
+          mixer?.sinkRate ?? sp.outputRate,
+          sp.dac.rate,
+          mixer?.sinkChannels ?? sp.outputChannels,
+          sp.dac.channels,
+        )
+      : "unknown";
+  const dacMatchesPipeline =
+    sp?.dac?.state === "Active" &&
+    formatsEquivalent(sp.dac.format, sp.outputFormat) &&
+    sp.dac.rate === sp.outputRate &&
+    sp.dac.channels === sp.outputChannels;
+  const knownModification =
+    userVolAltered ||
+    normAltered ||
+    conversion === "modified" ||
+    mixerConversion === "modified" ||
+    dacConversion === "modified" ||
+    (measured(sp?.resampledFrom) &&
+      measured(sp?.resampledTo) &&
+      sp.resampledFrom !== sp.resampledTo) ||
+    (!!mixer &&
+      (mixer.sinkMuted ||
+        (Number.isFinite(mixer.sinkVolume) && mixer.sinkVolume !== 1)));
   const isPristine =
     !!sp &&
     isDirectAlsa &&
-    !!sp.exclusiveMode &&
-    sp.resampledFrom == null &&
-    sp.formatFallbackFrom == null &&
-    !userVolAltered &&
-    !normAltered &&
-    !lossyFormatChange &&
-    dacMatchesPipeline;
-
+    sp.exclusiveMode &&
+    gainsKnown &&
+    conversion === "preserved" &&
+    !knownModification &&
+    !!dacMatchesPipeline;
+  const verdict: Preservation = isPristine
+    ? "preserved"
+    : knownModification
+      ? "modified"
+      : "unknown";
   return {
     userVol,
     normFactor,
@@ -240,5 +281,6 @@ export function deriveAlterations(sp: SignalPath | null) {
     isPristine,
     lossyFormatChange,
     losslessPromotion,
+    verdict,
   };
 }

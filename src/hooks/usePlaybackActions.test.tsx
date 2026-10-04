@@ -15,6 +15,8 @@ import {
   contextSourceAtom,
   manualQueueAtom,
   consecutiveFailCountAtom,
+  bitPerfectAtom,
+  isPlayingAtom,
 } from "../atoms/playback";
 import { getProxyBlockedReason } from "../lib/errorUtils";
 import type { Track } from "../types";
@@ -138,6 +140,36 @@ describe("a blocked proxy never enters the skip drain", () => {
     localStorage.clear();
     playResult = () => Promise.resolve({});
   });
+
+  it.each(["context", "manual"])(
+    "preserves the %s queue when bit-perfect output is unsupported",
+    async (which) => {
+      const { store, result } = setup();
+      store.set(bitPerfectAtom, true);
+      store.set(queueAtom, tracks(3));
+      if (which === "manual") store.set(manualQueueAtom, tracks(2));
+      playResult = () =>
+        Promise.reject({
+          kind: "Audio",
+          message:
+            "bit_perfect_unsupported: DAC cannot preserve 24-bit samples",
+        });
+      await act(async () => {
+        await result.current.playNext();
+      });
+      expect(store.get(queueAtom).map((t) => t.id)).toEqual([1, 2, 3]);
+      expect(store.get(manualQueueAtom).map((t) => t.id)).toEqual(
+        which === "manual" ? [1, 2] : [],
+      );
+      expect(store.get(consecutiveFailCountAtom)).toBe(0);
+      expect(store.get(isPlayingAtom)).toBe(false);
+      expect(store.get(bitPerfectAtom)).toBe(true);
+      expect(
+        screen.getAllByText(/Turn off bit-perfect manually/).length,
+      ).toBeGreaterThan(0);
+      cleanup();
+    },
+  );
 
   /** As Tauri delivers it: SoneError is #[serde(tag="kind", content="message")],
    *  so ProxyBlocked's `message` is an OBJECT carrying `reason`. */

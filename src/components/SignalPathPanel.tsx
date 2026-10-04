@@ -72,6 +72,7 @@ export default function SignalPathPanel({
     isPristine,
     lossyFormatChange,
     losslessPromotion,
+    verdict,
   } = deriveAlterations(sp);
 
   const sourceBits = streamInfo?.bitDepth;
@@ -113,13 +114,17 @@ export default function SignalPathPanel({
     headline = `Volume slider scaling samples · ${amplitudeToSliderPercent(userVol)}%`;
   } else if (sp?.osMixer && !isDirectAlsa) {
     headline = `Routed through ${sp.osMixer.server}`;
-  } else if (sp && !sp.bitPerfect) {
-    headline = "Bit-perfect mode off — pipeline at unity, not guaranteed";
+  } else if (verdict === "unknown") {
+    headline = "Insufficient measurements to verify sample preservation";
   } else {
-    headline = "Pipeline pass-through";
+    headline = "Measured output differs from the decoded source";
   }
 
-  const verdictWord = isPristine ? "PRISTINE" : "MODIFIED";
+  const verdictWord = isPristine
+    ? "PRISTINE"
+    : verdict === "unknown"
+      ? "UNKNOWN"
+      : "MODIFIED";
   const ringColor = isPristine ? "border-green-400" : "border-amber-400";
   const wordColor = isPristine ? "text-green-400" : "text-amber-300";
   const dotColor = isPristine ? "bg-green-400" : "bg-amber-400";
@@ -132,7 +137,7 @@ export default function SignalPathPanel({
         style={{
           width: expanded ? 680 : 480,
           transitionTimingFunction: "cubic-bezier(0.22, 1, 0.36, 1)",
-          animation: "fadeIn 0.2s ease-out",
+          animation: "fadeIn 0.2s var(--ease-settle)",
         }}
       >
         <div className="absolute top-3 right-3 z-20">

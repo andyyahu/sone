@@ -317,17 +317,14 @@ pub fn set_exclusive_device(state: State<'_, AppState>, device: String) -> Resul
 }
 
 #[tauri::command]
-pub fn list_audio_devices(state: State<'_, AppState>) -> Result<Vec<AudioDevice>, SoneError> {
-    // Return cached devices if available (avoids slow GStreamer DeviceMonitor probe)
-    let cached = state.cached_audio_devices.lock().unwrap().clone();
-    if let Some(devices) = cached {
-        return Ok(devices);
-    }
-
-    // First call: probe directly (not via audio thread) and cache
-    let devices = crate::audio::list_alsa_devices().map_err(SoneError::Audio)?;
-    *state.cached_audio_devices.lock().unwrap() = Some(devices.clone());
-    Ok(devices)
+pub fn list_audio_devices(
+    state: State<'_, AppState>,
+    force_refresh: Option<bool>,
+) -> Result<Vec<AudioDevice>, SoneError> {
+    state
+        .cached_audio_devices
+        .get(force_refresh.unwrap_or(false))
+        .map_err(SoneError::Audio)
 }
 
 #[tauri::command]

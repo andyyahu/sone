@@ -7,8 +7,9 @@ import {
   ChevronDown,
   Settings,
   Info,
+  RefreshCw,
 } from "lucide-react";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useAtom, useAtomValue } from "jotai";
 import { useAuth } from "../hooks/useAuth";
@@ -63,6 +64,27 @@ export default function UserMenu() {
   const [audioDevices, setAudioDevices] = useState<
     Array<{ id: string; name: string }>
   >([]);
+
+  const [devicesLoading, setDevicesLoading] = useState(false);
+  const [devicesError, setDevicesError] = useState(false);
+  const deviceRequest = useRef(0);
+  const loadDevices = useCallback((forceRefresh = false) => {
+    const request = ++deviceRequest.current;
+    setDevicesLoading(true);
+    setDevicesError(false);
+    invoke<Array<{ id: string; name: string }>>("list_audio_devices", {
+      forceRefresh,
+    })
+      .then((devices) => {
+        if (request === deviceRequest.current) setAudioDevices(devices);
+      })
+      .catch(() => {
+        if (request === deviceRequest.current) setDevicesError(true);
+      })
+      .finally(() => {
+        if (request === deviceRequest.current) setDevicesLoading(false);
+      });
+  }, []);
 
   // The proxy banner renders above this menu and cannot reach the sheet's
   // state, so it asks. Only meaningful inside the authenticated shell — the
@@ -131,22 +153,12 @@ export default function UserMenu() {
     return () => window.removeEventListener("keydown", handler, true);
   }, [editingId, bindings, setBindings]);
 
-  // Load audio devices when exclusive mode is enabled
   useEffect(() => {
-    if (exclusiveMode) {
-      invoke<Array<{ id: string; name: string }>>("list_audio_devices")
-        .then((devices) => {
-          setAudioDevices(devices);
-          if (!exclusiveDevice && devices.length > 0) {
-            setExclusiveDevice(devices[0].id);
-            invoke("set_exclusive_device", { device: devices[0].id }).catch(
-              () => {},
-            );
-          }
-        })
-        .catch(() => {});
-    }
-  }, [exclusiveMode]);
+    if (exclusiveMode && open) loadDevices();
+    return () => {
+      deviceRequest.current += 1;
+    };
+  }, [exclusiveMode, open, loadDevices]);
 
   // Close on click outside
   useEffect(() => {
@@ -252,9 +264,34 @@ export default function UserMenu() {
           </button>
 
           {/* Device selector (visible when exclusive on) */}
-          {exclusiveMode && audioDevices.length > 0 && (
+          {exclusiveMode && (
             <div className="px-4 py-1 relative">
               <div className="ml-7">
+                <button
+                  type="button"
+                  onClick={() => loadDevices(true)}
+                  disabled={devicesLoading}
+                  className="mb-1 flex items-center gap-2 text-[12px] text-th-text-secondary disabled:opacity-50"
+                >
+                  <RefreshCw
+                    size={12}
+                    className={devicesLoading ? "animate-spin" : ""}
+                  />
+                  {devicesLoading ? "Refreshing devices…" : "Refresh devices"}
+                </button>
+                {devicesError && (
+                  <p role="alert" className="text-[12px] text-red-400">
+                    Unable to load audio devices. Try refreshing.
+                  </p>
+                )}
+                {!devicesLoading &&
+                  !devicesError &&
+                  audioDevices.length === 0 && (
+                    <p role="status" className="text-[12px] text-th-text-muted">
+                      No audio devices found.
+                    </p>
+                  )}
+
                 <button
                   onClick={() => setDeviceDropdownOpen((p) => !p)}
                   className="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-md bg-th-inset border border-th-border-subtle text-[12px] text-th-text-secondary hover:border-th-accent/50 transition-colors"
@@ -395,7 +432,7 @@ export default function UserMenu() {
           <div
             className="bg-th-elevated rounded-xl shadow-2xl w-[460px] max-h-[80vh] flex flex-col overflow-hidden"
             onClick={(e) => e.stopPropagation()}
-            style={{ animation: "slideUp 0.2s ease-out" }}
+            style={{ animation: "slideUp 0.2s var(--ease-settle)" }}
           >
             <div className="flex items-center justify-between px-5 pt-5 pb-3">
               <h2 className="text-[16px] font-bold text-th-text-primary">

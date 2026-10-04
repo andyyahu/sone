@@ -15,6 +15,9 @@ interface SoneErrorShape {
   message: unknown;
 }
 
+export const BIT_PERFECT_UNSUPPORTED_MESSAGE =
+  "This output cannot preserve the source samples. Turn off bit-perfect manually to allow conversion.";
+
 function isSoneError(err: unknown): err is SoneErrorShape {
   return (
     typeof err === "object" &&

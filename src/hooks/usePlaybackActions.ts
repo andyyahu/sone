@@ -53,7 +53,10 @@ import {
   isUnplayableError,
   retryAfterSecs,
 } from "../lib/trackAvailability";
-import { getProxyBlockedReason } from "../lib/errorUtils";
+import {
+  BIT_PERFECT_UNSUPPORTED_MESSAGE,
+  getProxyBlockedReason,
+} from "../lib/errorUtils";
 import { pickGaplessNext } from "../lib/gaplessPredict";
 import { startVideoSession } from "../lib/videoSession";
 import { videoElementRef } from "../lib/videoElement";
@@ -374,6 +377,14 @@ export function usePlaybackActions() {
           // own reason so every caller halts instead of advancing.
           showToast(blockedReason, "error");
           return { ok: false, reason: "blocked" };
+        }
+        if (
+          extractPlaybackError(error).split(":", 1)[0] ===
+          "bit_perfect_unsupported"
+        ) {
+          store.set(streamInfoAtom, null);
+          showToast(BIT_PERFECT_UNSUPPORTED_MESSAGE, "error");
+          return { ok: false, reason: "transient" };
         }
         if (isNetworkError(error)) {
           checkNetworkError(error);

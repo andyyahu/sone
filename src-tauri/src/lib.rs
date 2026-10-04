@@ -32,7 +32,7 @@ mod tray;
 pub use error::SoneError;
 pub use signal_path::{SignalPath, SignalPathTracker};
 
-use audio::{AudioDevice, AudioPlayer};
+use audio::AudioPlayer;
 use cache::DiskCache;
 use crypto::Crypto;
 use serde::{Deserialize, Serialize};
@@ -269,7 +269,7 @@ pub struct AppState {
     pub gapless: AtomicBool,
     pub max_quality: std::sync::Mutex<String>,
     pub exclusive_device: std::sync::Mutex<Option<String>>,
-    pub cached_audio_devices: std::sync::Mutex<Option<Vec<AudioDevice>>>,
+    pub cached_audio_devices: audio::AudioDeviceCache,
     /// Current track's selected replay gain (dB) stored as f64 bits. NAN = no data.
     /// Album or track gain depending on playback context.
     pub last_replay_gain: AtomicU64,
@@ -480,7 +480,7 @@ impl AppState {
             gapless: AtomicBool::new(gapless),
             max_quality: std::sync::Mutex::new(max_quality),
             exclusive_device: std::sync::Mutex::new(exclusive_device),
-            cached_audio_devices: std::sync::Mutex::new(None),
+            cached_audio_devices: audio::AudioDeviceCache::default(),
             last_replay_gain: AtomicU64::new(f64::NAN.to_bits()),
             last_peak_amplitude: AtomicU64::new(f64::NAN.to_bits()),
             #[cfg(target_os = "linux")]
@@ -664,7 +664,7 @@ pub fn run() {
                 std::thread::spawn(move || {
                     if let Ok(devices) = crate::audio::list_alsa_devices() {
                         let state = handle.state::<AppState>();
-                        *state.cached_audio_devices.lock().unwrap() = Some(devices);
+                        state.cached_audio_devices.seed(devices);
                     }
                 });
             }

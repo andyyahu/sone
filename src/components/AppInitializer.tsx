@@ -1,3 +1,4 @@
+import { useAudioErrors } from "../hooks/useAudioErrors";
 /**
  * AppInitializer — invisible component rendered once at the app root.
  *
@@ -974,37 +975,7 @@ export function AppInitializer() {
     };
   }, [store]);
 
-  // ================================================================
-  //  AUDIO ERROR HANDLING
-  //  Async GStreamer bus errors (device busy, pipeline failures, etc.)
-  // ================================================================
-  useEffect(() => {
-    const unlisten = listen<{ kind: string; message?: string }>(
-      "audio-error",
-      (event) => {
-        store.set(isPlayingAtom, false);
-        const { kind, message } = event.payload;
-        if (kind === "device_disconnected" || kind === "playback_error") {
-          store.set(streamInfoAtom, null);
-        }
-        if (kind === "device_busy") {
-          showToast(
-            "Audio device is busy — close other apps using it",
-            "error",
-          );
-        } else {
-          const display =
-            message && message.length > 80
-              ? message.slice(0, 80) + "…"
-              : message || "Playback error";
-          showToast(display, "error");
-        }
-      },
-    );
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, [store, showToast]);
+  useAudioErrors();
 
   // ================================================================
   //  RESAMPLING NOTIFICATION — toast when exclusive mode resamples

@@ -1,6 +1,7 @@
 import { ArrowLeft } from "lucide-react";
 import {
   amplitudeToSliderPercent,
+  classifyConversion,
   conversionState,
   dacDisplayName,
   deriveAlterations,
@@ -11,10 +12,10 @@ import {
   type SignalPathViewProps,
 } from "./types";
 
-type CableState = "pristine" | "altered" | "lossy";
+type CableState = "pristine" | "altered" | "lossy" | "unknown";
 
 interface Alteration {
-  state: "altered" | "lossy";
+  state: "altered" | "lossy" | "unknown";
   label: string;
   detail: string;
   reason: string;
@@ -61,6 +62,7 @@ export default function FlowDiagramBody({
     isDirectAlsa,
     isPristine,
     losslessPromotion,
+    verdict,
   } = deriveAlterations(sp);
 
   const sourceCodec = streamInfo?.codec?.toUpperCase() ?? null;
@@ -156,7 +158,9 @@ export default function FlowDiagramBody({
   // honestly claim a transition that isn't visible at either end of the
   // cable.
   const promotionVisible =
-    !!sp?.promotedFrom && !!sp?.promotedTo && sp.promotedTo === sp.outputFormat;
+    losslessPromotion &&
+    formatsEquivalent(sp?.promotedFrom, sp?.decodedFormat) &&
+    formatsEquivalent(sp?.promotedTo, sp?.outputFormat);
   if (promotionVisible) {
     cable1Alterations.push({
       state: "altered",
@@ -171,17 +175,36 @@ export default function FlowDiagramBody({
   // preserved; only the byte layout differs. Flagged as altered-lossless
   // (yellow), not lossy (red).
   const containerRepack =
-    isDirectAlsa &&
     !!sp?.decodedFormat &&
     !!sp?.outputFormat &&
-    !formatsEquivalent(sp.decodedFormat, sp.outputFormat);
-  if (containerRepack) {
+    (!formatsEquivalent(sp.decodedFormat, sp.outputFormat) ||
+      sp.decodedRate !== sp.outputRate ||
+      sp.decodedChannels !== sp.outputChannels);
+  const pipelineConversion = classifyConversion(
+    sp?.decodedFormat,
+    sp?.outputFormat,
+    sp?.decodedRate,
+    sp?.outputRate,
+    sp?.decodedChannels,
+    sp?.outputChannels,
+  );
+  if (containerRepack && !promotionVisible) {
     cable1Alterations.push({
-      state: "altered",
-      label: "CONTAINER REPACK",
+      state: conversionState(
+        sp?.decodedFormat,
+        sp?.outputFormat,
+        sp?.decodedRate,
+        sp?.outputRate,
+        sp?.decodedChannels,
+        sp?.outputChannels,
+      ),
+      label: losslessPromotion ? "CONTAINER REPACK" : "FORMAT CONVERSION",
       detail: `${displayFormat(sp!.decodedFormat)} → ${displayFormat(sp!.outputFormat)}`,
-      reason:
-        "audioconvert repacked the sample container — audio bits preserved, byte layout differs",
+      reason: losslessPromotion
+        ? "Sample values preserved by integer widening or container repacking"
+        : pipelineConversion === "modified"
+          ? "Decoded samples were changed by format, rate or channel conversion"
+          : "Sample preservation could not be verified for this conversion",
     });
   }
   // Normal mode: detect pipeline-output → OS-mixer-input divergence.
@@ -192,38 +215,55 @@ export default function FlowDiagramBody({
   const mixerDiverges =
     !isDirectAlsa &&
     !!sp?.osMixer &&
-    !!sp?.decodedFormat &&
-    (!formatsEquivalent(sp.decodedFormat, sp.osMixer.sinkFormat) ||
-      (sp.decodedRate !== null && sp.osMixer.sinkRate !== sp.decodedRate));
+    !!sp?.outputFormat &&
+    (!formatsEquivalent(sp.outputFormat, sp.osMixer.sinkFormat) ||
+      sp.osMixer.sinkRate !== sp.outputRate ||
+      sp.osMixer.sinkChannels !== sp.outputChannels);
   if (mixerDiverges) {
     const mixState = conversionState(
-      sp!.decodedFormat,
+      sp!.outputFormat,
       sp!.osMixer!.sinkFormat,
-      sp!.decodedRate,
+      sp!.outputRate,
       sp!.osMixer!.sinkRate,
+      sp!.outputChannels,
+      sp!.osMixer!.sinkChannels,
     );
     const mixRateChanged =
-      sp!.decodedRate !== null && sp!.osMixer!.sinkRate !== sp!.decodedRate;
+      sp!.outputRate !== null && sp!.osMixer!.sinkRate !== sp!.outputRate;
     const mixServer = sp?.osMixer?.server ?? "OS mixer";
     cable1Alterations.push({
       state: mixState,
       label: "MIX CONVERSION",
-      detail: `pipeline ${displayFormat(sp!.decodedFormat)}/${formatRate(sp!.decodedRate)} → mixer ${displayFormat(sp!.osMixer!.sinkFormat)}/${formatRate(sp!.osMixer!.sinkRate)}`,
+      detail: `pipeline ${displayFormat(sp!.outputFormat)}/${formatRate(sp!.outputRate)} → mixer ${displayFormat(sp!.osMixer!.sinkFormat)}/${formatRate(sp!.osMixer!.sinkRate)}`,
       reason:
-        mixState === "altered"
-          ? `${mixServer} widened/repacked the stream into its internal mix format — audio bits preserved`
-          : mixRateChanged
-            ? `${mixServer} resampled the stream to its internal mix rate`
-            : `${mixServer} reduced bit depth converting into its internal mix format`,
+        mixState === "unknown"
+          ? "Sample preservation is unverified for this conversion"
+          : mixState === "altered"
+            ? `${mixServer} widened/repacked the stream into its internal mix format — audio bits preserved`
+            : mixRateChanged
+              ? `${mixServer} resampled the stream to its internal mix rate`
+              : `${mixServer} reduced bit depth converting into its internal mix format`,
     });
   }
   const cable1State: CableState = cable1Alterations.some(
     (a) => a.state === "lossy",
   )
     ? "lossy"
-    : cable1Alterations.length > 0
-      ? "altered"
-      : "pristine";
+    : cable1Alterations.some((a) => a.state === "unknown") ||
+        pipelineConversion === "unknown" ||
+        (!isDirectAlsa &&
+          classifyConversion(
+            sp?.outputFormat,
+            sp?.osMixer?.sinkFormat,
+            sp?.outputRate,
+            sp?.osMixer?.sinkRate,
+            sp?.outputChannels,
+            sp?.osMixer?.sinkChannels,
+          ) === "unknown")
+      ? "unknown"
+      : cable1Alterations.length > 0
+        ? "altered"
+        : "pristine";
   const cable1Caption =
     sp?.resampledFrom && sp?.resampledTo
       ? `resample ${shortRate(sp.resampledFrom)}→${shortRate(sp.resampledTo)}`
@@ -232,8 +272,12 @@ export default function FlowDiagramBody({
         : mixerDiverges
           ? "mix conversion"
           : containerRepack
-            ? "container repack"
-            : "pass-thru";
+            ? losslessPromotion
+              ? "container repack"
+              : "conversion"
+            : cable1State === "unknown"
+              ? "unverified"
+              : "pass-thru";
   const cable1: CableSpec = {
     state: cable1State,
     caption: cable1Caption,
@@ -270,13 +314,13 @@ export default function FlowDiagramBody({
   // per-sink software volume that scales every sample before the kernel write.
   // Skipped for DirectAlsa because we own the device exclusively (OS mixer is
   // bypassed). EPS_VOL guards against floating-point noise around 1.0.
-  const EPS_VOL = 1e-3;
   const osMuted = !isDirectAlsa && !!sp?.osMixer && sp.osMixer.sinkMuted;
   const osVolumeAltered =
     !isDirectAlsa &&
     !!sp?.osMixer &&
     !sp.osMixer.sinkMuted &&
-    Math.abs(sp.osMixer.sinkVolume - 1.0) > EPS_VOL;
+    Number.isFinite(sp.osMixer.sinkVolume) &&
+    sp.osMixer.sinkVolume !== 1;
   if (osMuted) {
     cable2Alterations.push({
       state: "lossy",
@@ -302,6 +346,20 @@ export default function FlowDiagramBody({
   const upstreamRate = isDirectAlsa
     ? (sp?.outputRate ?? null)
     : (sp?.osMixer?.sinkRate ?? sp?.outputRate ?? null);
+  const upstreamChannels = isDirectAlsa
+    ? sp?.outputChannels
+    : (sp?.osMixer?.sinkChannels ?? sp?.outputChannels);
+  const dacConversion =
+    sp?.dac?.state === "Active"
+      ? classifyConversion(
+          upstreamFormat,
+          sp.dac.format,
+          upstreamRate,
+          sp.dac.rate,
+          upstreamChannels,
+          sp.dac.channels,
+        )
+      : "unknown";
 
   const dacDiverges =
     !!sp?.dac &&
@@ -309,13 +367,16 @@ export default function FlowDiagramBody({
     !!upstreamFormat &&
     upstreamRate !== null &&
     (!formatsEquivalent(sp.dac.format, upstreamFormat) ||
-      sp.dac.rate !== upstreamRate);
+      sp.dac.rate !== upstreamRate ||
+      sp.dac.channels !== upstreamChannels);
   if (dacDiverges) {
     const dacState = conversionState(
       upstreamFormat,
       sp!.dac!.format,
       upstreamRate,
       sp!.dac!.rate,
+      upstreamChannels,
+      sp!.dac!.channels,
     );
     const dacRateChanged = sp!.dac!.rate !== upstreamRate;
     const dacServer = sp?.osMixer?.server ?? "OS mixer";
@@ -324,20 +385,25 @@ export default function FlowDiagramBody({
       label: "OS-LAYER CONVERSION",
       detail: `${isDirectAlsa ? "pipeline" : "mixer"} ${displayFormat(upstreamFormat)}/${formatRate(upstreamRate)} → DAC ${displayFormat(sp!.dac!.format)}/${formatRate(sp!.dac!.rate)}`,
       reason:
-        dacState === "altered"
-          ? `${dacServer} widened/repacked the stream before it reached ALSA — audio bits preserved`
-          : dacRateChanged
-            ? `${dacServer} resampled the stream before it reached ALSA`
-            : `${dacServer} reduced bit depth before it reached ALSA`,
+        dacState === "unknown"
+          ? "Sample preservation is unverified for this conversion"
+          : dacState === "altered"
+            ? `${dacServer} widened/repacked the stream before it reached ALSA — audio bits preserved`
+            : dacRateChanged
+              ? `${dacServer} resampled the stream before it reached ALSA`
+              : `${dacServer} reduced bit depth before it reached ALSA`,
     });
   }
   const cable2State: CableState = cable2Alterations.some(
     (a) => a.state === "lossy",
   )
     ? "lossy"
-    : cable2Alterations.length > 0
-      ? "altered"
-      : "pristine";
+    : dacConversion === "unknown" ||
+        cable2Alterations.some((a) => a.state === "unknown")
+      ? "unknown"
+      : cable2Alterations.length > 0
+        ? "altered"
+        : "pristine";
   const cable2Caption =
     sp?.formatFallbackFrom && sp?.formatFallbackTo
       ? `fallback ${displayFormat(sp.formatFallbackFrom)}→${displayFormat(sp.formatFallbackTo)}`
@@ -349,7 +415,9 @@ export default function FlowDiagramBody({
             ? `OS vol ${gainFactorToDb(sp!.osMixer!.sinkVolume)}`
             : userVolAltered || normAltered
               ? "gain applied"
-              : "pass-thru";
+              : cable2State === "unknown"
+                ? "unverified"
+                : "pass-thru";
   const cable2: CableSpec = {
     state: cable2State,
     caption: cable2Caption,
@@ -373,14 +441,18 @@ export default function FlowDiagramBody({
       ? "bg-green-400"
       : s === "altered"
         ? "bg-amber-400"
-        : "bg-red-400";
+        : s === "unknown"
+          ? "bg-th-text-muted"
+          : "bg-red-400";
 
   const cableTextColor = (s: CableState): string =>
     s === "pristine"
       ? "text-green-400"
       : s === "altered"
         ? "text-amber-300"
-        : "text-red-400";
+        : s === "unknown"
+          ? "text-th-text-muted"
+          : "text-red-400";
 
   return (
     <>
@@ -422,8 +494,8 @@ export default function FlowDiagramBody({
                 </span>
               )}
               {sp?.bitPerfect && (
-                <span className="px-1.5 py-0.5 rounded bg-th-inset text-green-400 tracking-wider">
-                  BIT-PERFECT
+                <span className="px-1.5 py-0.5 rounded bg-th-inset text-th-text-muted tracking-wider">
+                  BIT-PERFECT MODE
                 </span>
               )}
             </div>
@@ -513,7 +585,7 @@ export default function FlowDiagramBody({
           </div>
           <div className="flex items-center gap-1.5">
             <div className="w-4 h-[3px] bg-amber-400" />
-            <span>ALTERED LOSSLESS</span>
+            <span>ALTERED</span>
           </div>
           <div className="flex items-center gap-1.5">
             <div className="w-4 h-[3px] bg-red-400" />
@@ -579,13 +651,15 @@ export default function FlowDiagramBody({
             ? losslessPromotion
               ? "PRISTINE · BIT-TRANSPARENT — LOSSLESS PROMOTION"
               : "PRISTINE — NO ALTERATIONS DETECTED"
-            : lossyCount > 0
-              ? `NOT PRISTINE — ${lossyCount} LOSSY STAGE${lossyCount === 1 ? "" : "S"}${
-                  alteredCount > 0 ? ` · ${alteredCount} MODIFIED` : ""
-                }`
-              : alteredCount > 0
-                ? `MODIFIED — ${alteredCount} STAGE${alteredCount === 1 ? "" : "S"}`
-                : "MODIFIED"}
+            : verdict === "unknown"
+              ? "UNKNOWN — INSUFFICIENT MEASUREMENTS"
+              : lossyCount > 0
+                ? `NOT PRISTINE — ${lossyCount} LOSSY STAGE${lossyCount === 1 ? "" : "S"}${
+                    alteredCount > 0 ? ` · ${alteredCount} MODIFIED` : ""
+                  }`
+                : alteredCount > 0
+                  ? `MODIFIED — ${alteredCount} STAGE${alteredCount === 1 ? "" : "S"}`
+                  : "MODIFIED"}
         </span>
       </div>
     </>

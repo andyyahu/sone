@@ -91,7 +91,7 @@ impl AudioProxy {
         c: crate::proxy::Capability,
     ) -> Result<crate::proxy::Route, crate::proxy::BlockReason> {
         let plan = crate::proxy::plan(&self.settings, &self.caps)
-            .map_err(|e| crate::proxy::BlockReason::new(&e.to_string()))?;
+            .map_err(|e| crate::proxy::BlockReason::new(e.to_string()))?;
 
         // After the `Direct` check, never before it. `Direct` hands routing
         // back to the system, bypass list included, so a user with no proxy
@@ -253,6 +253,92 @@ type Reply<T> = mpsc::Sender<T>;
 pub struct AudioDevice {
     pub id: String,
     pub name: String,
+}
+
+/// Serializes probes, including refresh requests already waiting on the same probe.
+type DeviceProbeResult = (std::time::Instant, Result<Vec<AudioDevice>, String>);
+
+#[derive(Default)]
+pub struct AudioDeviceCache {
+    result: Mutex<Option<DeviceProbeResult>>,
+}
+
+impl AudioDeviceCache {
+    pub fn seed(&self, devices: Vec<AudioDevice>) {
+        let mut state = self.result.lock().unwrap_or_else(|p| p.into_inner());
+        if state.is_none() {
+            *state = Some((std::time::Instant::now(), Ok(devices)));
+        }
+    }
+
+    pub fn get(&self, force_refresh: bool) -> Result<Vec<AudioDevice>, String> {
+        self.probe(force_refresh, list_alsa_devices)
+    }
+
+    fn probe(
+        &self,
+        force_refresh: bool,
+        probe: impl FnOnce() -> Result<Vec<AudioDevice>, String>,
+    ) -> Result<Vec<AudioDevice>, String> {
+        self.probe_started(std::time::Instant::now(), force_refresh, probe)
+    }
+
+    fn probe_started(
+        &self,
+        started: std::time::Instant,
+        force_refresh: bool,
+        probe: impl FnOnce() -> Result<Vec<AudioDevice>, String>,
+    ) -> Result<Vec<AudioDevice>, String> {
+        let mut state = self.result.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((completed, result)) = state.as_ref() {
+            if *completed >= started
+                || (!force_refresh
+                    && result.is_ok()
+                    && completed.elapsed() < std::time::Duration::from_secs(30))
+            {
+                return result.clone();
+            }
+        }
+        let result = probe();
+        *state = Some((std::time::Instant::now(), result.clone()));
+        result
+    }
+}
+
+fn integer_depth(format: &str) -> Option<u8> {
+    match format {
+        "S16LE" => Some(16),
+        "S24LE" | "S24_32LE" => Some(24),
+        "S32LE" => Some(32),
+        _ => None,
+    }
+}
+
+/// Only validated integer widening/repacking and identical float are allowed.
+fn sample_format_preserved(source: &str, target: &str) -> bool {
+    match (integer_depth(source), integer_depth(target)) {
+        (Some(from), Some(to)) => to >= from,
+        _ => source == "F32LE" && target == source,
+    }
+}
+
+fn samples_preserved(source: &PcmFormat, target: &PcmFormat) -> bool {
+    source.sample_rate > 0
+        && source.channels > 0
+        && source.sample_rate == target.sample_rate
+        && (source.channels == target.channels || (source.channels == 2 && target.channels > 2))
+        && sample_format_preserved(&source.gst_format, &target.gst_format)
+}
+
+fn pick_lossless_format(source: &str, supported: &[String]) -> Option<String> {
+    if supported.iter().any(|f| f == source) && sample_format_preserved(source, source) {
+        return Some(source.to_owned());
+    }
+    supported
+        .iter()
+        .filter(|f| sample_format_preserved(source, f))
+        .min_by_key(|f| integer_depth(f).unwrap_or(u8::MAX))
+        .cloned()
 }
 
 // ── PCM types ──────────────────────────────────────────────────────────
@@ -419,12 +505,15 @@ impl PlaybackBackend {
 
 fn parse_pcm_format(caps: &gst::CapsRef) -> Option<PcmFormat> {
     let s = caps.structure(0)?;
-    if !s.name().as_str().starts_with("audio/") {
+    if s.name() != "audio/x-raw" || !caps.is_fixed() {
         return None;
     }
     let format = s.get::<&str>("format").ok()?;
     let rate = s.get::<i32>("rate").ok()? as u32;
     let channels = s.get::<i32>("channels").ok()? as u32;
+    if rate == 0 || rate > i32::MAX as u32 || channels == 0 || channels > i32::MAX as u32 {
+        return None;
+    }
     let bps = match format {
         "S16LE" => 2,
         "S24LE" => 3,
@@ -817,13 +906,14 @@ fn probe_supported_gst_formats(pcm: &alsa::PCM) -> Vec<&'static str> {
     }
 }
 
-/// Pick the bit-perfect capsfilter format for a given source.
+/// Pick a compatible capsfilter format outside strict bit-perfect mode.
 /// Priority:
 ///   1. Pass-through if the DAC supports the source format directly (zero conversion work).
 ///   2. Narrowest lossless promotion the DAC supports (container widening or, for S24_32LE,
 ///      shrinking to S24LE which holds the same 24 audio bits in 3 bytes).
 ///   3. Lossy fallback: DAC's first probed format (widest per probe order).
-/// In case 3, the writer's `resolve_pending` still emits a truthful from→to toast.
+///
+/// This fallback is only used outside strict bit-perfect mode.
 #[cfg(target_os = "linux")]
 fn pick_capsfilter_format(source: &str, dac_supported: &[String]) -> String {
     // 1. Pass-through.
@@ -832,8 +922,8 @@ fn pick_capsfilter_format(source: &str, dac_supported: &[String]) -> String {
     }
     // 2. Narrowest lossless promotion. audioconvert with dithering=none does pure
     //    integer bit-shift conversions between these formats — no quantization.
-    //    S24_32LE → S24LE is safe because audioconvert writes a zero pad byte
-    //    upstream; stripping it preserves the 24 audio bits exactly.
+    //    S24_32LE → S24LE strips the unused high byte and preserves the 24 audio
+    //    bits exactly.
     let promotions: &[&str] = match source {
         "S16LE" => &["S24LE", "S24_32LE", "S32LE"],
         "S24LE" => &["S24_32LE", "S32LE"],
@@ -846,8 +936,7 @@ fn pick_capsfilter_format(source: &str, dac_supported: &[String]) -> String {
     {
         return (*p).to_string();
     }
-    // 3. Lossy fallback — DAC's preferred (widest) format. PendingPromotion still
-    //    fires from pad_added so the writer surfaces a truthful toast.
+    // 3. Compatibility fallback — DAC's preferred (widest) format.
     dac_supported
         .first()
         .cloned()
@@ -876,6 +965,121 @@ fn probe_supported_rates(pcm: &alsa::PCM) -> Vec<u32> {
     } else {
         supported
     }
+}
+
+const PCM_WAIT_MS: u32 = 50;
+const PCM_STALL: std::time::Duration = std::time::Duration::from_secs(2);
+
+trait PcmIo {
+    fn write(&mut self, bytes: &[u8]) -> Result<usize, i32>;
+    fn wait(&mut self, millis: u32) -> Result<(), i32>;
+    fn resume(&mut self) -> Result<(), i32>;
+    fn prepare(&mut self) -> Result<(), i32>;
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+    fn sleep(&mut self, millis: u32) {
+        std::thread::sleep(std::time::Duration::from_millis(millis.into()));
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct AlsaIo<'a>(&'a alsa::PCM);
+#[cfg(target_os = "linux")]
+impl PcmIo for AlsaIo<'_> {
+    fn write(&mut self, bytes: &[u8]) -> Result<usize, i32> {
+        self.0.io_bytes().writei(bytes).map_err(|e| e.errno())
+    }
+    fn wait(&mut self, millis: u32) -> Result<(), i32> {
+        self.0.wait(Some(millis)).map(|_| ()).map_err(|e| e.errno())
+    }
+    fn resume(&mut self) -> Result<(), i32> {
+        self.0.resume().map_err(|e| e.errno())
+    }
+    fn prepare(&mut self) -> Result<(), i32> {
+        self.0.prepare().map_err(|e| e.errno())
+    }
+}
+
+fn pcm_error(errno: i32) -> &'static str {
+    if errno == libc::ENODEV {
+        "device_disconnected"
+    } else {
+        "write_error"
+    }
+}
+
+fn recover_pcm(
+    io: &mut impl PcmIo,
+    errno: i32,
+    cancelled: &AtomicBool,
+) -> Result<(), &'static str> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err("cancelled");
+    }
+    if errno == libc::EPIPE {
+        return io.prepare().map_err(pcm_error);
+    }
+    if errno != libc::ESTRPIPE {
+        return Err(pcm_error(errno));
+    }
+    let deadline = io.now() + PCM_STALL;
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err("cancelled");
+        }
+        match io.resume() {
+            Ok(()) => return Ok(()),
+            Err(libc::EAGAIN) if io.now() < deadline => io.sleep(20),
+            Err(libc::EAGAIN) => return Err("suspend_timeout"),
+            Err(libc::ENODEV) => return Err("device_disconnected"),
+            Err(_) => return io.prepare().map_err(pcm_error),
+        }
+    }
+}
+
+/// Offset advances only for accepted frames. The deadline covers pending audio,
+/// excludes user pause, and resets only after actual progress.
+fn write_pcm(
+    io: &mut impl PcmIo,
+    data: &[u8],
+    frame_size: usize,
+    cancelled: &AtomicBool,
+    paused: &AtomicBool,
+    frames_written: &AtomicU64,
+) -> Result<(), &'static str> {
+    if frame_size == 0 || !data.len().is_multiple_of(frame_size) {
+        return Err("invalid_pcm");
+    }
+    let mut offset = 0;
+    let mut progress = io.now();
+    while offset < data.len() {
+        if cancelled.load(Ordering::Acquire) {
+            return Err("cancelled");
+        }
+        if paused.load(Ordering::Acquire) {
+            io.sleep(20);
+            progress = io.now();
+            continue;
+        }
+        if io.now().duration_since(progress) >= PCM_STALL {
+            return Err("write_timeout");
+        }
+        match io.write(&data[offset..]) {
+            Ok(n) if n > 0 => {
+                offset += n * frame_size;
+                frames_written.fetch_add(n as u64, Ordering::Relaxed);
+                progress = io.now();
+            }
+            Ok(_) | Err(libc::EAGAIN) => {
+                if let Err(e) = io.wait(PCM_WAIT_MS) {
+                    recover_pcm(io, e, cancelled)?;
+                }
+            }
+            Err(e) => recover_pcm(io, e, cancelled)?,
+        }
+    }
+    Ok(())
 }
 
 // ── ALSA writer thread ─────────────────────────────────────────────────
@@ -982,6 +1186,11 @@ fn configure_alsa_hwparams(
     // requested count; if unsupported, fall back to the device's native minimum.
     let hw_channels = if hwp.test_channels(fmt.channels).is_ok() {
         fmt.channels
+    } else if bit_perfect {
+        return Err(format!(
+            "Bit-perfect output cannot change {} channels",
+            fmt.channels
+        ));
     } else {
         match hwp.get_channels_min() {
             Ok(n) if n > 0 => {
@@ -1075,12 +1284,12 @@ fn configure_alsa_hwparams(
 }
 
 #[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
-fn spawn_alsa_writer(
-    device: &str,
-    initial_format: &PcmFormat,
+struct AlsaWriterConfig<'a> {
+    device: &'a str,
+    initial_format: &'a PcmFormat,
     app_handle: tauri::AppHandle,
     tearing_down: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
     frames_written: Arc<AtomicU64>,
     current_sample_rate: Arc<AtomicU32>,
     writer_gen: Arc<AtomicU64>,
@@ -1090,22 +1299,41 @@ fn spawn_alsa_writer(
     signal_path: Arc<SignalPathTracker>,
     decoded_cell: Arc<Mutex<Option<crate::pipeline_probe::PadCaps>>>,
     output_cell: Arc<Mutex<Option<crate::pipeline_probe::PadCaps>>>,
-) -> Result<
-    (
-        crossbeam_channel::Sender<WriterCommand>,
-        JoinHandle<()>,
-        PcmFormat,
-        Vec<&'static str>,
-        Vec<u32>,
-    ),
-    String,
-> {
+}
+
+#[cfg(target_os = "linux")]
+type AlsaWriterParts = (
+    crossbeam_channel::Sender<WriterCommand>,
+    JoinHandle<()>,
+    PcmFormat,
+    Vec<&'static str>,
+    Vec<u32>,
+);
+
+#[cfg(target_os = "linux")]
+fn spawn_alsa_writer(config: AlsaWriterConfig<'_>) -> Result<AlsaWriterParts, String> {
+    let AlsaWriterConfig {
+        device,
+        initial_format,
+        app_handle,
+        tearing_down,
+        cancelled,
+        frames_written,
+        current_sample_rate,
+        writer_gen,
+        paused,
+        bit_perfect,
+        combined_vol,
+        signal_path,
+        decoded_cell,
+        output_cell,
+    } = config;
     let device = device.to_string();
     let initial_format = initial_format.clone();
     let (tx, rx) = crossbeam_channel::bounded::<WriterCommand>(256);
 
     // Open device eagerly to detect EBUSY immediately
-    let pcm = alsa::PCM::new(&device, alsa::Direction::Playback, false).map_err(|e| {
+    let pcm = alsa::PCM::new(&device, alsa::Direction::Playback, true).map_err(|e| {
         let msg = e.to_string();
         if msg.contains("busy") || msg.contains("EBUSY") {
             "device_busy".to_string()
@@ -1152,7 +1380,7 @@ fn spawn_alsa_writer(
     };
 
     let requested_for_fallback = initial_format.clone();
-    let initial_format = configure_alsa_hwparams(&pcm, &initial_format, bit_perfect)?;
+    let initial_format = configure_alsa_hwparams(&pcm, &initial_format, false)?;
     pcm.prepare().map_err(|e| format!("pcm.prepare: {e}"))?;
     current_sample_rate.store(initial_format.sample_rate, Ordering::Relaxed);
     let negotiated_fmt = initial_format.clone();
@@ -1186,7 +1414,7 @@ fn spawn_alsa_writer(
             let mut pending_promotion_from: Option<String> = None;
             let resolve_pending = |pending: &mut Option<String>, current: &PcmFormat| {
                 if let Some(from) = pending.take() {
-                    if from != current.gst_format {
+                    if from != current.gst_format && sample_format_preserved(&from, &current.gst_format) {
                         log::info!("[alsa-writer] bit-depth promotion: {from} -> {}", current.gst_format);
                         sp.record_bit_depth_promotion(&from, &current.gst_format);
                         app_handle.emit(
@@ -1199,84 +1427,21 @@ fn spawn_alsa_writer(
                 }
             };
 
-            // Recover from ALSA errors (XRUN, suspend, etc.)
-            fn alsa_recover(pcm: &alsa::PCM, errno: i32) -> bool {
-                if errno == libc::EPIPE {
-                    log::warn!("[alsa-writer] XRUN, recovering");
-                    pcm.prepare().ok();
-                    true
-                } else if errno == libc::ESTRPIPE {
-                    let mut recovered = false;
-                    loop {
-                        match pcm.resume() {
-                            Ok(_) => { recovered = true; break; }
-                            Err(e) if e.errno() == libc::EAGAIN => {
-                                std::thread::sleep(std::time::Duration::from_millis(10));
-                            }
-                            Err(_) => {
-                                if pcm.prepare().is_ok() { recovered = true; }
-                                break;
-                            }
-                        }
+            let write_bytes = |pcm: &alsa::PCM, data: &[u8], fmt: &PcmFormat, fw: &AtomicU64, _silence: &[u8]| {
+                write_pcm(&mut AlsaIo(pcm), data,
+                    fmt.channels as usize * fmt.bytes_per_sample as usize,
+                    &cancelled, &paused, fw)
+            };
+            let write_silence = |pcm: &alsa::PCM, buf: &[u8]| -> Result<(), &'static str> {
+                if cancelled.load(Ordering::Acquire) { return Err("cancelled"); }
+                let mut io = AlsaIo(pcm);
+                match io.write(buf) {
+                    Ok(_) | Err(libc::EAGAIN) => {
+                        io.wait(PCM_WAIT_MS).or_else(|e| if e == libc::EAGAIN { Ok(()) } else { Err(e) }).map_err(pcm_error)
                     }
-                    recovered
-                } else {
-                    false
+                    Err(e) => recover_pcm(&mut io, e, &cancelled),
                 }
-            }
-
-            fn write_bytes(pcm: &alsa::PCM, data: &[u8], fmt: &PcmFormat, fw: &AtomicU64, silence_buf: &[u8]) -> Result<(), &'static str> {
-                let frame_size = fmt.channels as usize * fmt.bytes_per_sample as usize;
-                if frame_size == 0 { return Ok(()); }
-                let mut offset = 0;
-                while offset < data.len() {
-                    let result = {
-                        let io = pcm.io_bytes();
-                        io.writei(&data[offset..])
-                    }; // io dropped here — flag cleared before any recovery
-                    match result {
-                        Ok(0) => break, // sub-frame remnant
-                        Ok(frames) => {
-                            offset += frames * frame_size;
-                            fw.fetch_add(frames as u64, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            let errno = e.errno();
-                            if alsa_recover(pcm, errno) {
-                                let kick_frames = (fmt.sample_rate as usize * 50) / 1000;
-                                let kick_bytes = kick_frames * frame_size;
-                                let io = pcm.io_bytes();
-                                let _ = io.writei(&silence_buf[..kick_bytes.min(silence_buf.len())]);
-                            } else if errno == libc::ENODEV {
-                                return Err("device_disconnected");
-                            } else {
-                                log::error!("[alsa-writer] write error: {e}");
-                                return Err("write_error");
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            }
-
-            fn write_silence(pcm: &alsa::PCM, buf: &[u8]) -> bool {
-                let result = {
-                    let io = pcm.io_bytes();
-                    io.writei(buf)
-                }; // io dropped here
-                match result {
-                    Ok(_) => {}
-                    Err(e) if alsa_recover(pcm, e.errno()) => {
-                        let io = pcm.io_bytes();
-                        let _ = io.writei(buf);
-                    }
-                    Err(e) => {
-                        log::error!("[alsa-writer] silence write error: {e}");
-                        return false;
-                    }
-                }
-                true
-            }
+            };
 
             /// Scale raw PCM samples in-place by a volume multiplier.
             fn apply_volume(data: &mut [u8], fmt: &PcmFormat, vol: f32) {
@@ -1338,7 +1503,7 @@ fn spawn_alsa_writer(
                 sbuf: &mut Vec<u8>,
                 bit_perfect: bool,
             ) -> Result<(alsa::PCM, PcmFormat), String> {
-                let pcm = alsa::PCM::new(device, alsa::Direction::Playback, false)
+                let pcm = alsa::PCM::new(device, alsa::Direction::Playback, true)
                     .map_err(|e| format!("Failed to reopen ALSA device: {e}"))?;
                 let negotiated = configure_alsa_hwparams(&pcm, fmt, bit_perfect)?;
                 pcm.prepare().map_err(|e| format!("pcm.prepare: {e}"))?;
@@ -1362,6 +1527,7 @@ fn spawn_alsa_writer(
             );
 
             'main: loop {
+                if cancelled.load(Ordering::Acquire) { break; }
                 match rx.recv_timeout(period_duration) {
                     Ok(WriterCommand::Data(mut chunk)) => {
                         if chunk.generation < writer_gen.load(Ordering::Acquire) {
@@ -1375,16 +1541,18 @@ fn spawn_alsa_writer(
                             if can_hw { pcm.pause(true).ok(); }
 
                             while paused.load(Ordering::Acquire) {
+                                if cancelled.load(Ordering::Acquire) { break 'main; }
                                 if can_hw {
                                     // HW pause: DAC frozen, nothing to feed — just sleep
                                     std::thread::sleep(std::time::Duration::from_millis(50));
                                 } else {
                                     // SW pause: blocking writei paces the thread (~50ms per period)
-                                    if !write_silence(&pcm, &silence_buf) {
+                                    if let Err(kind) = write_silence(&pcm, &silence_buf) {
+                                if kind == "cancelled" { break 'main; }
                                         *decoded_cell.lock().unwrap() = None;
                                         *output_cell.lock().unwrap() = None;
                                         app_handle.emit("audio-error",
-                                            serde_json::json!({ "kind": "device_disconnected" })).ok();
+                                            serde_json::json!({ "kind": kind })).ok();
                                         tearing_down.store(true, Ordering::SeqCst);
                                         break 'main;
                                     }
@@ -1407,13 +1575,13 @@ fn spawn_alsa_writer(
 
                         if chunk.format != current_fmt {
                             log::info!("[alsa-writer] format change: {current_fmt:?} -> {:?}", chunk.format);
-                            sp.set_decoded(&chunk.format.gst_format, chunk.format.sample_rate, chunk.format.channels);
                             drop(pcm);
                             match reopen_alsa(&device, &chunk.format, &current_sample_rate, &mut silence_buf, bit_perfect) {
                                 Ok((new_pcm, negotiated)) => {
                                     pcm = new_pcm;
                                     if negotiated.gst_format != chunk.format.gst_format
-                                        || negotiated.channels != chunk.format.channels {
+                                        || negotiated.channels != chunk.format.channels
+                                        || (bit_perfect && negotiated.sample_rate != chunk.format.sample_rate) {
                                         log::error!(
                                             "[alsa-writer] format mismatch after reopen: chunk={}/{}ch, ALSA={}/{}ch",
                                             chunk.format.gst_format, chunk.format.channels,
@@ -1434,7 +1602,7 @@ fn spawn_alsa_writer(
                                 }
                                 Err(e) => {
                                     log::error!("[alsa-writer] reopen failed: {e}");
-                                    app_handle.emit("audio-error", serde_json::json!({ "kind": "format_change_failed", "message": e })).ok();
+                                    app_handle.emit("audio-error", serde_json::json!({ "kind": if bit_perfect { "bit_perfect_unsupported" } else { "format_change_failed" }, "message": e })).ok();
                                     tearing_down.store(true, Ordering::SeqCst);
                                     return; // pcm already dropped, just exit thread
                                 }
@@ -1444,6 +1612,7 @@ fn spawn_alsa_writer(
                         let vol = f32::from_bits(combined_vol.load(Ordering::Relaxed));
                         apply_volume(&mut chunk.data, &current_fmt, vol);
                         if let Err(kind) = write_bytes(&pcm, &chunk.data, &current_fmt, &frames_written, &silence_buf) {
+                            if kind == "cancelled" { break 'main; }
                             app_handle.emit("audio-error", serde_json::json!({ "kind": kind })).ok();
                             tearing_down.store(true, Ordering::SeqCst);
                             break;
@@ -1451,7 +1620,6 @@ fn spawn_alsa_writer(
                     }
 
                     Ok(WriterCommand::FormatHint(new_fmt)) => {
-                        sp.set_decoded(&new_fmt.gst_format, new_fmt.sample_rate, new_fmt.channels);
                         if new_fmt != current_fmt {
                             log::info!("[alsa-writer] format hint: {current_fmt:?} -> {new_fmt:?}");
                             let requested = new_fmt.clone();
@@ -1481,13 +1649,12 @@ fn spawn_alsa_writer(
                                 }
                                 Err(e) => {
                                     log::error!("[alsa-writer] reopen for format hint failed: {e}");
-                                    app_handle.emit("audio-error", serde_json::json!({ "kind": "format_change_failed", "message": e })).ok();
+                                    app_handle.emit("audio-error", serde_json::json!({ "kind": if bit_perfect { "bit_perfect_unsupported" } else { "format_change_failed" }, "message": e })).ok();
                                     tearing_down.store(true, Ordering::SeqCst);
                                     return;
                                 }
                             }
                         }
-                        resolve_pending(&mut pending_promotion_from, &current_fmt);
                     }
 
                     Ok(WriterCommand::Resampling { from, to }) => {
@@ -1512,11 +1679,12 @@ fn spawn_alsa_writer(
                             continue; // stale EOS from old pipeline
                         }
                         let got_shutdown = drain_writer_rx(&rx);
-                        if !write_silence(&pcm, &silence_buf) {
+                        if let Err(kind) = write_silence(&pcm, &silence_buf) {
+                                if kind == "cancelled" { break 'main; }
                             *decoded_cell.lock().unwrap() = None;
                             *output_cell.lock().unwrap() = None;
                             app_handle.emit("audio-error",
-                                serde_json::json!({ "kind": "device_disconnected" })).ok();
+                                serde_json::json!({ "kind": kind })).ok();
                             tearing_down.store(true, Ordering::SeqCst);
                             break 'main;
                         }
@@ -1531,22 +1699,24 @@ fn spawn_alsa_writer(
                         // Idle silence loop — keep DAC clock alive between tracks
                         log::debug!("[alsa-writer] entering idle silence loop");
                         loop {
-                            if !write_silence(&pcm, &silence_buf) {
+                            if cancelled.load(Ordering::Acquire) { break 'main; }
+                            if let Err(kind) = write_silence(&pcm, &silence_buf) {
+                                if kind == "cancelled" { break 'main; }
                                 *decoded_cell.lock().unwrap() = None;
                                 *output_cell.lock().unwrap() = None;
                                 app_handle.emit("audio-error",
-                                    serde_json::json!({ "kind": "device_disconnected" })).ok();
+                                    serde_json::json!({ "kind": kind })).ok();
                                 tearing_down.store(true, Ordering::SeqCst);
                                 break 'main;
                             }
+                            std::thread::sleep(std::time::Duration::from_millis(20));
                             match rx.try_recv() {
                                 Ok(WriterCommand::Data(mut chunk)) => {
                                     if chunk.generation < writer_gen.load(Ordering::Acquire) {
                                         continue; // discard stale data, stay in idle
                                     }
                                     if chunk.format != current_fmt {
-                                        sp.set_decoded(&chunk.format.gst_format, chunk.format.sample_rate, chunk.format.channels);
-                                        // reopen_alsa drops old PCM — buffer cleared implicitly
+                                                    // reopen_alsa drops old PCM — buffer cleared implicitly
                                         drop(pcm);
                                         match reopen_alsa(&device, &chunk.format, &current_sample_rate, &mut silence_buf, bit_perfect) {
                                             Ok((new_pcm, negotiated)) => {
@@ -1573,7 +1743,7 @@ fn spawn_alsa_writer(
                                             }
                                             Err(e) => {
                                                 log::error!("[alsa-writer] reopen failed in idle: {e}");
-                                                app_handle.emit("audio-error", serde_json::json!({ "kind": "format_change_failed", "message": e })).ok();
+                                                app_handle.emit("audio-error", serde_json::json!({ "kind": if bit_perfect { "bit_perfect_unsupported" } else { "format_change_failed" }, "message": e })).ok();
                                                 return;
                                             }
                                         }
@@ -1586,6 +1756,7 @@ fn spawn_alsa_writer(
                                     let vol = f32::from_bits(combined_vol.load(Ordering::Relaxed));
                                     apply_volume(&mut chunk.data, &current_fmt, vol);
                                     if let Err(kind) = write_bytes(&pcm, &chunk.data, &current_fmt, &frames_written, &silence_buf) {
+                            if kind == "cancelled" { break 'main; }
                                         app_handle.emit("audio-error", serde_json::json!({ "kind": kind })).ok();
                                         break 'main;
                                     }
@@ -1594,8 +1765,7 @@ fn spawn_alsa_writer(
                                 Ok(WriterCommand::Shutdown) => break 'main,
                                 Ok(WriterCommand::Flush) => { drain_writer_rx(&rx); pcm.drop().ok(); pcm.prepare().ok(); pending_promotion_from = None; break; }
                                 Ok(WriterCommand::FormatHint(new_fmt)) => {
-                                    sp.set_decoded(&new_fmt.gst_format, new_fmt.sample_rate, new_fmt.channels);
-                                    if new_fmt != current_fmt {
+                                                if new_fmt != current_fmt {
                                         log::info!("[alsa-writer] format hint (idle): {current_fmt:?} -> {new_fmt:?}");
                                         let requested = new_fmt.clone();
                                         drop(pcm);
@@ -1622,12 +1792,11 @@ fn spawn_alsa_writer(
                                             }
                                             Err(e) => {
                                                 log::error!("[alsa-writer] reopen for format hint failed (idle): {e}");
-                                                app_handle.emit("audio-error", serde_json::json!({ "kind": "format_change_failed", "message": e })).ok();
+                                                app_handle.emit("audio-error", serde_json::json!({ "kind": if bit_perfect { "bit_perfect_unsupported" } else { "format_change_failed" }, "message": e })).ok();
                                                 return;
                                             }
                                         }
                                     }
-                                    resolve_pending(&mut pending_promotion_from, &current_fmt);
                                 }
                                 Ok(WriterCommand::Resampling { from, to }) => {
                                     sp.record_resample(from, to);
@@ -1659,11 +1828,12 @@ fn spawn_alsa_writer(
                     }
 
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        if !write_silence(&pcm, &silence_buf) {
+                        if let Err(kind) = write_silence(&pcm, &silence_buf) {
+                                if kind == "cancelled" { break 'main; }
                             *decoded_cell.lock().unwrap() = None;
                             *output_cell.lock().unwrap() = None;
                             app_handle.emit("audio-error",
-                                serde_json::json!({ "kind": "device_disconnected" })).ok();
+                                serde_json::json!({ "kind": kind })).ok();
                             tearing_down.store(true, Ordering::SeqCst);
                             break 'main;
                         }
@@ -1840,6 +2010,7 @@ impl AudioPlayer {
             // ALSA writer state — lives outside PlaybackBackend so it persists across track changes
             let mut writer_tx: Option<crossbeam_channel::Sender<WriterCommand>> = None;
             let mut writer_thread: Option<JoinHandle<()>> = None;
+            let mut writer_cancel = Arc::new(AtomicBool::new(false));
             let mut writer_fmt: Option<PcmFormat> = None;
             let mut writer_supported_fmts: Option<Vec<&'static str>> = None;
             let mut writer_supported_rates: Option<Vec<u32>> = None;
@@ -2091,33 +2262,36 @@ impl AudioPlayer {
                                         || mode_changed
                                     {
                                         // Shut down old writer cleanly
+                                        writer_cancel.store(true, Ordering::Release);
                                         if let Some(tx) = writer_tx.take() {
                                             tx.try_send(WriterCommand::Shutdown).ok();
                                         }
                                         if let Some(h) = writer_thread.take() {
                                             h.join().ok();
                                         }
+                                        writer_cancel = Arc::new(AtomicBool::new(false));
                                         let (
                                             tx,
                                             handle,
                                             negotiated_fmt,
                                             supported_gst_fmts,
                                             supported_rates,
-                                        ) = spawn_alsa_writer(
-                                            dev,
-                                            &default_fmt,
-                                            app_handle.clone(),
-                                            Arc::clone(&tearing_down),
-                                            Arc::clone(&frames_written),
-                                            Arc::clone(&current_sample_rate),
-                                            Arc::clone(&writer_gen),
-                                            Arc::clone(&paused),
+                                        ) = spawn_alsa_writer(AlsaWriterConfig {
+                                            device: dev,
+                                            initial_format: &default_fmt,
+                                            app_handle: app_handle.clone(),
+                                            tearing_down: Arc::clone(&tearing_down),
+                                            cancelled: Arc::clone(&writer_cancel),
+                                            frames_written: Arc::clone(&frames_written),
+                                            current_sample_rate: Arc::clone(&current_sample_rate),
+                                            writer_gen: Arc::clone(&writer_gen),
+                                            paused: Arc::clone(&paused),
                                             bit_perfect,
-                                            Arc::clone(&combined_vol),
-                                            Arc::clone(&signal_path),
-                                            Arc::clone(&decoded_cell_thread),
-                                            Arc::clone(&output_cell_thread),
-                                        )?;
+                                            combined_vol: Arc::clone(&combined_vol),
+                                            signal_path: Arc::clone(&signal_path),
+                                            decoded_cell: Arc::clone(&decoded_cell_thread),
+                                            output_cell: Arc::clone(&output_cell_thread),
+                                        })?;
                                         writer_tx = Some(tx);
                                         writer_thread = Some(handle);
                                         writer_fmt = Some(negotiated_fmt);
@@ -2137,24 +2311,39 @@ impl AudioPlayer {
                                     let supported_rates_for_pipeline = writer_supported_rates
                                         .as_deref()
                                         .unwrap_or(&[44100, 48000]);
-                                    let (pipe, u_vol, n_vol) = build_appsink_pipeline(
-                                        &uri,
-                                        is_dash,
-                                        route,
-                                        exclusive,
-                                        bit_perfect,
-                                        wtx.clone(),
-                                        Arc::clone(&writer_gen),
-                                        fmt_for_pipeline,
-                                        supported_fmts_for_pipeline,
-                                        supported_rates_for_pipeline,
-                                        Arc::clone(&decoded_cell_thread),
-                                        Arc::clone(&output_cell_thread),
-                                    )?;
+                                    let rejected = Arc::new(AtomicBool::new(false));
+                                    let (pipe, u_vol, n_vol) =
+                                        build_appsink_pipeline(AppSinkConfig {
+                                            uri: &uri,
+                                            is_dash,
+                                            route,
+                                            exclusive,
+                                            bit_perfect,
+                                            writer_tx: wtx.clone(),
+                                            writer_gen: Arc::clone(&writer_gen),
+                                            negotiated_fmt: fmt_for_pipeline,
+                                            supported_gst_formats: supported_fmts_for_pipeline,
+                                            supported_rates: supported_rates_for_pipeline,
+                                            decoded_cell: Arc::clone(&decoded_cell_thread),
+                                            output_cell: Arc::clone(&output_cell_thread),
+                                            rejected: Arc::clone(&rejected),
+                                            cancelled: Arc::clone(&writer_cancel),
+                                        })?;
 
                                     // Start pipeline directly — errors come via bus watcher
-                                    pipe.set_state(gst::State::Playing)
-                                        .map_err(|e| format!("Failed to start playback: {e}"))?;
+                                    if let Err(error) = pipe.set_state(gst::State::Playing) {
+                                        writer_cancel.store(true, Ordering::Release);
+                                        let message = if rejected.load(Ordering::Acquire) {
+                                            "bit_perfect_unsupported: DAC cannot preserve the source samples. Turn off bit-perfect manually to allow conversion.".to_string()
+                                        } else {
+                                            format!("Failed to start playback: {error}")
+                                        };
+                                        if rejected.load(Ordering::Acquire) {
+                                            app_handle.emit("audio-error", serde_json::json!({ "kind": "bit_perfect_unsupported", "message": message })).ok();
+                                        }
+                                        pipe.set_state(gst::State::Null).ok();
+                                        return Err(message);
+                                    }
 
                                     // Bus watcher: decode errors + EOS → forward to writer
                                     let eos_flag = Arc::clone(&eos);
@@ -2162,11 +2351,15 @@ impl AudioPlayer {
                                     let writer_tx_bus = wtx;
                                     let bus_gen = Arc::clone(&writer_gen);
                                     let tearing_down_bus = Arc::clone(&tearing_down);
+                                    let stop_tx = cmd_tx_worker.clone();
                                     if let Some(bus) = pipe.bus() {
                                         std::thread::spawn(move || {
                                             for msg in bus.iter_timed(gst::ClockTime::NONE) {
                                                 match msg.view() {
                                                     gst::MessageView::Eos(..) => {
+                                                        if rejected.load(Ordering::Acquire) {
+                                                            break;
+                                                        }
                                                         eos_flag.store(true, Ordering::SeqCst);
                                                         writer_tx_bus
                                                             .send(WriterCommand::EndOfTrack {
@@ -2195,11 +2388,17 @@ impl AudioPlayer {
                                                                 .emit(
                                                                     "audio-error",
                                                                     serde_json::json!({
-                                                                        "kind": "playback_error",
+                                                                        "kind": if rejected.load(Ordering::Acquire) { "bit_perfect_unsupported" } else { "playback_error" },
                                                                         "message": err_msg
                                                                     }),
                                                                 )
                                                                 .ok();
+                                                        }
+                                                        if rejected.load(Ordering::Acquire) {
+                                                            let (reply, _) = mpsc::channel();
+                                                            let _ = stop_tx
+                                                                .send(AudioCommand::Stop { reply });
+                                                            break;
                                                         }
                                                         writer_tx_bus
                                                             .send(WriterCommand::EndOfTrack {
@@ -2231,6 +2430,7 @@ impl AudioPlayer {
                             } else {
                                 // ── Normal path (unchanged) ──
                                 // Shut down any lingering ALSA writer from a mode switch
+                                writer_cancel.store(true, Ordering::Release);
                                 if let Some(tx) = writer_tx.take() {
                                     tx.try_send(WriterCommand::Shutdown).ok();
                                 }
@@ -2402,9 +2602,6 @@ impl AudioPlayer {
                                     .link(&concat_sink_0)
                                     .map_err(|e| format!("Failed to link queue→concat: {e}"))?;
 
-                                // Pad probe on audioconvert.sink — captures the codec's raw output
-                                // (pre-conversion). audioconvert.src would show the post-promotion
-                                // format when the downstream capsfilter is locked, which is misleading.
                                 if let Some(sink_pad) = audioconvert.static_pad("sink") {
                                     let cell = Arc::clone(&decoded_cell_thread);
                                     sink_pad.add_probe(
@@ -2786,6 +2983,7 @@ impl AudioPlayer {
                     }
 
                     AudioCommand::Stop { reply } => {
+                        writer_cancel.store(true, Ordering::Release);
                         // 2b-A3 (detach matrix): Stop tears down the whole pipeline,
                         // so the next-bin + current-branch elements die with it. Just
                         // null the gapless slots (no executor detach — moot, and it
@@ -2842,7 +3040,7 @@ impl AudioPlayer {
                             None => {
                                 // Clean up orphaned writer (e.g. pipeline build failed after spawn)
                                 if let Some(tx) = writer_tx.take() {
-                                    let _ = tx.send(WriterCommand::Shutdown);
+                                    let _ = tx.try_send(WriterCommand::Shutdown);
                                 }
                                 if let Some(h) = writer_thread.take() {
                                     h.join().ok();
@@ -3658,26 +3856,72 @@ fn stereo_pad_mix_matrix(out_channels: u32) -> gst::Array {
     gst::Array::new(rows)
 }
 
+type PipelineParts = (gst::Pipeline, Option<gst::Element>, Option<gst::Element>);
+
 #[cfg(target_os = "linux")]
-fn build_appsink_pipeline(
-    uri: &str,
-    // Both decided by the caller: one tier decision serves this arm and the
-    // normal one, so nothing here re-sniffs the URI.
+struct AppSinkConfig<'a> {
+    uri: &'a str,
     is_dash: bool,
     route: crate::proxy::Route,
     exclusive: bool,
     bit_perfect: bool,
     writer_tx: crossbeam_channel::Sender<WriterCommand>,
     writer_gen: Arc<AtomicU64>,
-    // The ALSA writer's negotiated device format. Its channel count drives the
-    // stereo→Nch upmix (mix-matrix) and the capsfilter / appsink channel pin
-    // when the DAC exposes only a fixed channel count (> 2).
-    negotiated_fmt: &PcmFormat,
-    supported_gst_formats: &[&str],
-    supported_rates: &[u32],
+    negotiated_fmt: &'a PcmFormat,
+    supported_gst_formats: &'a [&'a str],
+    supported_rates: &'a [u32],
     decoded_cell: Arc<Mutex<Option<crate::pipeline_probe::PadCaps>>>,
     output_cell: Arc<Mutex<Option<crate::pipeline_probe::PadCaps>>>,
-) -> Result<(gst::Pipeline, Option<gst::Element>, Option<gst::Element>), String> {
+    rejected: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+}
+
+fn send_writer_data(
+    tx: &crossbeam_channel::Sender<WriterCommand>,
+    chunk: AudioChunk,
+    cancelled: &AtomicBool,
+) -> Result<(), gst::FlowError> {
+    let mut command = WriterCommand::Data(chunk);
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(gst::FlowError::Flushing);
+        }
+        match tx.send_timeout(command, std::time::Duration::from_millis(50)) {
+            Ok(()) => return Ok(()),
+            Err(crossbeam_channel::SendTimeoutError::Timeout(pending)) => command = pending,
+            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                return Err(gst::FlowError::Error)
+            }
+        }
+    }
+}
+
+fn reject_bit_perfect(pipe: &gst::Pipeline, rejected: &AtomicBool, cancelled: &AtomicBool) {
+    cancelled.store(true, Ordering::Release);
+    if !rejected.swap(true, Ordering::AcqRel) {
+        gst::element_error!(pipe, gst::StreamError::Format,
+            ("DAC cannot preserve the decoded format, rate or channels. Turn off bit-perfect to use compatible output."));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn build_appsink_pipeline(config: AppSinkConfig<'_>) -> Result<PipelineParts, String> {
+    let AppSinkConfig {
+        uri,
+        is_dash,
+        route,
+        exclusive,
+        bit_perfect,
+        writer_tx,
+        writer_gen,
+        negotiated_fmt,
+        supported_gst_formats,
+        supported_rates,
+        decoded_cell,
+        output_cell,
+        rejected,
+        cancelled,
+    } = config;
     use gst_app::prelude::*;
 
     let pipe = gst::Pipeline::new();
@@ -3770,15 +4014,8 @@ fn build_appsink_pipeline(
         audioconvert.set_property_from_str("dithering", "none");
         audioconvert.set_property_from_str("noise-shaping", "none");
 
-        if is_dash {
-            // DASH: no capsfilter — appsink caps constrain format,
-            // audioconvert passes through rate changes
-            pipe.add_many([&uridecodebin, &audioconvert, appsink.upcast_ref()])
-                .map_err(|e| format!("Failed to add elements: {e}"))?;
-            gst::Element::link_many([&audioconvert, appsink.upcast_ref()])
-                .map_err(|e| format!("Failed to link bit-perfect DASH chain: {e}"))?;
-            (None, None, None)
-        } else {
+        {
+            // Both transports pin formats on every decoded CAPS event.
             // BTS: capsfilter for dynamic locking (preserves exact decoded format)
             let capsfilter = gst::ElementFactory::make("capsfilter")
                 .build()
@@ -3845,18 +4082,56 @@ fn build_appsink_pipeline(
     // format when the downstream capsfilter is locked, which is misleading.
     if let Some(sink_pad) = audioconvert.static_pad("sink") {
         let cell = Arc::clone(&decoded_cell);
+        let filter = capsfilter_weak.clone();
+        let formats: Vec<String> = supported_gst_formats
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let pipe_weak = pipe.downgrade();
+        let rejected = Arc::clone(&rejected);
+        let cancelled = Arc::clone(&cancelled);
+        let promotion_tx = writer_tx.clone();
+        let generation = Arc::clone(&writer_gen);
         sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
             if let Some(gst::PadProbeData::Event(ref event)) = info.data {
                 if let gst::EventView::Caps(caps_event) = event.view() {
-                    let caps = caps_event.caps();
-                    if let Some(fmt) = parse_pcm_format(caps) {
-                        if let Ok(mut guard) = cell.lock() {
-                            *guard = Some(crate::pipeline_probe::PadCaps {
-                                format: fmt.gst_format.clone(),
-                                rate: fmt.sample_rate,
-                                channels: fmt.channels,
-                            });
+                    let format = parse_pcm_format(caps_event.caps());
+                    *cell.lock().unwrap() =
+                        format.as_ref().map(|fmt| crate::pipeline_probe::PadCaps {
+                            format: fmt.gst_format.clone(),
+                            rate: fmt.sample_rate,
+                            channels: fmt.channels,
+                        });
+                    if bit_perfect {
+                        let selected = format.as_ref().and_then(|fmt| {
+                            if !(fmt.channels == device_channels
+                                || (fmt.channels == 2 && device_channels > 2))
+                            {
+                                return None;
+                            }
+                            pick_lossless_format(&fmt.gst_format, &formats)
+                                .map(|chosen| (fmt, chosen))
+                        });
+                        let Some((fmt, chosen)) = selected else {
+                            if let Some(pipe) = pipe_weak.upgrade() {
+                                reject_bit_perfect(&pipe, &rejected, &cancelled);
+                            }
+                            return gst::PadProbeReturn::Drop;
+                        };
+                        if let Some(cf) = filter.as_ref().and_then(|f| f.upgrade()) {
+                            cf.set_property(
+                                "caps",
+                                gst::Caps::builder("audio/x-raw")
+                                    .field("format", chosen.as_str())
+                                    .field("rate", fmt.sample_rate as i32)
+                                    .field("channels", device_channels as i32)
+                                    .build(),
+                            );
                         }
+                        let _ = promotion_tx.try_send(WriterCommand::PendingPromotion {
+                            from: fmt.gst_format.clone(),
+                            generation: generation.load(Ordering::Acquire),
+                        });
                     }
                 }
             }
@@ -3873,9 +4148,6 @@ fn build_appsink_pipeline(
     let supported_rates_for_closure: Vec<u32> = supported_rates.to_vec();
     let resample_tx = writer_tx.clone();
     let is_bit_perfect = bit_perfect;
-    // pad_added runs on the GStreamer streaming thread; clone writer_gen up front
-    // since `writer_gen` itself is moved into the appsink callback later.
-    let pad_gen = Arc::clone(&writer_gen);
     uridecodebin.connect_pad_added(move |_src, src_pad| {
         let Some(convert) = convert_weak.upgrade() else {
             return;
@@ -3921,11 +4193,9 @@ fn build_appsink_pipeline(
             }
         }
 
-        // Format selection: both bit-perfect AND non-bit-perfect prefer the
-        // narrowest lossless option from pick_capsfilter_format. Difference:
-        // bit-perfect also emits PendingPromotion so the writer can fire a
-        // truthful from→to toast; non-bit-perfect just relies on FormatHint.
-        if !is_dash {
+        // Compatibility mode can choose a lossy format or resample to a rate
+        // supported by the DAC. Strict mode locks every decoded CAPS event above.
+        if !is_dash && !is_bit_perfect {
             let caps = src_pad.current_caps().or_else(|| {
                 let query = src_pad.query_caps(None);
                 if query.is_fixed() {
@@ -3952,39 +4222,21 @@ fn build_appsink_pipeline(
                             );
                         }
 
-                        // Bit-perfect: announce source format so the writer
-                        // can emit a truthful promotion toast once negotiation lands.
-                        if is_bit_perfect {
-                            let _ = resample_tx.try_send(WriterCommand::PendingPromotion {
-                                from: format.to_string(),
-                                generation: pad_gen.load(Ordering::Acquire),
-                            });
-                        }
-
                         let chosen = pick_capsfilter_format(format, &supported_fmts_for_closure);
 
                         if let Some(ref cf_weak) = capsfilter_weak {
                             if let Some(cf) = cf_weak.upgrade() {
-                                let locked = if is_bit_perfect {
-                                    // Bit-perfect: single rate (no audioresample work).
-                                    gst::Caps::builder("audio/x-raw")
-                                        .field("format", chosen.as_str())
-                                        .field("rate", rate)
-                                        .field("channels", device_channels as i32)
-                                        .build()
-                                } else {
-                                    // Non-bit-perfect: rate stays a list so audioresample
-                                    // can pick a DAC-supported rate when source rate isn't.
-                                    let rate_list: Vec<i32> = supported_rates_for_closure
-                                        .iter()
-                                        .map(|&r| r as i32)
-                                        .collect();
-                                    gst::Caps::builder("audio/x-raw")
-                                        .field("format", chosen.as_str())
-                                        .field("channels", device_channels as i32)
-                                        .field("rate", gst::List::new(rate_list))
-                                        .build()
-                                };
+                                // Keep a rate list so audioresample can select a
+                                // supported rate when the native one is unavailable.
+                                let rate_list: Vec<i32> = supported_rates_for_closure
+                                    .iter()
+                                    .map(|&r| r as i32)
+                                    .collect();
+                                let locked = gst::Caps::builder("audio/x-raw")
+                                    .field("format", chosen.as_str())
+                                    .field("channels", device_channels as i32)
+                                    .field("rate", gst::List::new(rate_list))
+                                    .build();
                                 log::info!("[audio] capsfilter locked to {locked}");
                                 cf.set_property("caps", &locked);
 
@@ -3993,22 +4245,18 @@ fn build_appsink_pipeline(
                                 // probe will also fire FormatHint when the new caps
                                 // event reaches it; both arrive at the writer's mpsc
                                 // and the writer dedups via the current_fmt comparison.
-                                if !is_bit_perfect {
-                                    let bps: u32 = match chosen.as_str() {
-                                        "S16LE" => 2,
-                                        "S24LE" => 3,
-                                        "S24_32LE" | "S32LE" | "F32LE" => 4,
-                                        _ => 4,
-                                    };
-                                    let hint_fmt = PcmFormat {
-                                        gst_format: chosen.clone(),
-                                        sample_rate: rate as u32,
-                                        channels: device_channels,
-                                        bytes_per_sample: bps,
-                                    };
-                                    let _ =
-                                        resample_tx.try_send(WriterCommand::FormatHint(hint_fmt));
-                                }
+                                let bps: u32 = match chosen.as_str() {
+                                    "S16LE" => 2,
+                                    "S24LE" => 3,
+                                    _ => 4,
+                                };
+                                let hint_fmt = PcmFormat {
+                                    gst_format: chosen.clone(),
+                                    sample_rate: rate as u32,
+                                    channels: device_channels,
+                                    bytes_per_sample: bps,
+                                };
+                                let _ = resample_tx.try_send(WriterCommand::FormatHint(hint_fmt));
                             }
                         }
                     }
@@ -4021,11 +4269,30 @@ fn build_appsink_pipeline(
     let probe_tx = writer_tx.clone();
     if let Some(sink_pad) = appsink.static_pad("sink") {
         let output_cell_for_probe = Arc::clone(&output_cell);
+        let decoded = Arc::clone(&decoded_cell);
+        let rejected = Arc::clone(&rejected);
+        let cancelled = Arc::clone(&cancelled);
+        let pipe_weak = pipe.downgrade();
         sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
             if let Some(gst::PadProbeData::Event(ref event)) = info.data {
                 if let gst::EventView::Caps(caps_event) = event.view() {
-                    let caps = caps_event.caps();
-                    if let Some(fmt) = parse_pcm_format(caps) {
+                    let format = parse_pcm_format(caps_event.caps());
+                    if bit_perfect
+                        && !format.as_ref().is_some_and(|fmt| {
+                            decoded.lock().unwrap().as_ref().is_some_and(|source| {
+                                source.rate == fmt.sample_rate
+                                    && (source.channels == fmt.channels
+                                        || (source.channels == 2 && fmt.channels > 2))
+                                    && sample_format_preserved(&source.format, &fmt.gst_format)
+                            })
+                        })
+                    {
+                        if let Some(pipe) = pipe_weak.upgrade() {
+                            reject_bit_perfect(&pipe, &rejected, &cancelled);
+                        }
+                        return gst::PadProbeReturn::Drop;
+                    }
+                    if let Some(fmt) = format {
                         log::debug!("[audio] CAPS event on appsink: {fmt:?}");
                         if let Ok(mut guard) = output_cell_for_probe.lock() {
                             *guard = Some(crate::pipeline_probe::PadCaps {
@@ -4044,25 +4311,54 @@ fn build_appsink_pipeline(
 
     // Appsink callback: extract PCM and forward to ALSA writer
     let chunk_gen = Arc::clone(&writer_gen);
+    let pipe_weak = pipe.downgrade();
     appsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
                 let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                 let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
-                let caps = sample.caps().ok_or(gst::FlowError::Error)?;
-                let format = parse_pcm_format(caps).ok_or(gst::FlowError::Error)?;
+                let format = sample.caps().and_then(parse_pcm_format).ok_or_else(|| {
+                    if bit_perfect {
+                        if let Some(pipe) = pipe_weak.upgrade() {
+                            reject_bit_perfect(&pipe, &rejected, &cancelled);
+                        }
+                    }
+                    gst::FlowError::Error
+                })?;
+                if bit_perfect
+                    && (rejected.load(Ordering::Acquire)
+                        || !decoded_cell.lock().unwrap().as_ref().is_some_and(|source| {
+                            let decoded = PcmFormat {
+                                gst_format: source.format.clone(),
+                                sample_rate: source.rate,
+                                channels: source.channels,
+                                bytes_per_sample: 0,
+                            };
+                            samples_preserved(&decoded, &format)
+                        }))
+                {
+                    if let Some(pipe) = pipe_weak.upgrade() {
+                        reject_bit_perfect(&pipe, &rejected, &cancelled);
+                    }
+                    return Err(gst::FlowError::Error);
+                }
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(gst::FlowError::Flushing);
+                }
 
                 let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
                 let data = map.as_slice().to_vec();
                 let generation = chunk_gen.load(Ordering::Acquire);
 
-                writer_tx
-                    .send(WriterCommand::Data(AudioChunk {
+                send_writer_data(
+                    &writer_tx,
+                    AudioChunk {
                         data,
                         format,
                         generation,
-                    }))
-                    .map_err(|_| gst::FlowError::Error)?;
+                    },
+                    &cancelled,
+                )?;
 
                 Ok(gst::FlowSuccess::Ok)
             })
@@ -4638,6 +4934,622 @@ mod proxy_source_tests {
                 p.route_for(c).expect("direct is unaffected"),
                 Route::NoProxy
             );
+        }
+    }
+
+    mod reliability_tests {
+        use super::*;
+        use std::collections::VecDeque;
+        use std::time::{Duration, Instant};
+
+        struct FakePcm<'a> {
+            now: Instant,
+            writes: VecDeque<Result<usize, i32>>,
+            written: Vec<u8>,
+            frame_size: usize,
+            resumes: VecDeque<Result<(), i32>>,
+            prepare: Result<(), i32>,
+            prepare_calls: usize,
+            waits: Vec<u32>,
+            sleeps: Vec<u32>,
+            cancel_on_wait: Option<&'a AtomicBool>,
+            cancel_on_sleep: Option<&'a AtomicBool>,
+            unpause_after: Option<(Instant, &'a AtomicBool)>,
+        }
+
+        impl Default for FakePcm<'_> {
+            fn default() -> Self {
+                Self {
+                    now: Instant::now(),
+                    writes: VecDeque::new(),
+                    written: vec![],
+                    frame_size: 2,
+                    resumes: VecDeque::new(),
+                    prepare: Ok(()),
+                    prepare_calls: 0,
+                    waits: vec![],
+                    sleeps: vec![],
+                    cancel_on_wait: None,
+                    cancel_on_sleep: None,
+                    unpause_after: None,
+                }
+            }
+        }
+        impl PcmIo for FakePcm<'_> {
+            fn write(&mut self, bytes: &[u8]) -> Result<usize, i32> {
+                let result = self.writes.pop_front().unwrap_or(Err(libc::EAGAIN));
+                if let Ok(frames) = result {
+                    self.written
+                        .extend_from_slice(&bytes[..frames * self.frame_size]);
+                }
+                result
+            }
+            fn wait(&mut self, millis: u32) -> Result<(), i32> {
+                assert!(millis <= 50);
+                self.waits.push(millis);
+                self.now += Duration::from_millis(millis.into());
+                if let Some(cancelled) = self.cancel_on_wait {
+                    cancelled.store(true, Ordering::Release);
+                }
+                Ok(())
+            }
+            fn resume(&mut self) -> Result<(), i32> {
+                self.resumes.pop_front().unwrap_or(Err(libc::EAGAIN))
+            }
+            fn prepare(&mut self) -> Result<(), i32> {
+                self.prepare_calls += 1;
+                self.prepare
+            }
+            fn now(&self) -> Instant {
+                self.now
+            }
+            fn sleep(&mut self, millis: u32) {
+                self.sleeps.push(millis);
+                self.now += Duration::from_millis(millis.into());
+                if let Some(cancelled) = self.cancel_on_sleep {
+                    cancelled.store(true, Ordering::Release);
+                }
+                if let Some((deadline, paused)) = self.unpause_after {
+                    if self.now >= deadline {
+                        paused.store(false, Ordering::Release);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn partial_writes_and_eagain_preserve_every_frame_once() {
+            let mut io = FakePcm {
+                writes: [Ok(1), Err(libc::EAGAIN), Ok(0), Ok(2)].into(),
+                ..Default::default()
+            };
+            let frames = AtomicU64::new(0);
+            let data = [1, 2, 3, 4, 5, 6];
+            assert_eq!(
+                write_pcm(
+                    &mut io,
+                    &data,
+                    2,
+                    &AtomicBool::new(false),
+                    &AtomicBool::new(false),
+                    &frames
+                ),
+                Ok(())
+            );
+            assert_eq!(io.written, data);
+            assert_eq!(frames.load(Ordering::Relaxed), 3);
+            assert_eq!(io.waits, [50, 50]);
+        }
+
+        #[test]
+        fn no_progress_times_out_but_user_pause_does_not() {
+            let cancelled = AtomicBool::new(false);
+            let paused = AtomicBool::new(false);
+            let frames = AtomicU64::new(0);
+            let mut stalled = FakePcm::default();
+            let start = stalled.now;
+            assert_eq!(
+                write_pcm(&mut stalled, &[1, 2], 2, &cancelled, &paused, &frames),
+                Err("write_timeout")
+            );
+            assert_eq!(stalled.now.duration_since(start), Duration::from_secs(2));
+
+            paused.store(true, Ordering::Release);
+            let mut paused_io = FakePcm {
+                writes: [Ok(1)].into(),
+                ..Default::default()
+            };
+            paused_io.unpause_after = Some((paused_io.now + Duration::from_secs(8), &paused));
+            assert_eq!(
+                write_pcm(&mut paused_io, &[1, 2], 2, &cancelled, &paused, &frames),
+                Ok(())
+            );
+            assert_eq!(paused_io.written, [1, 2]);
+        }
+
+        #[test]
+        fn cancellation_interrupts_wait_and_suspend_recovery_without_an_audio_error() {
+            let cancelled = AtomicBool::new(false);
+            let mut waiting = FakePcm {
+                cancel_on_wait: Some(&cancelled),
+                ..Default::default()
+            };
+            assert_eq!(
+                write_pcm(
+                    &mut waiting,
+                    &[1, 2],
+                    2,
+                    &cancelled,
+                    &AtomicBool::new(false),
+                    &AtomicU64::new(0)
+                ),
+                Err("cancelled")
+            );
+            assert_eq!(waiting.waits, [50]);
+            cancelled.store(false, Ordering::Release);
+            let mut suspended = FakePcm {
+                cancel_on_sleep: Some(&cancelled),
+                ..Default::default()
+            };
+            assert_eq!(
+                recover_pcm(&mut suspended, libc::ESTRPIPE, &cancelled),
+                Err("cancelled")
+            );
+            assert_eq!(suspended.sleeps, [20]);
+        }
+
+        #[test]
+        fn recovery_reports_prepare_failure_and_bounds_suspend_retries() {
+            let cancelled = AtomicBool::new(false);
+            let mut failed = FakePcm {
+                prepare: Err(libc::ENODEV),
+                ..Default::default()
+            };
+            assert_eq!(
+                recover_pcm(&mut failed, libc::EPIPE, &cancelled),
+                Err("device_disconnected")
+            );
+            assert_eq!(failed.prepare_calls, 1);
+            let mut suspended = FakePcm::default();
+            let start = suspended.now;
+            assert_eq!(
+                recover_pcm(&mut suspended, libc::ESTRPIPE, &cancelled),
+                Err("suspend_timeout")
+            );
+            assert_eq!(suspended.now.duration_since(start), Duration::from_secs(2));
+            assert!(suspended.sleeps.iter().all(|&ms| ms == 20));
+            let mut recovered = FakePcm {
+                resumes: [Err(libc::EAGAIN), Ok(())].into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                recover_pcm(&mut recovered, libc::ESTRPIPE, &cancelled),
+                Ok(())
+            );
+            assert_eq!(recovered.prepare_calls, 0);
+        }
+
+        #[test]
+        fn progress_resets_deadline_and_recovery_does_not_discard_pending_frames() {
+            let mut writes = VecDeque::new();
+            writes.extend(std::iter::repeat_n(Err(libc::EAGAIN), 30));
+            writes.push_back(Ok(1));
+            writes.push_back(Err(libc::EPIPE));
+            writes.extend(std::iter::repeat_n(Err(libc::EAGAIN), 30));
+            writes.push_back(Ok(1));
+            let mut io = FakePcm {
+                writes,
+                ..Default::default()
+            };
+            let start = io.now;
+            assert_eq!(
+                write_pcm(
+                    &mut io,
+                    &[1, 2, 3, 4],
+                    2,
+                    &AtomicBool::new(false),
+                    &AtomicBool::new(false),
+                    &AtomicU64::new(0)
+                ),
+                Ok(())
+            );
+            assert_eq!(io.now.duration_since(start), Duration::from_secs(3));
+            assert_eq!(io.written, [1, 2, 3, 4]);
+            assert_eq!(io.prepare_calls, 1);
+        }
+
+        fn devices(name: &str) -> Vec<AudioDevice> {
+            vec![AudioDevice {
+                id: "hw:0".into(),
+                name: name.into(),
+            }]
+        }
+
+        #[test]
+        fn device_cache_expires_refreshes_and_retries_failed_probes() {
+            let cache = AudioDeviceCache::default();
+            assert_eq!(
+                cache.probe(false, || Ok(devices("first"))).unwrap()[0].name,
+                "first"
+            );
+            assert_eq!(
+                cache.probe(false, || panic!("cached")).unwrap()[0].name,
+                "first"
+            );
+            assert_eq!(
+                cache.probe(true, || Ok(devices("refreshed"))).unwrap()[0].name,
+                "refreshed"
+            );
+            cache.result.lock().unwrap().as_mut().unwrap().0 =
+                Instant::now() - Duration::from_secs(31);
+            assert_eq!(
+                cache.probe(false, || Ok(devices("expired"))).unwrap()[0].name,
+                "expired"
+            );
+            assert_eq!(
+                cache.probe(true, || Err("unavailable".into())).unwrap_err(),
+                "unavailable"
+            );
+            assert_eq!(
+                cache.probe(false, || Ok(devices("recovered"))).unwrap()[0].name,
+                "recovered"
+            );
+        }
+
+        #[test]
+        fn concurrent_refresh_joins_success_and_error_from_the_in_flight_probe() {
+            for result in [Ok(devices("shared")), Err("probe failed".to_string())] {
+                let cache = Arc::new(AudioDeviceCache::default());
+                let waiter_started = Instant::now();
+                let (entered_tx, entered_rx) = mpsc::channel();
+                let (finish_tx, finish_rx) = mpsc::channel();
+                let first = {
+                    let cache = Arc::clone(&cache);
+                    std::thread::spawn(move || {
+                        cache.probe(true, || {
+                            entered_tx.send(()).unwrap();
+                            finish_rx.recv().unwrap();
+                            result
+                        })
+                    })
+                };
+                entered_rx.recv().unwrap();
+                let waiter = {
+                    let cache = Arc::clone(&cache);
+                    std::thread::spawn(move || {
+                        cache.probe_started(waiter_started, true, || panic!("duplicate probe"))
+                    })
+                };
+                finish_tx.send(()).unwrap();
+                let original = first.join().unwrap();
+                let joined = waiter.join().unwrap();
+                assert_eq!(
+                    original.as_ref().map(|v| &v[0].name),
+                    joined.as_ref().map(|v| &v[0].name)
+                );
+            }
+        }
+
+        fn pcm(format: &str, rate: u32, channels: u32) -> PcmFormat {
+            PcmFormat {
+                gst_format: format.into(),
+                sample_rate: rate,
+                channels,
+                bytes_per_sample: match format {
+                    "S16LE" => 2,
+                    "S24LE" => 3,
+                    _ => 4,
+                },
+            }
+        }
+
+        #[test]
+        fn strict_format_matrix_distinguishes_integer_depth_float_and_channel_loss() {
+            for from in ["S16LE", "S24LE", "S24_32LE", "S32LE", "F32LE", "unknown"] {
+                for to in ["S16LE", "S24LE", "S24_32LE", "S32LE", "F32LE", "unknown"] {
+                    let expected = match (integer_depth(from), integer_depth(to)) {
+                        (Some(f), Some(t)) => t >= f,
+                        _ => from == "F32LE" && to == from,
+                    };
+                    assert_eq!(
+                        samples_preserved(&pcm(from, 44100, 2), &pcm(to, 44100, 2)),
+                        expected,
+                        "{from} -> {to}"
+                    );
+                }
+            }
+            assert!(!samples_preserved(
+                &pcm("S16LE", 44100, 2),
+                &pcm("S32LE", 48000, 2)
+            ));
+            assert!(!samples_preserved(
+                &pcm("S16LE", 44100, 6),
+                &pcm("S32LE", 44100, 2)
+            ));
+        }
+
+        #[test]
+        fn blocked_appsink_send_is_cancelled_without_waiting_for_the_writer() {
+            let (tx, _rx) = crossbeam_channel::bounded(1);
+            tx.send(WriterCommand::Flush).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let worker_cancel = Arc::clone(&cancelled);
+            let (started, ready) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                send_writer_data(
+                    &tx,
+                    AudioChunk {
+                        data: vec![0; 4],
+                        format: pcm("S16LE", 44100, 2),
+                        generation: 1,
+                    },
+                    &worker_cancel,
+                )
+            });
+            ready.recv().unwrap();
+            cancelled.store(true, Ordering::Release);
+            assert_eq!(worker.join().unwrap(), Err(gst::FlowError::Flushing));
+        }
+
+        #[cfg(target_os = "linux")]
+        struct GuardPipeline {
+            pipeline: gst::Pipeline,
+            source: gst_app::AppSrc,
+            rx: crossbeam_channel::Receiver<WriterCommand>,
+            rejected: Arc<AtomicBool>,
+            cancelled: Arc<AtomicBool>,
+        }
+
+        #[cfg(target_os = "linux")]
+        impl GuardPipeline {
+            fn new(is_dash: bool, formats: &[&str], channels: u32) -> Self {
+                gst::init().unwrap();
+                let (tx, rx) = crossbeam_channel::bounded(32);
+                let rejected = Arc::new(AtomicBool::new(false));
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let output = pcm(formats[0], 44100, channels);
+                let (pipeline, _, _) = build_appsink_pipeline(AppSinkConfig {
+                    uri: "file:///unused-in-synthetic-pcm-test",
+                    is_dash,
+                    route: crate::proxy::Route::NoProxy,
+                    exclusive: true,
+                    bit_perfect: true,
+                    writer_tx: tx,
+                    writer_gen: Arc::new(AtomicU64::new(1)),
+                    negotiated_fmt: &output,
+                    supported_gst_formats: formats,
+                    supported_rates: &[44100, 48000],
+                    decoded_cell: Arc::new(Mutex::new(None)),
+                    output_cell: Arc::new(Mutex::new(None)),
+                    rejected: Arc::clone(&rejected),
+                    cancelled: Arc::clone(&cancelled),
+                })
+                .unwrap();
+                // Inject decoded PCM into the real production chain. This exercises
+                // its decoder probe, format locking, appsink probe and buffer gate.
+                let decoder = pipeline
+                    .children()
+                    .into_iter()
+                    .find(|e| e.factory().is_some_and(|f| f.name() == "uridecodebin"))
+                    .unwrap();
+                pipeline.remove(&decoder).unwrap();
+                let convert = pipeline
+                    .children()
+                    .into_iter()
+                    .find(|e| e.factory().is_some_and(|f| f.name() == "audioconvert"))
+                    .unwrap();
+                let source = gst_app::AppSrc::builder().format(gst::Format::Time).build();
+                pipeline.add(&source).unwrap();
+                source.link(&convert).unwrap();
+                pipeline.set_state(gst::State::Playing).unwrap();
+                Self {
+                    pipeline,
+                    source,
+                    rx,
+                    rejected,
+                    cancelled,
+                }
+            }
+            fn push(&self, format: &str, rate: i32, channels: i32, bytes: Vec<u8>) {
+                self.source.set_caps(Some(
+                    &gst::Caps::builder("audio/x-raw")
+                        .field("format", format)
+                        .field("rate", rate)
+                        .field("channels", channels)
+                        .field("layout", "interleaved")
+                        .build(),
+                ));
+                let _ = self.source.push_buffer(gst::Buffer::from_mut_slice(bytes));
+            }
+            fn chunk(&self) -> AudioChunk {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    match self
+                        .rx
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    {
+                        Ok(WriterCommand::Data(chunk)) => return chunk,
+                        Ok(_) => {}
+                        Err(e) => panic!(
+                            "No valid PCM: {e}; rejected={}",
+                            self.rejected.load(Ordering::Acquire)
+                        ),
+                    }
+                }
+            }
+            fn assert_rejected(&self) {
+                let bus = self.pipeline.bus().unwrap();
+                let message = bus
+                    .timed_pop_filtered(gst::ClockTime::from_seconds(3), &[gst::MessageType::Error])
+                    .expect("actionable format error");
+                let gst::MessageView::Error(error) = message.view() else {
+                    unreachable!()
+                };
+                assert!(error.error().to_string().contains("bit-perfect"));
+                assert!(self.rejected.load(Ordering::Acquire));
+                assert!(self.cancelled.load(Ordering::Acquire));
+                assert!(!self
+                    .rx
+                    .try_iter()
+                    .any(|cmd| matches!(cmd, WriterCommand::Data(_))));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        impl Drop for GuardPipeline {
+            fn drop(&mut self) {
+                self.cancelled.store(true, Ordering::Release);
+                self.pipeline.set_state(gst::State::Null).unwrap();
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn real_gstreamer_preserves_integer_samples_for_both_transports_and_silent_channels() {
+            for is_dash in [false, true] {
+                for output_channels in [2, 4] {
+                    let chain = GuardPipeline::new(is_dash, &["S32LE"], output_channels);
+                    let source = [i16::MIN, -1, 1, i16::MAX];
+                    chain.push(
+                        "S16LE",
+                        44100,
+                        2,
+                        source.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                    );
+                    let chunk = chain.chunk();
+                    assert_eq!(chunk.format, pcm("S32LE", 44100, output_channels));
+                    let actual: Vec<i32> = chunk
+                        .data
+                        .chunks_exact(4)
+                        .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+                        .collect();
+                    let expected: Vec<i32> = source
+                        .chunks_exact(2)
+                        .flat_map(|frame| {
+                            let mut samples =
+                                vec![(frame[0] as i32) << 16, (frame[1] as i32) << 16];
+                            samples.resize(output_channels as usize, 0);
+                            samples
+                        })
+                        .collect();
+                    assert_eq!(
+                        actual, expected,
+                        "dash={is_dash}, channels={output_channels}"
+                    );
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn real_gstreamer_preserves_24_bit_repacking_and_identical_float_bits() {
+            let samples = [-8_388_608i32, -1, 1, 8_388_607];
+            let packed: Vec<u8> = samples
+                .iter()
+                .flat_map(|v| v.to_le_bytes()[..3].to_vec())
+                .collect();
+            let unpacked: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let widened: Vec<u8> = samples
+                .iter()
+                .flat_map(|v| (v << 8).to_le_bytes())
+                .collect();
+            let floats: Vec<u8> = [0x8000_0000u32, 0, 0x3f00_0000, 0xbf80_0000]
+                .iter()
+                .flat_map(|bits| bits.to_le_bytes())
+                .collect();
+            for is_dash in [false, true] {
+                for (source, target, input, expected) in [
+                    ("S24LE", "S24_32LE", &packed, &unpacked),
+                    ("S24_32LE", "S24LE", &unpacked, &packed),
+                    ("S24_32LE", "S32LE", &unpacked, &widened),
+                    ("F32LE", "F32LE", &floats, &floats),
+                ] {
+                    let chain = GuardPipeline::new(is_dash, &[target], 2);
+                    chain.push(source, 44100, 2, input.clone());
+                    let chunk = chain.chunk();
+                    assert_eq!(chunk.format, pcm(target, 44100, 2));
+                    assert_eq!(
+                        &chunk.data, expected,
+                        "{source} -> {target}, dash={is_dash}"
+                    );
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn real_gstreamer_rejects_narrowing_and_float_conversion_before_any_writer_buffer() {
+            for is_dash in [false, true] {
+                for (source, target) in [("S32LE", "S16LE"), ("F32LE", "S32LE"), ("S24LE", "F32LE")]
+                {
+                    let chain = GuardPipeline::new(is_dash, &[target], 2);
+                    chain.push(
+                        source,
+                        44100,
+                        2,
+                        vec![0; if source == "S24LE" { 6 } else { 8 }],
+                    );
+                    chain.assert_rejected();
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn real_gstreamer_revalidates_renegotiation_and_output_rate_at_caps_boundary() {
+            for is_dash in [false, true] {
+                let chain = GuardPipeline::new(is_dash, &["S16LE"], 2);
+                chain.push("S16LE", 44100, 2, vec![0; 4]);
+                chain.chunk();
+                chain.push("S32LE", 44100, 2, vec![0; 8]);
+                chain.assert_rejected();
+
+                let chain = GuardPipeline::new(is_dash, &["S16LE"], 2);
+                chain.push("S16LE", 44100, 2, vec![0; 4]);
+                chain.chunk();
+                let sink = chain
+                    .pipeline
+                    .children()
+                    .into_iter()
+                    .find(|e| e.is::<gst_app::AppSink>())
+                    .unwrap();
+                sink.static_pad("sink")
+                    .unwrap()
+                    .send_event(gst::event::Caps::new(
+                        &gst::Caps::builder("audio/x-raw")
+                            .field("format", "S16LE")
+                            .field("rate", 48000i32)
+                            .field("channels", 2i32)
+                            .field("layout", "interleaved")
+                            .build(),
+                    ));
+                chain.assert_rejected();
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn real_gstreamer_rejects_incomplete_output_caps_before_writer_buffers() {
+            for is_dash in [false, true] {
+                let chain = GuardPipeline::new(is_dash, &["S16LE"], 2);
+                chain.push("S16LE", 44100, 2, vec![0; 4]);
+                chain.chunk();
+                let sink = chain
+                    .pipeline
+                    .children()
+                    .into_iter()
+                    .find(|e| e.is::<gst_app::AppSink>())
+                    .unwrap();
+                sink.static_pad("sink")
+                    .unwrap()
+                    .send_event(gst::event::Caps::new(
+                        &gst::Caps::builder("audio/x-raw")
+                            .field("format", "S16LE")
+                            .field("layout", "interleaved")
+                            .build(),
+                    ));
+                chain.assert_rejected();
+            }
         }
     }
 }
