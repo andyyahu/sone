@@ -135,13 +135,13 @@ pub async fn connect_listenbrainz(
         .await;
 
     // Save credentials to settings
-    if let Some(mut settings) = state.load_settings() {
+    state.update_settings(|settings| {
         settings.scrobble.listenbrainz = Some(ListenBrainzCredentials {
             token,
             username: username.clone(),
         });
-        state.save_settings(&settings)?;
-    }
+        Ok(())
+    })?;
 
     Ok(username)
 }
@@ -152,7 +152,7 @@ pub async fn disconnect_provider(
     provider: String,
 ) -> Result<(), SoneError> {
     // Clear credentials from settings
-    if let Some(mut settings) = state.load_settings() {
+    state.update_settings(|settings| {
         match provider.as_str() {
             "lastfm" => settings.scrobble.lastfm = None,
             "listenbrainz" => settings.scrobble.listenbrainz = None,
@@ -161,8 +161,8 @@ pub async fn disconnect_provider(
                 return Err(SoneError::Scrobble(format!("unknown provider: {provider}")));
             }
         }
-        state.save_settings(&settings)?;
-    }
+        Ok(())
+    })?;
 
     state.scrobble_manager.remove_provider(&provider).await;
     Ok(())
@@ -267,7 +267,7 @@ pub async fn complete_audioscrobbler_auth(
         .await;
 
     // Save credentials
-    if let Some(mut settings) = state.load_settings() {
+    state.update_settings(|settings| {
         let creds = LastfmCredentials {
             session_key,
             username: username.clone(),
@@ -277,8 +277,8 @@ pub async fn complete_audioscrobbler_auth(
             "librefm" => settings.scrobble.librefm = Some(creds),
             _ => {}
         }
-        state.save_settings(&settings)?;
-    }
+        Ok(())
+    })?;
 
     // Register provider with the scrobble manager
     state

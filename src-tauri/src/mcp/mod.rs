@@ -20,15 +20,29 @@ pub(crate) async fn ensure_mcp_started(app: &tauri::AppHandle) {
         return;
     }
 
-    let mut settings = state.load_settings().unwrap_or_default();
+    let mut settings = match state.settings_store.snapshot() {
+        Ok(settings) => settings,
+        Err(error) => {
+            log::warn!("MCP settings could not be loaded: {error}");
+            return;
+        }
+    };
     if !settings.mcp_enabled {
         log::info!("MCP server disabled in settings");
         return;
     }
     if settings.mcp_token.is_empty() {
-        settings.mcp_token = uuid::Uuid::new_v4().simple().to_string();
-        if let Err(e) = state.save_settings(&settings) {
-            log::warn!("Failed to persist MCP token: {e}");
+        match state.update_settings(|current| {
+            if current.mcp_token.is_empty() {
+                current.mcp_token = uuid::Uuid::new_v4().simple().to_string();
+            }
+            Ok(current.clone())
+        }) {
+            Ok(current) => settings = current,
+            Err(error) => {
+                log::warn!("Failed to persist MCP token: {error}");
+                return;
+            }
         }
     }
 

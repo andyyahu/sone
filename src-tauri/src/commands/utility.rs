@@ -115,12 +115,21 @@ pub fn set_decorations(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), SoneError> {
-    state.decorations.store(enabled, Ordering::Relaxed);
-    window.set_decorations(enabled).map_err(SoneError::from)?;
-    let mut settings = state.load_settings().unwrap_or_default();
-    settings.decorations = enabled;
-    state.save_settings(&settings)?;
-    Ok(())
+    state.settings_store.update_with_apply(
+        |settings| {
+            settings.decorations = enabled;
+            Ok(())
+        },
+        |settings| {
+            window
+                .set_decorations(settings.decorations)
+                .map_err(SoneError::from)?;
+            state
+                .decorations
+                .store(settings.decorations, Ordering::Relaxed);
+            Ok(())
+        },
+    )
 }
 
 #[tauri::command]
@@ -130,11 +139,18 @@ pub fn get_minimize_to_tray(state: State<'_, AppState>) -> bool {
 
 #[tauri::command]
 pub fn set_minimize_to_tray(state: State<'_, AppState>, enabled: bool) -> Result<(), SoneError> {
-    state.minimize_to_tray.store(enabled, Ordering::Relaxed);
-    let mut settings = state.load_settings().unwrap_or_default();
-    settings.minimize_to_tray = enabled;
-    state.save_settings(&settings)?;
-    Ok(())
+    state.settings_store.update_with_apply(
+        |settings| {
+            settings.minimize_to_tray = enabled;
+            Ok(())
+        },
+        |settings| {
+            state
+                .minimize_to_tray
+                .store(settings.minimize_to_tray, Ordering::Relaxed);
+            Ok(())
+        },
+    )
 }
 
 #[tauri::command]
@@ -147,26 +163,52 @@ pub fn set_volume_normalization(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), SoneError> {
-    state.volume_normalization.store(enabled, Ordering::Relaxed);
+    state.settings_store.update_with_apply(
+        |settings| {
+            settings.volume_normalization = enabled;
+            Ok(())
+        },
+        |settings| {
+            let enabled = settings.volume_normalization;
+            let norm_gain = if enabled {
+                let rg = f64::from_bits(state.last_replay_gain.load(Ordering::Relaxed));
+                let peak = f64::from_bits(state.last_peak_amplitude.load(Ordering::Relaxed));
+                compute_norm_gain(
+                    rg.is_finite().then_some(rg),
+                    peak.is_finite().then_some(peak),
+                )
+            } else {
+                1.0
+            };
+            state
+                .audio_player
+                .set_normalization_gain(norm_gain)
+                .map_err(SoneError::Audio)?;
+            state.volume_normalization.store(enabled, Ordering::Relaxed);
+            state.signal_path.set_normalization_enabled(enabled);
+            Ok(())
+        },
+    )
+}
 
-    // Immediately apply/reset normalization on the current track
-    let norm_gain = if enabled {
-        let rg = f64::from_bits(state.last_replay_gain.load(Ordering::Relaxed));
-        let peak = f64::from_bits(state.last_peak_amplitude.load(Ordering::Relaxed));
-        let rg_opt = if rg.is_finite() { Some(rg) } else { None };
-        let peak_opt = if peak.is_finite() { Some(peak) } else { None };
-        compute_norm_gain(rg_opt, peak_opt)
-    } else {
-        1.0
-    };
+// Apply the complete output choice so a failed commit can restore it, including
+// the coupling between exclusive mode, bit-perfect and the selected device.
+fn apply_output_settings(state: &AppState, settings: &crate::Settings) -> Result<(), SoneError> {
     state
         .audio_player
-        .set_normalization_gain(norm_gain)
+        .set_exclusive_mode(settings.exclusive_mode, settings.exclusive_device.clone())
         .map_err(SoneError::Audio)?;
-    state.signal_path.set_normalization_enabled(enabled);
-    let mut settings = state.load_settings().unwrap_or_default();
-    settings.volume_normalization = enabled;
-    state.save_settings(&settings)?;
+    state
+        .audio_player
+        .set_bit_perfect(settings.bit_perfect)
+        .map_err(SoneError::Audio)?;
+    state
+        .exclusive_mode
+        .store(settings.exclusive_mode, Ordering::Relaxed);
+    state
+        .bit_perfect
+        .store(settings.bit_perfect, Ordering::Relaxed);
+    *state.exclusive_device.lock().unwrap() = settings.exclusive_device.clone();
     Ok(())
 }
 
@@ -177,29 +219,16 @@ pub fn get_exclusive_mode(state: State<'_, AppState>) -> bool {
 
 #[tauri::command]
 pub fn set_exclusive_mode(state: State<'_, AppState>, enabled: bool) -> Result<(), SoneError> {
-    state.exclusive_mode.store(enabled, Ordering::Relaxed);
-
-    if !enabled {
-        state.bit_perfect.store(false, Ordering::Relaxed);
-        state
-            .audio_player
-            .set_bit_perfect(false)
-            .map_err(SoneError::Audio)?;
-    }
-
-    let device = state.exclusive_device.lock().unwrap().clone();
-    state
-        .audio_player
-        .set_exclusive_mode(enabled, device)
-        .map_err(SoneError::Audio)?;
-
-    let mut settings = state.load_settings().unwrap_or_default();
-    settings.exclusive_mode = enabled;
-    if !enabled {
-        settings.bit_perfect = false;
-    }
-    state.save_settings(&settings)?;
-    Ok(())
+    state.settings_store.update_with_apply(
+        |settings| {
+            settings.exclusive_mode = enabled;
+            if !enabled {
+                settings.bit_perfect = false;
+            }
+            Ok(())
+        },
+        |settings| apply_output_settings(&state, settings),
+    )
 }
 
 #[tauri::command]
@@ -209,29 +238,16 @@ pub fn get_bit_perfect(state: State<'_, AppState>) -> bool {
 
 #[tauri::command]
 pub fn set_bit_perfect(state: State<'_, AppState>, enabled: bool) -> Result<(), SoneError> {
-    state.bit_perfect.store(enabled, Ordering::Relaxed);
-
-    if enabled && !state.exclusive_mode.load(Ordering::Relaxed) {
-        state.exclusive_mode.store(true, Ordering::Relaxed);
-        let device = state.exclusive_device.lock().unwrap().clone();
-        state
-            .audio_player
-            .set_exclusive_mode(true, device)
-            .map_err(SoneError::Audio)?;
-    }
-
-    state
-        .audio_player
-        .set_bit_perfect(enabled)
-        .map_err(SoneError::Audio)?;
-
-    let mut settings = state.load_settings().unwrap_or_default();
-    settings.bit_perfect = enabled;
-    if enabled {
-        settings.exclusive_mode = true;
-    }
-    state.save_settings(&settings)?;
-    Ok(())
+    state.settings_store.update_with_apply(
+        |settings| {
+            settings.bit_perfect = enabled;
+            if enabled {
+                settings.exclusive_mode = true;
+            }
+            Ok(())
+        },
+        |settings| apply_output_settings(&state, settings),
+    )
 }
 
 #[tauri::command]
@@ -246,15 +262,20 @@ pub fn get_gapless_supported() -> bool {
 
 #[tauri::command]
 pub fn set_gapless(state: State<'_, AppState>, enabled: bool) -> Result<(), SoneError> {
-    state.gapless.store(enabled, Ordering::Relaxed);
-    state
-        .audio_player
-        .set_gapless(enabled)
-        .map_err(SoneError::Audio)?;
-    let mut settings = state.load_settings().unwrap_or_default();
-    settings.gapless = enabled;
-    state.save_settings(&settings)?;
-    Ok(())
+    state.settings_store.update_with_apply(
+        |settings| {
+            settings.gapless = enabled;
+            Ok(())
+        },
+        |settings| {
+            state
+                .audio_player
+                .set_gapless(settings.gapless)
+                .map_err(SoneError::Audio)?;
+            state.gapless.store(settings.gapless, Ordering::Relaxed);
+            Ok(())
+        },
+    )
 }
 
 #[tauri::command]
@@ -267,11 +288,16 @@ pub fn set_max_quality(state: State<'_, AppState>, quality: String) -> Result<()
     if !matches!(quality.as_str(), "HI_RES_LOSSLESS" | "LOSSLESS" | "HIGH") {
         return Err(SoneError::Parse(format!("invalid max_quality: {quality}")));
     }
-    *state.max_quality.lock().unwrap() = quality.clone();
-    let mut settings = state.load_settings().unwrap_or_default();
-    settings.max_quality = quality;
-    state.save_settings(&settings)?;
-    Ok(())
+    state.settings_store.update_with_apply(
+        |settings| {
+            settings.max_quality = quality;
+            Ok(())
+        },
+        |settings| {
+            *state.max_quality.lock().unwrap() = settings.max_quality.clone();
+            Ok(())
+        },
+    )
 }
 
 #[tauri::command]
@@ -281,17 +307,13 @@ pub fn get_exclusive_device(state: State<'_, AppState>) -> Option<String> {
 
 #[tauri::command]
 pub fn set_exclusive_device(state: State<'_, AppState>, device: String) -> Result<(), SoneError> {
-    *state.exclusive_device.lock().unwrap() = Some(device.clone());
-
-    let enabled = state.exclusive_mode.load(Ordering::Relaxed);
-    state
-        .audio_player
-        .set_exclusive_mode(enabled, Some(device.clone()))
-        .map_err(SoneError::Audio)?;
-    let mut settings = state.load_settings().unwrap_or_default();
-    settings.exclusive_device = Some(device);
-    state.save_settings(&settings)?;
-    Ok(())
+    state.settings_store.update_with_apply(
+        |settings| {
+            settings.exclusive_device = Some(device);
+            Ok(())
+        },
+        |settings| apply_output_settings(&state, settings),
+    )
 }
 
 #[tauri::command]
@@ -318,17 +340,20 @@ pub fn get_discord_rpc(state: State<'_, AppState>) -> bool {
 
 #[tauri::command]
 pub fn set_discord_rpc(state: State<'_, AppState>, enabled: bool) -> Result<(), SoneError> {
-    if enabled {
-        state.discord.send(crate::discord::DiscordCommand::Connect);
-    } else {
-        state
-            .discord
-            .send(crate::discord::DiscordCommand::Disconnect);
-    }
-    let mut settings = state.load_settings().unwrap_or_default();
-    settings.discord_rpc = enabled;
-    state.save_settings(&settings)?;
-    Ok(())
+    state.settings_store.update_with_apply(
+        |settings| {
+            settings.discord_rpc = enabled;
+            Ok(())
+        },
+        |settings| {
+            state.discord.send(if settings.discord_rpc {
+                crate::discord::DiscordCommand::Connect
+            } else {
+                crate::discord::DiscordCommand::Disconnect
+            });
+            Ok(())
+        },
+    )
 }
 
 #[tauri::command]
@@ -344,9 +369,10 @@ pub async fn set_report_plays(state: State<'_, AppState>, enabled: bool) -> Resu
     // Persist first: if the write fails the caller sees an error and the
     // in-memory state still matches disk. Reversing this order can silently
     // discard a user's opt-out.
-    let mut settings = state.load_settings().unwrap_or_default();
-    settings.report_plays = enabled;
-    state.save_settings(&settings)?;
+    state.update_settings(|settings| {
+        settings.report_plays = enabled;
+        Ok(())
+    })?;
 
     state.tidal_reporter.set_enabled(enabled);
     if enabled {
@@ -371,14 +397,20 @@ pub fn get_discord_status_text(state: State<'_, AppState>) -> String {
 
 #[tauri::command]
 pub fn set_discord_status_text(state: State<'_, AppState>, text: String) -> Result<(), SoneError> {
-    state
-        .discord
-        .send(crate::discord::DiscordCommand::SetStatusText { text: text.clone() });
-
-    let mut settings = state.load_settings().unwrap_or_default();
-    settings.discord_status_text = text;
-    state.save_settings(&settings)?;
-    Ok(())
+    state.settings_store.update_with_apply(
+        |settings| {
+            settings.discord_status_text = text;
+            Ok(())
+        },
+        |settings| {
+            state
+                .discord
+                .send(crate::discord::DiscordCommand::SetStatusText {
+                    text: settings.discord_status_text.clone(),
+                });
+            Ok(())
+        },
+    )
 }
 
 #[tauri::command]
@@ -559,9 +591,10 @@ pub async fn set_proxy_settings(
     let outcome = persist_then_reconfigure(
         &settings,
         |s| {
-            let mut app_settings = state.load_settings().unwrap_or_default();
-            app_settings.proxy = s.clone();
-            state.save_settings(&app_settings)?;
+            state.update_settings(|app_settings| {
+                app_settings.proxy = s.clone();
+                Ok(())
+            })?;
 
             // Mirror the two non-secret fields next to the encrypted file so
             // the next launch can decide whether to scrub the proxy

@@ -21,6 +21,7 @@ pub mod proxy;
 mod proxy_http;
 mod rate_gate;
 mod scrobble;
+mod settings_store;
 mod signal_path;
 mod theme_config;
 mod tidal_api;
@@ -36,7 +37,7 @@ use cache::DiskCache;
 use crypto::Crypto;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -256,6 +257,7 @@ pub struct AppState {
     /// to restart. Read it through `host_caps()`.
     pub host_caps: std::sync::Mutex<crate::proxy::HostCaps>,
     pub settings_path: PathBuf,
+    pub settings_store: Arc<settings_store::SettingsStore>,
     pub cache_dir: PathBuf,
     pub disk_cache: DiskCache,
     pub crypto: Arc<Crypto>,
@@ -284,6 +286,7 @@ pub struct AppState {
     pub mcp_handle: Mutex<Option<crate::mcp::McpHandle>>,
     pub overlay_state: crate::overlay::OverlayStateRef,
     pub overlay_handle: Mutex<Option<crate::overlay::OverlayHandle>>,
+    pub overlay_settings_lock: Mutex<()>,
     pub signal_path: Arc<SignalPathTracker>,
 }
 
@@ -303,29 +306,6 @@ pub fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-/// Write refreshed tokens back into the stored settings. Called from every
-/// refresh, including the automatic one after a 401 — without it the stored
-/// access token stays stale and each launch burns a 401 before the first
-/// request succeeds.
-fn persist_auth_tokens(path: &Path, crypto: &Crypto, tokens: &AuthTokens) {
-    let mut settings = fs::read(path)
-        .ok()
-        .and_then(|data| crypto.decrypt(&data).ok())
-        .and_then(|plain| serde_json::from_slice::<Settings>(&plain).ok())
-        .unwrap_or_default();
-    settings.auth_tokens = Some(tokens.clone());
-
-    let write = || -> Result<(), SoneError> {
-        let json = serde_json::to_string_pretty(&settings)?;
-        let encrypted = crypto.encrypt(json.as_bytes())?;
-        fs::write(path, encrypted)?;
-        Ok(())
-    };
-    if let Err(e) = write() {
-        log::warn!("Failed to persist refreshed auth tokens: {e}");
-    }
 }
 
 impl AppState {
@@ -350,68 +330,32 @@ impl AppState {
 
         let disk_cache = DiskCache::new(&cache_dir, crypto.clone());
 
-        // Load preferences from saved settings (decrypt if needed)
-        let mut saved = fs::read(&settings_path)
-            .ok()
-            .and_then(|data| crypto.decrypt(&data).ok())
-            .and_then(|plain| String::from_utf8(plain).ok())
-            .and_then(|s| serde_json::from_str::<Settings>(&s).ok());
-
-        // One-shot custom-titlebar migration: existing installs had
-        // `decorations: true` (native GTK chrome); silent-flip to false so
-        // the custom React titlebar is shown by default. The toggle in
-        // Settings remains as an escape hatch.
-        if let Some(ref mut s) = saved {
-            if !s.titlebar_migration_v1 {
-                log::info!("[migration] custom-titlebar v1: flipping decorations to false");
-                s.decorations = false;
-                s.titlebar_migration_v1 = true;
-                if let Ok(json) = serde_json::to_string_pretty(s) {
-                    if let Ok(encrypted) = crypto.encrypt(json.as_bytes()) {
-                        if let Err(e) = fs::write(&settings_path, encrypted) {
-                            log::warn!("[migration] failed to persist titlebar_migration_v1: {e}");
-                        }
+        let settings_store = Arc::new(settings_store::SettingsStore::open(
+            settings_path.clone(),
+            crypto.clone(),
+        ));
+        // Migrations share the same transaction and atomic writer as all
+        // subsequent preference and token updates. A corrupt read cannot
+        // reach this branch and is never replaced by defaults.
+        let mut saved = settings_store.snapshot().ok();
+        if let Some(settings) = saved.as_ref() {
+            let plaintext =
+                fs::read(&settings_path).is_ok_and(|bytes| !crypto::is_encrypted(&bytes));
+            let mut proxy = settings.proxy.clone();
+            if plaintext
+                || !settings.titlebar_migration_v1
+                || crate::proxy::migrate_incomplete_proxy(&mut proxy)
+            {
+                match settings_store.update(|settings| {
+                    if !settings.titlebar_migration_v1 {
+                        settings.decorations = false;
+                        settings.titlebar_migration_v1 = true;
                     }
-                }
-            }
-        }
-
-        // One-shot proxy migration. A pre-branch install can hold an enabled
-        // proxy with no host or a zero port, which the old client builder read
-        // as "no proxy". This module fails closed instead, so left alone it
-        // would come up with every request blocked and no way in. Turning it
-        // off restores exactly what that install already had.
-        if let Some(ref mut s) = saved {
-            if crate::proxy::migrate_incomplete_proxy(&mut s.proxy) {
-                log::info!(
-                    "[migration] proxy was enabled with no host or port; disabling it \
-                     so the app is not blocked by settings a previous version accepted"
-                );
-                if let Ok(json) = serde_json::to_string_pretty(s) {
-                    if let Ok(encrypted) = crypto.encrypt(json.as_bytes()) {
-                        if let Err(e) = fs::write(&settings_path, encrypted) {
-                            log::warn!("[migration] failed to persist the proxy migration: {e}");
-                        }
-                    }
-                }
-            }
-        }
-
-        // Eager migration: if settings exist but aren't encrypted, re-save encrypted
-        if settings_path.exists() {
-            if let Ok(raw) = fs::read(&settings_path) {
-                if !crypto::is_encrypted(&raw) {
-                    if let Some(ref settings) = saved {
-                        if let Ok(json) = serde_json::to_string_pretty(settings) {
-                            if let Ok(encrypted) = crypto.encrypt(json.as_bytes()) {
-                                if let Err(e) = fs::write(&settings_path, encrypted) {
-                                    log::warn!("Failed to migrate settings to encrypted: {e}");
-                                } else {
-                                    log::info!("Migrated settings.json to encrypted format");
-                                }
-                            }
-                        }
-                    }
+                    crate::proxy::migrate_incomplete_proxy(&mut settings.proxy);
+                    Ok(settings.clone())
+                }) {
+                    Ok(settings) => saved = Some(settings),
+                    Err(error) => log::warn!("Failed to persist settings migration: {error}"),
                 }
             }
         }
@@ -506,10 +450,14 @@ impl AppState {
 
         let mut tidal_client = TidalClient::new(proxied_http.clone());
         tidal_client.set_token_persist({
-            let settings_path = settings_path.clone();
-            let crypto = Arc::clone(&crypto);
+            let settings_store = Arc::clone(&settings_store);
             Arc::new(move |tokens: &AuthTokens| {
-                persist_auth_tokens(&settings_path, &crypto, tokens);
+                if let Err(error) = settings_store.update(|settings| {
+                    settings.auth_tokens = Some(tokens.clone());
+                    Ok(())
+                }) {
+                    log::warn!("Failed to persist refreshed auth tokens: {error}");
+                }
             })
         });
 
@@ -520,6 +468,7 @@ impl AppState {
             proxied_http,
             host_caps: std::sync::Mutex::new(host_caps),
             settings_path,
+            settings_store,
             cache_dir,
             disk_cache,
             crypto,
@@ -547,6 +496,7 @@ impl AppState {
                 s
             },
             overlay_handle: Mutex::new(None),
+            overlay_settings_lock: Mutex::new(()),
             signal_path,
         }
     }
@@ -584,17 +534,14 @@ impl AppState {
     }
 
     pub fn load_settings(&self) -> Option<Settings> {
-        let data = fs::read(&self.settings_path).ok()?;
-        let plain = self.crypto.decrypt(&data).ok()?;
-        let text = String::from_utf8(plain).ok()?;
-        serde_json::from_str(&text).ok()
+        self.settings_store.snapshot().ok()
     }
 
-    pub fn save_settings(&self, settings: &Settings) -> Result<(), SoneError> {
-        let json = serde_json::to_string_pretty(settings)?;
-        let encrypted = self.crypto.encrypt(json.as_bytes())?;
-        fs::write(&self.settings_path, encrypted)?;
-        Ok(())
+    pub fn update_settings<R>(
+        &self,
+        edit: impl FnOnce(&mut Settings) -> Result<R, SoneError>,
+    ) -> Result<R, SoneError> {
+        self.settings_store.update(edit)
     }
 
     // ---- Persistent state (not cache — survives restarts) ----

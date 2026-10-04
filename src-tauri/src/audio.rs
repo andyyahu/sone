@@ -2974,9 +2974,9 @@ impl AudioPlayer {
                         reply,
                     } => {
                         exclusive = enabled;
-                        if let Some(d) = dev {
-                            device = Some(d);
-                        }
+                        // Callers pass the complete saved choice. None also
+                        // clears a choice when a settings transaction rolls back.
+                        device = dev;
                         if !enabled {
                             bit_perfect = false;
                         }

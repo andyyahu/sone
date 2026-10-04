@@ -233,9 +233,11 @@ pub async fn play_tidal_track(
     .map_err(SoneError::Audio)?;
 
     // Save last played track
-    if let Some(mut settings) = state.load_settings() {
+    if let Err(error) = state.update_settings(|settings| {
         settings.last_track_id = Some(track_id);
-        state.save_settings(&settings).ok();
+        Ok(())
+    }) {
+        log::warn!("Could not persist last track: {error}");
     }
 
     Ok(stream_info)
@@ -359,9 +361,11 @@ pub fn set_volume(state: State<'_, AppState>, level: f32) -> Result<(), SoneErro
     });
 
     // Save volume to settings
-    if let Some(mut settings) = state.load_settings() {
+    if let Err(error) = state.update_settings(|settings| {
         settings.volume = level;
-        state.save_settings(&settings).ok();
+        Ok(())
+    }) {
+        log::warn!("Could not persist volume: {error}");
     }
 
     Ok(())

@@ -2,7 +2,6 @@ use base64::Engine;
 use rand::RngExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::fs;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
@@ -126,7 +125,8 @@ pub async fn load_saved_auth(state: State<'_, AppState>) -> Result<Option<AuthTo
         );
         if let Some(ref tokens) = settings.auth_tokens {
             let (id, secret) = resolve_credentials(&settings);
-            let mut client = state.tidal_client.lock().await;
+            let mut client =
+                crate::client_timing::lock(&state.tidal_client, "load_saved_auth").await;
             client.tokens = Some(tokens.clone());
             client.set_credentials(&id, &secret);
             // Fetch session info to populate country_code for search
@@ -215,14 +215,14 @@ pub async fn import_session(
 ) -> Result<AuthTokens, SoneError> {
     log::debug!(
         "[import_session]: client_id={}",
-        &client_id[..client_id.len().min(8)]
+        crate::http_util::bounded_preview(&client_id, 8)
     );
     if client_id.is_empty() || refresh_token.is_empty() {
         return Err(SoneError::NotConfigured(
             "Client ID and refresh token are required".into(),
         ));
     }
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "import_session").await;
     client.set_credentials(&client_id, &client_secret);
 
     let final_tokens = if let Some(at) = access_token.filter(|s| !s.is_empty()) {
@@ -254,14 +254,15 @@ pub async fn import_session(
         tokens
     };
 
-    let mut settings = state.load_settings().unwrap_or_default();
-    settings.auth_tokens = Some(final_tokens.clone());
-    // Only persist user-provided credentials, not embedded defaults
-    if !are_embedded_defaults(&client_id, &client_secret) {
-        settings.client_id = client_id;
-        settings.client_secret = client_secret;
-    }
-    state.save_settings(&settings)?;
+    state.update_settings(|settings| {
+        settings.auth_tokens = Some(final_tokens.clone());
+        // Only persist user-provided credentials, not embedded defaults
+        if !are_embedded_defaults(&client_id, &client_secret) {
+            settings.client_id = client_id;
+            settings.client_secret = client_secret;
+        }
+        Ok(())
+    })?;
 
     restore_session_services(&app).await;
 
@@ -275,7 +276,7 @@ pub async fn start_device_auth(
     client_secret: String,
 ) -> Result<DeviceAuthResponse, SoneError> {
     log::debug!("[start_device_auth]");
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "start_device_auth").await;
     client.set_credentials(&client_id, &client_secret);
     client.start_device_auth().await
 }
@@ -289,7 +290,7 @@ pub async fn poll_device_auth(
     client_secret: String,
 ) -> Result<Option<AuthTokens>, SoneError> {
     log::debug!("[poll_device_auth]");
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "poll_device_auth").await;
     client.set_credentials(&client_id, &client_secret);
 
     match client.poll_device_token(&device_code).await? {
@@ -300,18 +301,19 @@ pub async fn poll_device_auth(
             }
 
             // Save tokens and credentials
-            let mut settings = state.load_settings().unwrap_or_default();
-            settings.auth_tokens = Some(tokens.clone());
-            settings.auth_method = AuthMethod::LoginCode;
-            // Only persist user-provided credentials, not embedded defaults
-            if !are_embedded_defaults(&client_id, &client_secret) {
-                settings.client_id = client_id;
-                settings.client_secret = client_secret;
-            } else {
-                settings.client_id = String::new();
-                settings.client_secret = String::new();
-            }
-            state.save_settings(&settings)?;
+            state.update_settings(|settings| {
+                settings.auth_tokens = Some(tokens.clone());
+                settings.auth_method = AuthMethod::LoginCode;
+                // Only persist user-provided credentials, not embedded defaults
+                if !are_embedded_defaults(&client_id, &client_secret) {
+                    settings.client_id = client_id;
+                    settings.client_secret = client_secret;
+                } else {
+                    settings.client_id = String::new();
+                    settings.client_secret = String::new();
+                }
+                Ok(())
+            })?;
 
             // restore_session_services does not lock tidal_client, so calling
             // it while `client` is still in scope is safe (no re-entrant lock).
@@ -326,7 +328,7 @@ pub async fn poll_device_auth(
 #[tauri::command]
 pub async fn refresh_tidal_auth(state: State<'_, AppState>) -> Result<AuthTokens, SoneError> {
     log::debug!("[refresh_tidal_auth]");
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "refresh_tidal_auth").await;
     // refresh_token persists the new tokens via the client's persist hook.
     client.refresh_token().await
 }
@@ -377,7 +379,7 @@ pub async fn complete_pkce_auth(
     client_secret: String,
 ) -> Result<AuthTokens, SoneError> {
     log::debug!("[complete_pkce_auth]");
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "complete_pkce_auth").await;
     client.set_credentials(&client_id, &client_secret);
     let tokens = client
         .exchange_pkce_code(&code, &code_verifier, PKCE_REDIRECT_URI, &client_unique_key)
@@ -389,21 +391,22 @@ pub async fn complete_pkce_auth(
     }
 
     // Save tokens and credentials
-    let mut settings = state.load_settings().unwrap_or_default();
-    settings.auth_tokens = Some(tokens.clone());
-    settings.auth_method = AuthMethod::Pkce;
-    settings.legacy_auth_notice_count = 0;
-    // Only persist user-provided credentials, not embedded defaults
-    if !are_embedded_pkce_defaults(&client_id, &client_secret)
-        && !are_embedded_defaults(&client_id, &client_secret)
-    {
-        settings.client_id = client_id;
-        settings.client_secret = client_secret;
-    } else {
-        settings.client_id = String::new();
-        settings.client_secret = String::new();
-    }
-    state.save_settings(&settings)?;
+    state.update_settings(|settings| {
+        settings.auth_tokens = Some(tokens.clone());
+        settings.auth_method = AuthMethod::Pkce;
+        settings.legacy_auth_notice_count = 0;
+        // Only persist user-provided credentials, not embedded defaults
+        if !are_embedded_pkce_defaults(&client_id, &client_secret)
+            && !are_embedded_defaults(&client_id, &client_secret)
+        {
+            settings.client_id = client_id;
+            settings.client_secret = client_secret;
+        } else {
+            settings.client_id = String::new();
+            settings.client_secret = String::new();
+        }
+        Ok(())
+    })?;
 
     restore_session_services(&app).await;
 
@@ -437,29 +440,25 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), SoneError> {
     // Release the idle inhibitor if a track had held it.
     state.idle_inhibitor.lock().await.uninhibit().await;
 
-    // Clear the Tidal session: tokens + cached country. Preserve login
-    // credentials (client_id/secret) for the next login.
-    {
-        let mut client = state.tidal_client.lock().await;
+    // Token callbacks run while the client lock is held. Clear disk and
+    // memory under that same lock so a concurrent login/refresh cannot be
+    // published between the two halves of logout.
+    let settings_result = {
+        let mut client = crate::client_timing::lock(&state.tidal_client, "logout").await;
         client.tokens = None;
         client.country_code = "US".to_string();
-    }
-
-    // Clear auth tokens + purge scrobble creds from settings; keep the rest
-    // (audio prefs, Discord/MCP settings, mcp_token).
-    if let Some(mut settings) = state.load_settings() {
-        settings.auth_tokens = None;
-        settings.last_track_id = None;
-        settings.scrobble = Default::default();
-        state.save_settings(&settings).ok();
-    } else {
-        fs::remove_file(&state.settings_path).ok();
-    }
+        state.update_settings(|settings| {
+            settings.auth_tokens = None;
+            settings.last_track_id = None;
+            settings.scrobble = Default::default();
+            Ok(())
+        })
+    };
 
     // Clear all cached data.
     state.disk_cache.clear().await;
 
-    Ok(())
+    settings_result
 }
 
 /// Re-arm session-bound background services after a successful login. Mirrors
@@ -486,24 +485,22 @@ const LEGACY_AUTH_NOTICE_LIMIT: u8 = 3;
 
 #[tauri::command]
 pub fn consume_legacy_auth_notice(state: State<'_, AppState>) -> Result<bool, SoneError> {
-    let Some(mut settings) = state.load_settings() else {
-        return Ok(false);
-    };
-    if settings.auth_tokens.is_none()
-        || settings.auth_method != AuthMethod::LoginCode
-        || settings.legacy_auth_notice_count >= LEGACY_AUTH_NOTICE_LIMIT
-    {
-        return Ok(false);
-    }
-    settings.legacy_auth_notice_count = settings.legacy_auth_notice_count.saturating_add(1);
-    state.save_settings(&settings)?;
-    Ok(true)
+    state.update_settings(|settings| {
+        if settings.auth_tokens.is_none()
+            || settings.auth_method != AuthMethod::LoginCode
+            || settings.legacy_auth_notice_count >= LEGACY_AUTH_NOTICE_LIMIT
+        {
+            return Ok(false);
+        }
+        settings.legacy_auth_notice_count = settings.legacy_auth_notice_count.saturating_add(1);
+        Ok(true)
+    })
 }
 
 #[tauri::command]
 pub async fn get_session_user_id(state: State<'_, AppState>) -> Result<u64, SoneError> {
     log::debug!("[get_session_user_id]");
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_session_user_id").await;
     client.get_session_info().await
 }
 
@@ -545,7 +542,7 @@ async fn finish_embedded_pkce(
     let client_id = crate::embedded_config::stream_key_c();
     let client_secret = crate::embedded_config::stream_key_d();
 
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "finish_embedded_pkce").await;
     client.set_credentials(&client_id, &client_secret);
     let tokens = client
         .exchange_pkce_code(&code, &code_verifier, PKCE_REDIRECT_URI, &client_unique_key)
@@ -556,13 +553,14 @@ async fn finish_embedded_pkce(
         log::warn!("session country refresh failed: {}", e.log_safe());
     }
 
-    let mut settings = state.load_settings().unwrap_or_default();
-    settings.auth_tokens = Some(tokens.clone());
-    settings.auth_method = AuthMethod::Pkce;
-    settings.legacy_auth_notice_count = 0;
-    settings.client_id = String::new();
-    settings.client_secret = String::new();
-    state.save_settings(&settings)?;
+    state.update_settings(|settings| {
+        settings.auth_tokens = Some(tokens.clone());
+        settings.auth_method = AuthMethod::Pkce;
+        settings.legacy_auth_notice_count = 0;
+        settings.client_id = String::new();
+        settings.client_secret = String::new();
+        Ok(())
+    })?;
 
     // Covers both the embedded-webview path and complete_pkce_browser_login.
     restore_session_services(&app).await;
@@ -709,6 +707,6 @@ pub async fn get_user_profile(
     user_id: u64,
 ) -> Result<(String, Option<String>), SoneError> {
     log::debug!("[get_user_profile]");
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_user_profile").await;
     client.get_user_profile(user_id).await
 }

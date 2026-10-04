@@ -54,7 +54,9 @@ pub async fn mcp_set_enabled(
     app_handle: tauri::AppHandle,
     enabled: bool,
 ) -> Result<McpConnectionInfo, SoneError> {
-    let mut settings = state.load_settings().unwrap_or_default();
+    let mut guard = state.mcp_handle.lock().await;
+    let old_settings = state.settings_store.snapshot()?;
+    let mut settings = old_settings.clone();
 
     settings.mcp_enabled = enabled;
 
@@ -65,7 +67,6 @@ pub async fn mcp_set_enabled(
     {
         // Hold the guard across stop→bind→store so this cannot race the
         // startup spawn (or a concurrent regenerate) into a double bind.
-        let mut guard = state.mcp_handle.lock().await;
         if let Some(handle) = guard.take() {
             handle.shutdown().await;
         }
@@ -81,7 +82,27 @@ pub async fn mcp_set_enabled(
     }
     // Persist only after the server matches — a failed enable must not
     // stick across launches.
-    state.save_settings(&settings)?;
+    let persisted = state.update_settings(|current| {
+        current.mcp_enabled = enabled;
+        current.mcp_token = settings.mcp_token.clone();
+        Ok(())
+    });
+    if let Err(error) = persisted {
+        if let Some(handle) = guard.take() {
+            handle.shutdown().await;
+        }
+        if old_settings.mcp_enabled {
+            *guard = crate::mcp::start_server(
+                app_handle.clone(),
+                old_settings.mcp_port,
+                old_settings.mcp_token,
+            )
+            .await
+            .ok();
+        }
+        return Err(error);
+    }
+    drop(guard);
 
     mcp_get_connection_info(state).await
 }
@@ -91,12 +112,12 @@ pub async fn mcp_regenerate_token(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<McpConnectionInfo, SoneError> {
-    let old_settings = state.load_settings().unwrap_or_default();
+    let mut guard = state.mcp_handle.lock().await;
+    let old_settings = state.settings_store.snapshot()?;
     let mut settings = old_settings.clone();
     settings.mcp_token = uuid::Uuid::new_v4().simple().to_string();
 
     {
-        let mut guard = state.mcp_handle.lock().await;
         if let Some(handle) = guard.take() {
             handle.shutdown().await;
         }
@@ -126,7 +147,25 @@ pub async fn mcp_regenerate_token(
             }
         }
     }
-    state.save_settings(&settings)?;
+    if let Err(error) = state.update_settings(|current| {
+        current.mcp_token = settings.mcp_token;
+        Ok(())
+    }) {
+        if let Some(handle) = guard.take() {
+            handle.shutdown().await;
+        }
+        if old_settings.mcp_enabled {
+            *guard = crate::mcp::start_server(
+                app_handle.clone(),
+                old_settings.mcp_port,
+                old_settings.mcp_token,
+            )
+            .await
+            .ok();
+        }
+        return Err(error);
+    }
+    drop(guard);
 
     mcp_get_connection_info(state).await
 }

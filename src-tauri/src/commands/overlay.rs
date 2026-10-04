@@ -105,7 +105,9 @@ pub async fn overlay_set_enabled(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<OverlayConnectionInfo, SoneError> {
-    let mut settings = state.load_settings().unwrap_or_default();
+    let _settings_guard = state.overlay_settings_lock.lock().await;
+    let old_settings = state.settings_store.snapshot()?;
+    let mut settings = old_settings.clone();
     settings.overlay_enabled = enabled;
 
     if enabled {
@@ -115,7 +117,18 @@ pub async fn overlay_set_enabled(
     } else {
         stop_server(&state).await;
     }
-    state.save_settings(&settings)?;
+    if let Err(error) = state.update_settings(|current| {
+        current.overlay_enabled = settings.overlay_enabled;
+        Ok(())
+    }) {
+        if old_settings.overlay_enabled {
+            let _ = restart_server(&state, &old_settings, false).await;
+        } else {
+            stop_server(&state).await;
+        }
+        return Err(error);
+    }
+    drop(_settings_guard);
 
     overlay_get_connection_info(state).await
 }
@@ -131,7 +144,8 @@ pub async fn overlay_set_port(
         ));
     }
 
-    let old_settings = state.load_settings().unwrap_or_default();
+    let _settings_guard = state.overlay_settings_lock.lock().await;
+    let old_settings = state.settings_store.snapshot()?;
     let mut settings = old_settings.clone();
     settings.overlay_port = port;
 
@@ -141,7 +155,18 @@ pub async fn overlay_set_port(
         let _ = restart_server(&state, &old_settings, false).await;
         return Err(e);
     }
-    state.save_settings(&settings)?;
+    if let Err(error) = state.update_settings(|current| {
+        current.overlay_port = settings.overlay_port;
+        Ok(())
+    }) {
+        if old_settings.overlay_enabled {
+            let _ = restart_server(&state, &old_settings, false).await;
+        } else {
+            stop_server(&state).await;
+        }
+        return Err(error);
+    }
+    drop(_settings_guard);
 
     overlay_get_connection_info(state).await
 }
@@ -161,7 +186,8 @@ pub async fn overlay_set_host(
         return Err(SoneError::Io(format!("Invalid host address: {trimmed}")));
     }
 
-    let old_settings = state.load_settings().unwrap_or_default();
+    let _settings_guard = state.overlay_settings_lock.lock().await;
+    let old_settings = state.settings_store.snapshot()?;
     let mut settings = old_settings.clone();
     settings.overlay_host = trimmed;
 
@@ -169,7 +195,18 @@ pub async fn overlay_set_host(
         let _ = restart_server(&state, &old_settings, false).await;
         return Err(e);
     }
-    state.save_settings(&settings)?;
+    if let Err(error) = state.update_settings(|current| {
+        current.overlay_host = settings.overlay_host;
+        Ok(())
+    }) {
+        if old_settings.overlay_enabled {
+            let _ = restart_server(&state, &old_settings, false).await;
+        } else {
+            stop_server(&state).await;
+        }
+        return Err(error);
+    }
+    drop(_settings_guard);
 
     overlay_get_connection_info(state).await
 }
