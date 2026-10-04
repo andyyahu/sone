@@ -1,4 +1,12 @@
-import { Fragment, useEffect, useRef, useState } from "react";
+import {
+  Fragment,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import {
   X,
   Volume2,
@@ -79,6 +87,36 @@ function DiscordGlyph({ size = 16 }: { size?: number }) {
   );
 }
 
+const MOTION_QUERY = "(prefers-reduced-motion: reduce)";
+const reducedMotion = () => window.matchMedia?.(MOTION_QUERY).matches ?? false;
+function subscribeMotion(onChange: () => void) {
+  const media = window.matchMedia?.(MOTION_QUERY);
+  media?.addEventListener("change", onChange);
+  return () => media?.removeEventListener("change", onChange);
+}
+
+function focusableElements(panel: HTMLElement): HTMLElement[] {
+  return Array.from(
+    panel.querySelectorAll<HTMLElement>(
+      'button, a[href], input, select, textarea, [tabindex], [contenteditable="true"]',
+    ),
+  ).filter((element) => {
+    if (element.tabIndex < 0 || element.matches(":disabled")) return false;
+    if (element.closest("[hidden], [inert], [aria-hidden='true']"))
+      return false;
+    for (
+      let node: HTMLElement | null = element;
+      node && node !== panel;
+      node = node.parentElement
+    ) {
+      const style = window.getComputedStyle(node);
+      if (style.display === "none" || style.visibility === "hidden")
+        return false;
+    }
+    return true;
+  });
+}
+
 export default function SettingsSheet({
   open,
   onClose,
@@ -95,36 +133,106 @@ export default function SettingsSheet({
 }) {
   const [active, setActive] = useState<TabId>(initialTab);
   const panelRef = useRef<HTMLDivElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+  const titleId = useId();
+  const noMotion = useSyncExternalStore(subscribeMotion, reducedMotion);
+  const [present, setPresent] = useState(open);
+  // Make the panel available in this render's layout phase when reopened.
+  if (open && !present) setPresent(true);
+  const isTop = useEscapeDismiss(open, onClose, DISMISS_PRIORITY.modal);
+
+  useEffect(() => {
+    if (open || !present) return;
+    if (noMotion) {
+      setPresent(false);
+      return;
+    }
+    const timer = setTimeout(() => setPresent(false), 120);
+    return () => clearTimeout(timer);
+  }, [open, present, noMotion]);
 
   useEffect(() => {
     if (open) setActive(initialTab);
   }, [open, initialTab]);
 
+  useLayoutEffect(() => {
+    if (!open) return;
+    const previous = document.activeElement;
+    restoreFocusRef.current = previous instanceof HTMLElement ? previous : null;
+    closeRef.current?.focus();
+    const containFocus = (event: FocusEvent) => {
+      const panel = panelRef.current;
+      if (isTop() && panel && !panel.contains(event.target as Node))
+        closeRef.current?.focus();
+    };
+    const containTab = (event: KeyboardEvent) => {
+      if (event.key !== "Tab" || event.defaultPrevented || !isTop()) return;
+      const panel = panelRef.current;
+      if (!panel) return;
+      const elements = focusableElements(panel);
+      const first = elements[0] ?? panel;
+      const last = elements[elements.length - 1] ?? panel;
+      const current = document.activeElement;
+      if (event.shiftKey && (current === first || !panel.contains(current))) {
+        event.preventDefault();
+        last.focus();
+      } else if (
+        !event.shiftKey &&
+        (current === last || !panel.contains(current))
+      ) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("focusin", containFocus);
+    document.addEventListener("keydown", containTab);
+    return () => {
+      document.removeEventListener("focusin", containFocus);
+      document.removeEventListener("keydown", containTab);
+    };
+  }, [open, isTop]);
+
+  // React restores the pre-commit focus after layout cleanups. Restore the
+  // opener in the passive cleanup so it also survives an animated exit.
   useEffect(() => {
     if (!open) return;
-    const handler = (e: MouseEvent) => {
-      if (panelRef.current && !panelRef.current.contains(e.target as Node))
-        onClose();
+    const previous = restoreFocusRef.current;
+    return () => {
+      if (previous?.isConnected) previous.focus();
     };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [open, onClose]);
+  }, [open]);
 
-  useEscapeDismiss(open, onClose, DISMISS_PRIORITY.modal);
-
-  if (!open) return null;
+  if (!present || (!open && noMotion)) return null;
 
   return (
-    <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/55 backdrop-blur-sm animate-fadeIn">
+    <div
+      className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/55 backdrop-blur-sm settings-backdrop"
+      data-state={open ? "open" : "closed"}
+      inert={!open}
+      aria-hidden={!open || undefined}
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && isTop()) onClose();
+      }}
+    >
       <div
         ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
         className="w-full max-w-[800px] h-[min(94vh,740px)] bg-th-elevated rounded-[18px] shadow-2xl flex flex-col overflow-hidden border border-th-border-subtle settings-modal-anim"
       >
         <div className="flex items-center justify-between px-6 pt-5 pb-4 border-b border-th-border-subtle">
-          <h2 className="text-[20px] font-extrabold text-th-text-primary">
+          <h2
+            id={titleId}
+            className="text-[20px] font-extrabold text-th-text-primary"
+          >
             Settings
           </h2>
           <button
+            ref={closeRef}
+            aria-label="Close settings"
             onClick={onClose}
             className="w-8 h-8 rounded-full flex items-center justify-center hover:bg-th-inset transition-colors text-th-text-muted hover:text-th-text-primary"
           >
@@ -133,7 +241,10 @@ export default function SettingsSheet({
         </div>
 
         <div className="flex flex-1 min-h-0">
-          <nav className="w-[204px] shrink-0 border-r border-th-border-subtle py-4 px-3 flex flex-col gap-0.5 overflow-y-auto">
+          <nav
+            aria-label="Settings categories"
+            className="w-[204px] shrink-0 border-r border-th-border-subtle py-4 px-3 flex flex-col gap-0.5 overflow-y-auto"
+          >
             {GROUPS.map((group) => (
               <Fragment key={group.label}>
                 <p className="text-[9.5px] font-bold tracking-[1.1px] uppercase text-th-text-faint px-[11px] mt-3.5 mb-1 first:mt-0.5">
@@ -145,6 +256,7 @@ export default function SettingsSheet({
                     <button
                       key={id}
                       onClick={() => setActive(id)}
+                      aria-current={on ? "page" : undefined}
                       className={`relative flex items-center gap-3 px-[13px] py-2.5 rounded-md text-left text-[14px] transition-colors ${
                         on
                           ? "bg-th-accent/10 text-th-accent"

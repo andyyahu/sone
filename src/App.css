@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "./motion.css";
 @config "../tailwind.config.js";
 
 :root {
@@ -177,12 +178,12 @@ svg[stroke-width="3"] {
 }
 
 .animate-fadeIn {
-  animation: fadeIn 0.2s ease-out both;
+  animation: fadeIn 0.2s var(--ease-settle) both;
 }
 
 @keyframes modalIn {
   from {
-    transform: translateY(10px) scale(0.985);
+    transform: translateY(8px);
     opacity: 0;
   }
   to {
@@ -190,11 +191,41 @@ svg[stroke-width="3"] {
     opacity: 1;
   }
 }
+@keyframes modalOut {
+  from {
+    transform: none;
+    opacity: 1;
+  }
+  to {
+    transform: translateY(4px);
+    opacity: 0;
+  }
+}
+@keyframes settingsBackdropOut {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+.settings-backdrop {
+  animation: fadeIn 180ms var(--ease-settle) both;
+}
 .settings-modal-anim {
-  animation: modalIn 0.22s cubic-bezier(0.16, 0.84, 0.44, 1);
+  animation: modalIn 180ms var(--ease-settle) both;
+}
+.settings-backdrop[data-state="closed"] {
+  animation: settingsBackdropOut 120ms var(--ease-settle) both;
+}
+.settings-backdrop[data-state="closed"] .settings-modal-anim {
+  animation: modalOut 120ms var(--ease-settle) both;
 }
 @media (prefers-reduced-motion: reduce) {
-  .settings-modal-anim {
+  .settings-backdrop,
+  .settings-modal-anim,
+  .settings-backdrop[data-state="closed"],
+  .settings-backdrop[data-state="closed"] .settings-modal-anim {
     animation: none;
   }
 }

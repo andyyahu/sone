@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "./motion.css";
 @config "../tailwind.config.js";
 
 html,

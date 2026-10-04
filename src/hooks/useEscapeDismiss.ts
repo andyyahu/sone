@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import { registerDismissable, DISMISS_PRIORITY } from "../lib/dismissStack";
 
 // Registers while `active` — not merely while mounted — so a layer that is
@@ -8,8 +8,11 @@ export function useEscapeDismiss(
   active: boolean,
   onClose: () => void,
   priority: number = DISMISS_PRIORITY.modal,
-): void {
+): () => boolean {
   const onCloseRef = useRef(onClose);
+  const registration = useRef<ReturnType<typeof registerDismissable> | null>(
+    null,
+  );
   // Layout-phase so an Escape between render and passive flush can't run a stale closure.
   useLayoutEffect(() => {
     onCloseRef.current = onClose;
@@ -17,6 +20,12 @@ export function useEscapeDismiss(
 
   useEffect(() => {
     if (!active) return;
-    return registerDismissable(priority, () => onCloseRef.current());
+    const entry = registerDismissable(priority, () => onCloseRef.current());
+    registration.current = entry;
+    return () => {
+      entry();
+      if (registration.current === entry) registration.current = null;
+    };
   }, [active, priority]);
+  return useCallback(() => registration.current?.isTop() ?? false, []);
 }

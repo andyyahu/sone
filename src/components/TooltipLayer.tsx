@@ -194,7 +194,7 @@ export default function TooltipLayer() {
         maxWidth: 280,
         whiteSpace: "normal",
         boxShadow: "0 6px 18px rgba(0, 0, 0, 0.35)",
-        transition: "opacity 120ms ease-out",
+        transition: "opacity 120ms var(--ease-settle)",
         userSelect: "none",
       }}
     >

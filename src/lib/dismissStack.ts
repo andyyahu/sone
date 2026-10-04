@@ -14,19 +14,25 @@ let entries: Entry[] = [];
 let seq = 0;
 let listening = false;
 
-function onKeyDown(e: KeyboardEvent) {
-  if (e.key !== "Escape") return;
-  if (entries.length === 0) return;
-
-  let top = entries[0];
+function topEntry(): Entry | undefined {
+  let top: Entry | undefined = entries[0];
   for (const entry of entries) {
     if (
+      !top ||
       entry.priority > top.priority ||
       (entry.priority === top.priority && entry.seq > top.seq)
     ) {
       top = entry;
     }
   }
+
+  return top;
+}
+
+function onKeyDown(e: KeyboardEvent) {
+  if (e.key !== "Escape") return;
+  const top = topEntry();
+  if (!top) return;
 
   e.preventDefault();
   top.onClose();
@@ -35,7 +41,7 @@ function onKeyDown(e: KeyboardEvent) {
 export function registerDismissable(
   priority: number,
   onClose: () => void,
-): () => void {
+): (() => void) & { isTop: () => boolean } {
   const entry: Entry = { priority, onClose, seq: ++seq };
   entries.push(entry);
   if (!listening) {
@@ -44,11 +50,14 @@ export function registerDismissable(
     listening = true;
   }
 
-  return () => {
-    entries = entries.filter((e) => e !== entry);
-    if (entries.length === 0 && listening) {
-      window.removeEventListener("keydown", onKeyDown);
-      listening = false;
-    }
-  };
+  return Object.assign(
+    () => {
+      entries = entries.filter((e) => e !== entry);
+      if (entries.length === 0 && listening) {
+        window.removeEventListener("keydown", onKeyDown);
+        listening = false;
+      }
+    },
+    { isTop: () => topEntry() === entry },
+  );
 }
