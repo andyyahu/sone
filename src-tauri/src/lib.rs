@@ -1,5 +1,6 @@
 mod audio;
 pub mod cache;
+mod client_timing;
 mod commands;
 mod crypto;
 mod discord;

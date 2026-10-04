@@ -55,7 +55,7 @@ pub async fn resolve_play_uri(
     // encrypted DASH streams that require Widevine). With a secret, the
     // confidential PKCE credentials may return unencrypted Hi-Res BTS streams.
     let stream_info = {
-        let mut client = state.tidal_client.lock().await;
+        let mut client = crate::client_timing::lock(&state.tidal_client, "resolve_play_uri").await;
         let has_secret = !client.client_secret.is_empty();
         let ceiling = state.max_quality.lock().unwrap().clone();
         let tiers = quality_tiers(&ceiling, has_secret);
@@ -296,7 +296,7 @@ pub async fn get_video_stream_info(
     video_quality: Option<String>,
 ) -> Result<VideoStreamInfo, SoneError> {
     let quality = video_quality.unwrap_or_else(|| "HIGH".to_string());
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_video_stream_info").await;
     client.get_video_stream_url(video_id, &quality).await
 }
 
@@ -305,7 +305,7 @@ pub async fn get_video_metadata(
     state: State<'_, AppState>,
     video_id: u64,
 ) -> Result<TidalVideo, SoneError> {
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_video_metadata").await;
     client.get_video(video_id).await
 }
 

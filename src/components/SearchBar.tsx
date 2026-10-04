@@ -73,6 +73,15 @@ export default function SearchBar() {
     undefined,
   );
 
+  const requestVersion = useRef(0);
+  const cancelSuggestions = useCallback(() => {
+    requestVersion.current++;
+    clearTimeout(debounceRef.current);
+    debounceRef.current = undefined;
+  }, []);
+
+  useEffect(() => cancelSuggestions, [cancelSuggestions]);
+
   // Track context menu state
   const [ctxTrack, setCtxTrack] = useState<Track | null>(null);
   const [ctxTrackIndex, setCtxTrackIndex] = useState(0);
@@ -90,14 +99,19 @@ export default function SearchBar() {
   // Sync search query with current view if it's a search view
   useEffect(() => {
     if (currentView.type === "search") {
+      cancelSuggestions();
+      setSearching(false);
+      setTextSuggestions([]);
+      setDirectHits([]);
       setSearchQuery(currentView.query);
     }
-  }, [currentView]);
+  }, [currentView, cancelSuggestions]);
 
   // Debounced suggestions fetch — single call powers the entire mini-search dropdown
   const doQuickSearch = useCallback(
     (query: string) => {
-      clearTimeout(debounceRef.current);
+      cancelSuggestions();
+      const version = requestVersion.current;
       if (!query.trim()) {
         setTextSuggestions([]);
         setDirectHits([]);
@@ -106,21 +120,24 @@ export default function SearchBar() {
       }
       setSearching(true);
       debounceRef.current = setTimeout(() => {
+        debounceRef.current = undefined;
         getSuggestions(query.trim(), 10)
           .then((resp) => {
+            if (requestVersion.current !== version) return;
             setTextSuggestions(resp.textSuggestions);
             setDirectHits(resp.directHits);
           })
           .catch(() => {
+            if (requestVersion.current !== version) return;
             setTextSuggestions([]);
             setDirectHits([]);
           })
           .finally(() => {
-            setSearching(false);
+            if (requestVersion.current === version) setSearching(false);
           });
-      }, 300); // Increased debounce to 300ms
+      }, 300);
     },
-    [getSuggestions],
+    [cancelSuggestions],
   );
 
   const addToHistory = useCallback((query: string) => {
@@ -153,6 +170,8 @@ export default function SearchBar() {
 
   const handleSearchKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && searchQuery.trim()) {
+      cancelSuggestions();
+      setSearching(false);
       setSearchOpen(false);
       addToHistory(searchQuery.trim());
       navigateToSearch(searchQuery.trim());
@@ -165,6 +184,8 @@ export default function SearchBar() {
   };
 
   const clearSearch = () => {
+    cancelSuggestions();
+    setSearching(false);
     setSearchQuery("");
     setSearchOpen(false);
     setTextSuggestions([]);
@@ -244,6 +265,7 @@ export default function SearchBar() {
         {searchQuery && (
           <button
             onClick={clearSearch}
+            aria-label="Clear search"
             className="text-th-text-faint hover:text-th-text-primary shrink-0"
           >
             <X size={16} />
@@ -266,12 +288,14 @@ export default function SearchBar() {
               {matchingHistory.slice(0, 5).map((item) => (
                 <div
                   key={item}
-                  className="flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle transition-colors cursor-pointer"
+                  className="flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle active:bg-th-hl-strong transition-colors duration-150 ease-settle motion-reduce:transition-none cursor-pointer"
                 >
                   <Clock size={15} className="text-th-text-faint shrink-0" />
                   <button
                     className="flex-1 text-left text-[13px] text-th-text-primary truncate"
                     onClick={() => {
+                      cancelSuggestions();
+                      setSearching(false);
                       setSearchQuery(item);
                       setSearchOpen(false);
                       addToHistory(item);
@@ -303,6 +327,8 @@ export default function SearchBar() {
                   key={`sug-${i}`}
                   className="w-full flex items-center gap-3 px-3 py-2.5 hover:bg-th-border-subtle transition-colors text-left"
                   onClick={() => {
+                    cancelSuggestions();
+                    setSearching(false);
                     setSearchQuery(s.query);
                     setTextSuggestions([]);
                     setDirectHits([]);
@@ -344,7 +370,12 @@ export default function SearchBar() {
             <>
               {searching && !hasDirectHits && (
                 <div className="flex items-center justify-center py-6">
-                  <Loader2 size={18} className="animate-spin text-th-accent" />
+                  <Loader2
+                    size={18}
+                    role="status"
+                    aria-label="Searching"
+                    className="animate-spin text-th-accent"
+                  />
                 </div>
               )}
 
@@ -361,7 +392,7 @@ export default function SearchBar() {
                       return (
                         <div
                           key={`dh-${idx}`}
-                          className="flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle transition-colors text-left group/item cursor-pointer"
+                          className="flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle active:bg-th-hl-strong transition-colors duration-150 ease-settle motion-reduce:transition-none text-left group/item cursor-pointer"
                           onClick={() => {
                             setSearchOpen(false);
                             if (hit.id)
@@ -434,7 +465,7 @@ export default function SearchBar() {
                       return (
                         <div
                           key={`dh-${idx}`}
-                          className="flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle transition-colors text-left group/item cursor-pointer"
+                          className="flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle active:bg-th-hl-strong transition-colors duration-150 ease-settle motion-reduce:transition-none text-left group/item cursor-pointer"
                           onClick={() => {
                             setSearchOpen(false);
                             if (hit.id)
@@ -503,7 +534,7 @@ export default function SearchBar() {
                       return (
                         <div
                           key={`dh-${idx}`}
-                          className={`flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle transition-colors text-left group/track ${
+                          className={`flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle active:bg-th-hl-strong transition-colors duration-150 ease-settle motion-reduce:transition-none text-left group/track ${
                             hit.albumId ? "cursor-pointer" : ""
                           }`}
                           onClick={() => {
@@ -593,7 +624,7 @@ export default function SearchBar() {
                       return (
                         <div
                           key={`dh-${idx}`}
-                          className="flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle transition-colors text-left group/item cursor-pointer"
+                          className="flex items-center gap-3 px-3 py-3 hover:bg-th-border-subtle active:bg-th-hl-strong transition-colors duration-150 ease-settle motion-reduce:transition-none text-left group/item cursor-pointer"
                           onClick={() => {
                             setSearchOpen(false);
                             if (hit.uuid)

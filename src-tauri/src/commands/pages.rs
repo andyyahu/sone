@@ -30,6 +30,7 @@ pub async fn get_album_detail(
 ) -> Result<TidalAlbumDetail, SoneError> {
     log::debug!("[get_album_detail]: album_id={}", album_id);
 
+    let fetch_ticket = state.disk_cache.begin_fetch().await;
     let cache_key = artwork_cache_key(format_args!("album:{}", album_id));
     match state
         .disk_cache
@@ -50,14 +51,15 @@ pub async fn get_album_detail(
         CacheResult::Miss => {}
     }
 
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_album_detail").await;
     let detail = client.get_album_detail(album_id).await?;
     drop(client);
 
     if let Ok(json) = serde_json::to_vec(&detail) {
         state
             .disk_cache
-            .put(
+            .put_if_current(
+                &fetch_ticket,
                 &cache_key,
                 &json,
                 CacheTier::StaticMeta,
@@ -84,6 +86,7 @@ pub async fn get_album_page(
 ) -> Result<AlbumPageCached, SoneError> {
     log::debug!("[get_album_page]: album_id={}", album_id);
 
+    let fetch_ticket = state.disk_cache.begin_fetch().await;
     let cache_key = artwork_cache_key(format_args!("album-page:{}", album_id));
     match state.disk_cache.get(&cache_key, CacheTier::Dynamic).await {
         CacheResult::Fresh(bytes) => {
@@ -96,21 +99,28 @@ pub async fn get_album_page(
         }
         CacheResult::Stale(bytes) => {
             if let Ok(page) = serde_json::from_slice::<AlbumPageResponse>(&bytes) {
-                if state.disk_cache.mark_in_flight(&cache_key).await {
+                if let Some(refresh_ticket) = state
+                    .disk_cache
+                    .begin_refresh(&cache_key, &fetch_ticket)
+                    .await
+                {
                     if state.disk_cache.should_retry_refresh(&cache_key, 300).await {
-                        state.disk_cache.mark_refresh_attempt(&cache_key).await;
+                        state.disk_cache.mark_refresh_attempt(&refresh_ticket).await;
                         let handle = app_handle.clone();
                         let key = cache_key.clone();
                         tokio::spawn(async move {
                             let st = handle.state::<AppState>();
                             let result = {
-                                let mut client = st.tidal_client.lock().await;
+                                let mut client =
+                                    crate::client_timing::lock(&st.tidal_client, "get_album_page")
+                                        .await;
                                 client.get_album_page(album_id).await
                             };
                             if let Ok(fresh) = result {
                                 if let Ok(json) = serde_json::to_vec(&fresh) {
                                     st.disk_cache
-                                        .put(
+                                        .put_if_current(
+                                            &fetch_ticket,
                                             &key,
                                             &json,
                                             CacheTier::Dynamic,
@@ -120,10 +130,10 @@ pub async fn get_album_page(
                                         .ok();
                                 }
                             }
-                            st.disk_cache.clear_in_flight(&key).await;
+                            st.disk_cache.finish_refresh(&refresh_ticket).await;
                         });
                     } else {
-                        state.disk_cache.clear_in_flight(&cache_key).await;
+                        state.disk_cache.finish_refresh(&refresh_ticket).await;
                     }
                 }
                 return Ok(AlbumPageCached {
@@ -135,14 +145,15 @@ pub async fn get_album_page(
         CacheResult::Miss => {}
     }
 
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_album_page").await;
     let page = client.get_album_page(album_id).await?;
     drop(client);
 
     if let Ok(json) = serde_json::to_vec(&page) {
         state
             .disk_cache
-            .put(
+            .put_if_current(
+                &fetch_ticket,
                 &cache_key,
                 &json,
                 CacheTier::Dynamic,
@@ -171,6 +182,7 @@ pub async fn get_album_tracks(
         limit
     );
 
+    let fetch_ticket = state.disk_cache.begin_fetch().await;
     let cache_key = artwork_cache_key(format_args!(
         "album-tracks:{}:{}:{}",
         album_id, offset, limit
@@ -188,14 +200,15 @@ pub async fn get_album_tracks(
         CacheResult::Miss => {}
     }
 
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_album_tracks").await;
     let tracks = client.get_album_tracks(album_id, offset, limit).await?;
     drop(client);
 
     if let Ok(json) = serde_json::to_vec(&tracks) {
         state
             .disk_cache
-            .put(
+            .put_if_current(
+                &fetch_ticket,
                 &cache_key,
                 &json,
                 CacheTier::StaticMeta,
@@ -236,6 +249,7 @@ pub async fn get_home_page(
     let slug = feed_type
         .unwrap_or_else(|| "static".to_string())
         .to_lowercase();
+    let fetch_ticket = state.disk_cache.begin_fetch().await;
     let cache_key = format!("home_feed_{}", slug);
     log::debug!("[get_home_page] feed={}", slug);
 
@@ -251,24 +265,31 @@ pub async fn get_home_page(
         CacheResult::Stale(bytes) => {
             if let Some(home) = decode_cached_home(&bytes) {
                 // SWR: return stale data, refresh in background.
-                if state.disk_cache.mark_in_flight(&cache_key).await {
+                if let Some(refresh_ticket) = state
+                    .disk_cache
+                    .begin_refresh(&cache_key, &fetch_ticket)
+                    .await
+                {
                     // Only retry if last attempt was >5min ago (300s)
                     if state.disk_cache.should_retry_refresh(&cache_key, 300).await {
-                        state.disk_cache.mark_refresh_attempt(&cache_key).await;
+                        state.disk_cache.mark_refresh_attempt(&refresh_ticket).await;
                         let handle = app_handle.clone();
                         let slug = slug.clone();
                         let cache_key = cache_key.clone();
                         tokio::spawn(async move {
                             let st = handle.state::<AppState>();
                             let result = {
-                                let mut client = st.tidal_client.lock().await;
+                                let mut client =
+                                    crate::client_timing::lock(&st.tidal_client, "get_home_page")
+                                        .await;
                                 client.get_home_page(&slug).await
                             };
                             match result {
                                 Ok(fresh) => {
                                     if let Some(json) = encode_home_for_cache(&fresh) {
                                         st.disk_cache
-                                            .put(
+                                            .put_if_current(
+                                                &fetch_ticket,
                                                 &cache_key,
                                                 &json,
                                                 CacheTier::Dynamic,
@@ -283,10 +304,10 @@ pub async fn get_home_page(
                                     e.log_safe()
                                 ),
                             }
-                            st.disk_cache.clear_in_flight(&cache_key).await;
+                            st.disk_cache.finish_refresh(&refresh_ticket).await;
                         });
                     } else {
-                        state.disk_cache.clear_in_flight(&cache_key).await;
+                        state.disk_cache.finish_refresh(&refresh_ticket).await;
                     }
                 }
                 return Ok(HomePageCached {
@@ -298,14 +319,20 @@ pub async fn get_home_page(
         CacheResult::Miss => {}
     }
 
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_home_page").await;
     let home = client.get_home_page(&slug).await?;
     drop(client);
 
     if let Some(json) = encode_home_for_cache(&home) {
         state
             .disk_cache
-            .put(&cache_key, &json, CacheTier::Dynamic, &["home-page"])
+            .put_if_current(
+                &fetch_ticket,
+                &cache_key,
+                &json,
+                CacheTier::Dynamic,
+                &["home-page"],
+            )
             .await
             .ok();
     }
@@ -323,16 +350,23 @@ pub async fn refresh_home_page(
     let slug = feed_type
         .unwrap_or_else(|| "static".to_string())
         .to_lowercase();
+    let fetch_ticket = state.disk_cache.begin_fetch().await;
     let cache_key = format!("home_feed_{}", slug);
     log::debug!("[refresh_home_page] feed={}", slug);
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "refresh_home_page").await;
     let home = client.get_home_page(&slug).await?;
     drop(client);
 
     if let Some(json) = encode_home_for_cache(&home) {
         state
             .disk_cache
-            .put(&cache_key, &json, CacheTier::Dynamic, &["home-page"])
+            .put_if_current(
+                &fetch_ticket,
+                &cache_key,
+                &json,
+                CacheTier::Dynamic,
+                &["home-page"],
+            )
             .await
             .ok();
     }
@@ -351,9 +385,9 @@ pub async fn get_home_page_more(
     log::debug!(
         "[get_home_page_more]: feed={} cursor={}",
         slug,
-        &cursor[..cursor.len().min(32)]
+        crate::http_util::bounded_preview(&cursor, 32)
     );
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_home_page_more").await;
     let result = client.fetch_v2_home_feed(&slug, Some(&cursor)).await;
     drop(client);
     let (_tabs, mut sections, next_cursor) = result?;
@@ -385,6 +419,7 @@ pub async fn get_page_section(
 ) -> Result<HomePageResponse, SoneError> {
     log::debug!("[get_page_section]: api_path={}", api_path);
 
+    let fetch_ticket = state.disk_cache.begin_fetch().await;
     let cache_key = format!("section:{}", api_path);
     match state.disk_cache.get(&cache_key, CacheTier::Dynamic).await {
         CacheResult::Fresh(bytes) => {
@@ -394,31 +429,45 @@ pub async fn get_page_section(
         }
         CacheResult::Stale(bytes) => {
             if let Ok(page) = serde_json::from_slice::<HomePageResponse>(&bytes) {
-                if state.disk_cache.mark_in_flight(&cache_key).await {
+                if let Some(refresh_ticket) = state
+                    .disk_cache
+                    .begin_refresh(&cache_key, &fetch_ticket)
+                    .await
+                {
                     // Only retry if last attempt was >5min ago (300s)
                     if state.disk_cache.should_retry_refresh(&cache_key, 300).await {
-                        state.disk_cache.mark_refresh_attempt(&cache_key).await;
+                        state.disk_cache.mark_refresh_attempt(&refresh_ticket).await;
                         let handle = app_handle.clone();
                         let path = api_path.clone();
                         let key = cache_key.clone();
                         tokio::spawn(async move {
                             let st = handle.state::<AppState>();
                             let result = {
-                                let mut client = st.tidal_client.lock().await;
+                                let mut client = crate::client_timing::lock(
+                                    &st.tidal_client,
+                                    "get_page_section",
+                                )
+                                .await;
                                 client.get_page(&path).await
                             };
                             if let Ok(fresh) = result {
                                 if let Ok(json) = serde_json::to_vec(&fresh) {
                                     st.disk_cache
-                                        .put(&key, &json, CacheTier::Dynamic, &["section"])
+                                        .put_if_current(
+                                            &fetch_ticket,
+                                            &key,
+                                            &json,
+                                            CacheTier::Dynamic,
+                                            &["section"],
+                                        )
                                         .await
                                         .ok();
                                 }
                             }
-                            st.disk_cache.clear_in_flight(&key).await;
+                            st.disk_cache.finish_refresh(&refresh_ticket).await;
                         });
                     } else {
-                        state.disk_cache.clear_in_flight(&cache_key).await;
+                        state.disk_cache.finish_refresh(&refresh_ticket).await;
                     }
                 }
                 return Ok(page);
@@ -427,14 +476,20 @@ pub async fn get_page_section(
         CacheResult::Miss => {}
     }
 
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_page_section").await;
     let page = client.get_page(&api_path).await?;
     drop(client);
 
     if let Ok(json) = serde_json::to_vec(&page) {
         state
             .disk_cache
-            .put(&cache_key, &json, CacheTier::Dynamic, &["section"])
+            .put_if_current(
+                &fetch_ticket,
+                &cache_key,
+                &json,
+                CacheTier::Dynamic,
+                &["section"],
+            )
             .await
             .ok();
     }
@@ -448,6 +503,7 @@ pub async fn get_mix_items(
 ) -> Result<MixPageResult, SoneError> {
     log::debug!("[get_mix_items]: mix_id={}", mix_id);
 
+    let fetch_ticket = state.disk_cache.begin_fetch().await;
     let cache_key = artwork_cache_key(format_args!("mix-page:{}", mix_id));
     match state.disk_cache.get(&cache_key, CacheTier::Dynamic).await {
         CacheResult::Fresh(bytes) | CacheResult::Stale(bytes) => {
@@ -458,14 +514,20 @@ pub async fn get_mix_items(
         CacheResult::Miss => {}
     }
 
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_mix_items").await;
     let result = client.get_mix_items(&mix_id).await?;
     drop(client);
 
     if let Ok(json) = serde_json::to_vec(&result) {
         state
             .disk_cache
-            .put(&cache_key, &json, CacheTier::Dynamic, &["mix-page"])
+            .put_if_current(
+                &fetch_ticket,
+                &cache_key,
+                &json,
+                CacheTier::Dynamic,
+                &["mix-page"],
+            )
             .await
             .ok();
     }
@@ -479,6 +541,7 @@ pub async fn get_artist_detail(
 ) -> Result<TidalArtistDetail, SoneError> {
     log::debug!("[get_artist_detail]: artist_id={}", artist_id);
 
+    let fetch_ticket = state.disk_cache.begin_fetch().await;
     let cache_key = artwork_cache_key(format_args!("artist:{}", artist_id));
     match state
         .disk_cache
@@ -493,14 +556,15 @@ pub async fn get_artist_detail(
         CacheResult::Miss => {}
     }
 
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_artist_detail").await;
     let detail = client.get_artist_detail(artist_id).await?;
     drop(client);
 
     if let Ok(json) = serde_json::to_vec(&detail) {
         state
             .disk_cache
-            .put(
+            .put_if_current(
+                &fetch_ticket,
                 &cache_key,
                 &json,
                 CacheTier::StaticMeta,
@@ -525,6 +589,7 @@ pub async fn get_artist_top_tracks(
         limit
     );
 
+    let fetch_ticket = state.disk_cache.begin_fetch().await;
     let cache_key = format!("artist-tracks:{}:{}", artist_id, limit);
     match state.disk_cache.get(&cache_key, CacheTier::Dynamic).await {
         CacheResult::Fresh(bytes) => {
@@ -534,22 +599,31 @@ pub async fn get_artist_top_tracks(
         }
         CacheResult::Stale(bytes) => {
             if let Ok(tracks) = serde_json::from_slice::<Vec<TidalTrack>>(&bytes) {
-                if state.disk_cache.mark_in_flight(&cache_key).await {
+                if let Some(refresh_ticket) = state
+                    .disk_cache
+                    .begin_refresh(&cache_key, &fetch_ticket)
+                    .await
+                {
                     // Only retry if last attempt was >5min ago (300s)
                     if state.disk_cache.should_retry_refresh(&cache_key, 300).await {
-                        state.disk_cache.mark_refresh_attempt(&cache_key).await;
+                        state.disk_cache.mark_refresh_attempt(&refresh_ticket).await;
                         let handle = app_handle.clone();
                         let key = cache_key.clone();
                         tokio::spawn(async move {
                             let st = handle.state::<AppState>();
                             let result = {
-                                let mut client = st.tidal_client.lock().await;
+                                let mut client = crate::client_timing::lock(
+                                    &st.tidal_client,
+                                    "get_artist_top_tracks",
+                                )
+                                .await;
                                 client.get_artist_top_tracks(artist_id, limit).await
                             };
                             if let Ok(fresh) = result {
                                 if let Ok(json) = serde_json::to_vec(&fresh) {
                                     st.disk_cache
-                                        .put(
+                                        .put_if_current(
+                                            &fetch_ticket,
                                             &key,
                                             &json,
                                             CacheTier::Dynamic,
@@ -559,10 +633,10 @@ pub async fn get_artist_top_tracks(
                                         .ok();
                                 }
                             }
-                            st.disk_cache.clear_in_flight(&key).await;
+                            st.disk_cache.finish_refresh(&refresh_ticket).await;
                         });
                     } else {
-                        state.disk_cache.clear_in_flight(&cache_key).await;
+                        state.disk_cache.finish_refresh(&refresh_ticket).await;
                     }
                 }
                 return Ok(tracks);
@@ -571,14 +645,15 @@ pub async fn get_artist_top_tracks(
         CacheResult::Miss => {}
     }
 
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_artist_top_tracks").await;
     let tracks = client.get_artist_top_tracks(artist_id, limit).await?;
     drop(client);
 
     if let Ok(json) = serde_json::to_vec(&tracks) {
         state
             .disk_cache
-            .put(
+            .put_if_current(
+                &fetch_ticket,
                 &cache_key,
                 &json,
                 CacheTier::Dynamic,
@@ -602,6 +677,7 @@ pub async fn get_artist_albums(
         limit
     );
 
+    let fetch_ticket = state.disk_cache.begin_fetch().await;
     let cache_key = artwork_cache_key(format_args!("artist-albums:{}:{}", artist_id, limit));
     match state
         .disk_cache
@@ -616,14 +692,15 @@ pub async fn get_artist_albums(
         CacheResult::Miss => {}
     }
 
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_artist_albums").await;
     let albums = client.get_artist_albums(artist_id, limit).await?;
     drop(client);
 
     if let Ok(json) = serde_json::to_vec(&albums) {
         state
             .disk_cache
-            .put(
+            .put_if_current(
+                &fetch_ticket,
                 &cache_key,
                 &json,
                 CacheTier::StaticMeta,
@@ -643,6 +720,7 @@ pub async fn get_artist_bio(
 ) -> Result<String, SoneError> {
     log::debug!("[get_artist_bio]: artist_id={}", artist_id);
 
+    let fetch_ticket = state.disk_cache.begin_fetch().await;
     let cache_key = format!("artist-bio:{}", artist_id);
     match state.disk_cache.get(&cache_key, CacheTier::Dynamic).await {
         CacheResult::Fresh(bytes) => {
@@ -652,22 +730,29 @@ pub async fn get_artist_bio(
         }
         CacheResult::Stale(bytes) => {
             if let Ok(bio) = serde_json::from_slice::<String>(&bytes) {
-                if state.disk_cache.mark_in_flight(&cache_key).await {
+                if let Some(refresh_ticket) = state
+                    .disk_cache
+                    .begin_refresh(&cache_key, &fetch_ticket)
+                    .await
+                {
                     // Only retry if last attempt was >5min ago (300s)
                     if state.disk_cache.should_retry_refresh(&cache_key, 300).await {
-                        state.disk_cache.mark_refresh_attempt(&cache_key).await;
+                        state.disk_cache.mark_refresh_attempt(&refresh_ticket).await;
                         let handle = app_handle.clone();
                         let key = cache_key.clone();
                         tokio::spawn(async move {
                             let st = handle.state::<AppState>();
                             let result = {
-                                let mut client = st.tidal_client.lock().await;
+                                let mut client =
+                                    crate::client_timing::lock(&st.tidal_client, "get_artist_bio")
+                                        .await;
                                 client.get_artist_bio(artist_id).await
                             };
                             if let Ok(fresh) = result {
                                 if let Ok(json) = serde_json::to_vec(&fresh) {
                                     st.disk_cache
-                                        .put(
+                                        .put_if_current(
+                                            &fetch_ticket,
                                             &key,
                                             &json,
                                             CacheTier::Dynamic,
@@ -677,10 +762,10 @@ pub async fn get_artist_bio(
                                         .ok();
                                 }
                             }
-                            st.disk_cache.clear_in_flight(&key).await;
+                            st.disk_cache.finish_refresh(&refresh_ticket).await;
                         });
                     } else {
-                        state.disk_cache.clear_in_flight(&cache_key).await;
+                        state.disk_cache.finish_refresh(&refresh_ticket).await;
                     }
                 }
                 return Ok(bio);
@@ -689,14 +774,15 @@ pub async fn get_artist_bio(
         CacheResult::Miss => {}
     }
 
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_artist_bio").await;
     let bio = client.get_artist_bio(artist_id).await?;
     drop(client);
 
     if let Ok(json) = serde_json::to_vec(&bio) {
         state
             .disk_cache
-            .put(
+            .put_if_current(
+                &fetch_ticket,
                 &cache_key,
                 &json,
                 CacheTier::Dynamic,
@@ -716,6 +802,7 @@ pub async fn get_artist_page(
 ) -> Result<Value, SoneError> {
     log::debug!("[get_artist_page]: artist_id={}", artist_id);
 
+    let fetch_ticket = state.disk_cache.begin_fetch().await;
     let cache_key = format!("artist-page:{}", artist_id);
     match state.disk_cache.get(&cache_key, CacheTier::Dynamic).await {
         CacheResult::Fresh(bytes) => {
@@ -725,21 +812,28 @@ pub async fn get_artist_page(
         }
         CacheResult::Stale(bytes) => {
             if let Ok(page) = serde_json::from_slice::<Value>(&bytes) {
-                if state.disk_cache.mark_in_flight(&cache_key).await {
+                if let Some(refresh_ticket) = state
+                    .disk_cache
+                    .begin_refresh(&cache_key, &fetch_ticket)
+                    .await
+                {
                     if state.disk_cache.should_retry_refresh(&cache_key, 300).await {
-                        state.disk_cache.mark_refresh_attempt(&cache_key).await;
+                        state.disk_cache.mark_refresh_attempt(&refresh_ticket).await;
                         let handle = app_handle.clone();
                         let key = cache_key.clone();
                         tokio::spawn(async move {
                             let st = handle.state::<AppState>();
                             let result = {
-                                let mut client = st.tidal_client.lock().await;
+                                let mut client =
+                                    crate::client_timing::lock(&st.tidal_client, "get_artist_page")
+                                        .await;
                                 client.get_artist_page(artist_id).await
                             };
                             if let Ok(fresh) = result {
                                 if let Ok(json) = serde_json::to_vec(&fresh) {
                                     st.disk_cache
-                                        .put(
+                                        .put_if_current(
+                                            &fetch_ticket,
                                             &key,
                                             &json,
                                             CacheTier::Dynamic,
@@ -749,10 +843,10 @@ pub async fn get_artist_page(
                                         .ok();
                                 }
                             }
-                            st.disk_cache.clear_in_flight(&key).await;
+                            st.disk_cache.finish_refresh(&refresh_ticket).await;
                         });
                     } else {
-                        state.disk_cache.clear_in_flight(&cache_key).await;
+                        state.disk_cache.finish_refresh(&refresh_ticket).await;
                     }
                 }
                 return Ok(page);
@@ -761,14 +855,15 @@ pub async fn get_artist_page(
         CacheResult::Miss => {}
     }
 
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_artist_page").await;
     let page = client.get_artist_page(artist_id).await?;
     drop(client);
 
     if let Ok(json) = serde_json::to_vec(&page) {
         state
             .disk_cache
-            .put(
+            .put_if_current(
+                &fetch_ticket,
                 &cache_key,
                 &json,
                 CacheTier::Dynamic,
@@ -795,6 +890,7 @@ pub async fn get_artist_top_tracks_all(
         limit
     );
 
+    let fetch_ticket = state.disk_cache.begin_fetch().await;
     let cache_key = format!("artist-top-tracks-all:{}:{}:{}", artist_id, offset, limit);
     match state.disk_cache.get(&cache_key, CacheTier::Dynamic).await {
         CacheResult::Fresh(bytes) => {
@@ -804,15 +900,23 @@ pub async fn get_artist_top_tracks_all(
         }
         CacheResult::Stale(bytes) => {
             if let Ok(data) = serde_json::from_slice::<Value>(&bytes) {
-                if state.disk_cache.mark_in_flight(&cache_key).await {
+                if let Some(refresh_ticket) = state
+                    .disk_cache
+                    .begin_refresh(&cache_key, &fetch_ticket)
+                    .await
+                {
                     if state.disk_cache.should_retry_refresh(&cache_key, 300).await {
-                        state.disk_cache.mark_refresh_attempt(&cache_key).await;
+                        state.disk_cache.mark_refresh_attempt(&refresh_ticket).await;
                         let handle = app_handle.clone();
                         let key = cache_key.clone();
                         tokio::spawn(async move {
                             let st = handle.state::<AppState>();
                             let result = {
-                                let mut client = st.tidal_client.lock().await;
+                                let mut client = crate::client_timing::lock(
+                                    &st.tidal_client,
+                                    "get_artist_top_tracks_all",
+                                )
+                                .await;
                                 client
                                     .get_artist_top_tracks_all(artist_id, offset, limit)
                                     .await
@@ -820,7 +924,8 @@ pub async fn get_artist_top_tracks_all(
                             if let Ok(fresh) = result {
                                 if let Ok(json) = serde_json::to_vec(&fresh) {
                                     st.disk_cache
-                                        .put(
+                                        .put_if_current(
+                                            &fetch_ticket,
                                             &key,
                                             &json,
                                             CacheTier::Dynamic,
@@ -830,10 +935,10 @@ pub async fn get_artist_top_tracks_all(
                                         .ok();
                                 }
                             }
-                            st.disk_cache.clear_in_flight(&key).await;
+                            st.disk_cache.finish_refresh(&refresh_ticket).await;
                         });
                     } else {
-                        state.disk_cache.clear_in_flight(&cache_key).await;
+                        state.disk_cache.finish_refresh(&refresh_ticket).await;
                     }
                 }
                 return Ok(data);
@@ -842,7 +947,8 @@ pub async fn get_artist_top_tracks_all(
         CacheResult::Miss => {}
     }
 
-    let mut client = state.tidal_client.lock().await;
+    let mut client =
+        crate::client_timing::lock(&state.tidal_client, "get_artist_top_tracks_all").await;
     let data = client
         .get_artist_top_tracks_all(artist_id, offset, limit)
         .await?;
@@ -851,7 +957,8 @@ pub async fn get_artist_top_tracks_all(
     if let Ok(json) = serde_json::to_vec(&data) {
         state
             .disk_cache
-            .put(
+            .put_if_current(
+                &fetch_ticket,
                 &cache_key,
                 &json,
                 CacheTier::Dynamic,
@@ -880,6 +987,7 @@ pub async fn get_artist_view_all(
         limit
     );
 
+    let fetch_ticket = state.disk_cache.begin_fetch().await;
     let cache_key = format!(
         "artist-view-all:{}:{}:{}:{}",
         artist_id, view_all_path, offset, limit
@@ -892,16 +1000,24 @@ pub async fn get_artist_view_all(
         }
         CacheResult::Stale(bytes) => {
             if let Ok(data) = serde_json::from_slice::<Value>(&bytes) {
-                if state.disk_cache.mark_in_flight(&cache_key).await {
+                if let Some(refresh_ticket) = state
+                    .disk_cache
+                    .begin_refresh(&cache_key, &fetch_ticket)
+                    .await
+                {
                     if state.disk_cache.should_retry_refresh(&cache_key, 300).await {
-                        state.disk_cache.mark_refresh_attempt(&cache_key).await;
+                        state.disk_cache.mark_refresh_attempt(&refresh_ticket).await;
                         let handle = app_handle.clone();
                         let key = cache_key.clone();
                         let path = view_all_path.clone();
                         tokio::spawn(async move {
                             let st = handle.state::<AppState>();
                             let result = {
-                                let mut client = st.tidal_client.lock().await;
+                                let mut client = crate::client_timing::lock(
+                                    &st.tidal_client,
+                                    "get_artist_view_all",
+                                )
+                                .await;
                                 client
                                     .get_artist_view_all(artist_id, &path, offset, limit)
                                     .await
@@ -909,7 +1025,8 @@ pub async fn get_artist_view_all(
                             if let Ok(fresh) = result {
                                 if let Ok(json) = serde_json::to_vec(&fresh) {
                                     st.disk_cache
-                                        .put(
+                                        .put_if_current(
+                                            &fetch_ticket,
                                             &key,
                                             &json,
                                             CacheTier::Dynamic,
@@ -919,10 +1036,10 @@ pub async fn get_artist_view_all(
                                         .ok();
                                 }
                             }
-                            st.disk_cache.clear_in_flight(&key).await;
+                            st.disk_cache.finish_refresh(&refresh_ticket).await;
                         });
                     } else {
-                        state.disk_cache.clear_in_flight(&cache_key).await;
+                        state.disk_cache.finish_refresh(&refresh_ticket).await;
                     }
                 }
                 return Ok(data);
@@ -931,7 +1048,7 @@ pub async fn get_artist_view_all(
         CacheResult::Miss => {}
     }
 
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_artist_view_all").await;
     let data = client
         .get_artist_view_all(artist_id, &view_all_path, offset, limit)
         .await?;
@@ -940,7 +1057,8 @@ pub async fn get_artist_view_all(
     if let Ok(json) = serde_json::to_vec(&data) {
         state
             .disk_cache
-            .put(
+            .put_if_current(
+                &fetch_ticket,
                 &cache_key,
                 &json,
                 CacheTier::Dynamic,
@@ -956,12 +1074,16 @@ pub async fn get_artist_view_all(
 #[tauri::command]
 pub async fn debug_home_page_raw(state: State<'_, AppState>) -> Result<String, SoneError> {
     let access_token = {
-        let client = state.tidal_client.lock().await;
+        let client = crate::client_timing::lock(&state.tidal_client, "debug_home_page_raw").await;
         let tokens = client.tokens.as_ref().ok_or(SoneError::NotAuthenticated)?;
         tokens.access_token.clone()
     };
 
-    let gate = { state.tidal_client.lock().await.gate() };
+    let gate = {
+        crate::client_timing::lock(&state.tidal_client, "debug_home_page_raw")
+            .await
+            .gate()
+    };
     if let Some(secs) = gate.cooling_down() {
         return Err(SoneError::Api {
             status: 429,
@@ -1111,7 +1233,7 @@ pub async fn get_similar_albums(
     album_id: u64,
 ) -> Result<Vec<TidalAlbumDetail>, SoneError> {
     log::debug!("[get_similar_albums]: album_id={album_id}");
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_similar_albums").await;
     client.similar_albums(album_id).await
 }
 
@@ -1121,14 +1243,14 @@ pub async fn get_similar_tracks(
     track_id: u64,
 ) -> Result<Vec<TidalTrack>, SoneError> {
     log::debug!("[get_similar_tracks]: track_id={track_id}");
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_similar_tracks").await;
     client.similar_tracks(track_id).await
 }
 
 #[tauri::command(rename_all = "camelCase")]
 pub async fn get_user_mixes(state: State<'_, AppState>) -> Result<Vec<MixPageResult>, SoneError> {
     log::debug!("[get_user_mixes]");
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_user_mixes").await;
     client.list_user_mixes().await
 }
 

@@ -16,7 +16,7 @@ pub async fn get_stream_url(
         track_id,
         quality
     );
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_stream_url").await;
     client.get_stream_url(track_id, &quality).await
 }
 
@@ -26,7 +26,7 @@ pub async fn get_playlist_details(
     playlist_id: String,
 ) -> Result<serde_json::Value, SoneError> {
     log::debug!("[get_playlist_details]: playlist_id={}", playlist_id);
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_playlist_details").await;
     client.get_playlist_details(&playlist_id).await
 }
 
@@ -36,7 +36,7 @@ pub async fn get_track(
     track_id: u64,
 ) -> Result<serde_json::Value, SoneError> {
     log::debug!("[get_track]: track_id={}", track_id);
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_track").await;
     client.get_track(track_id).await
 }
 
@@ -46,7 +46,7 @@ pub async fn get_track_lyrics(
     track_id: u64,
 ) -> Result<TidalLyrics, SoneError> {
     log::debug!("[get_track_lyrics]: track_id={}", track_id);
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_track_lyrics").await;
     client.get_track_lyrics(track_id).await
 }
 
@@ -57,6 +57,7 @@ pub async fn get_track_credits(
 ) -> Result<Vec<TidalCredit>, SoneError> {
     log::debug!("[get_track_credits]: track_id={}", track_id);
 
+    let fetch_ticket = state.disk_cache.begin_fetch().await;
     let cache_key = format!("credits:{}", track_id);
     match state
         .disk_cache
@@ -71,14 +72,20 @@ pub async fn get_track_credits(
         CacheResult::Miss => {}
     }
 
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_track_credits").await;
     let credits = client.get_track_credits(track_id).await?;
     drop(client);
 
     if let Ok(json) = serde_json::to_vec(&credits) {
         state
             .disk_cache
-            .put(&cache_key, &json, CacheTier::StaticMeta, &["credits"])
+            .put_if_current(
+                &fetch_ticket,
+                &cache_key,
+                &json,
+                CacheTier::StaticMeta,
+                &["credits"],
+            )
             .await
             .ok();
     }

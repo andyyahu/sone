@@ -8,7 +8,7 @@ use crate::SoneError;
 #[tauri::command(rename_all = "camelCase")]
 pub async fn get_profile(state: State<'_, AppState>, user_id: u64) -> Result<Profile, SoneError> {
     log::debug!("[get_profile]: user_id={}", user_id);
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_profile").await;
     client.get_profile(user_id).await
 }
 
@@ -25,7 +25,7 @@ pub async fn update_profile_meta(
         artist_id,
         dry_run
     );
-    let client = state.tidal_client.lock().await;
+    let client = crate::client_timing::lock(&state.tidal_client, "update_profile_meta").await;
     client
         .update_artist_meta(artist_id, name.as_deref(), handle.as_deref(), dry_run)
         .await
@@ -38,7 +38,7 @@ pub async fn update_profile_bio(
     text: String,
 ) -> Result<(), SoneError> {
     log::debug!("[update_profile_bio]: bio_id={}", bio_id);
-    let client = state.tidal_client.lock().await;
+    let client = crate::client_timing::lock(&state.tidal_client, "update_profile_bio").await;
     client.update_bio(&bio_id, &text).await
 }
 
@@ -53,7 +53,7 @@ pub async fn update_profile_links(
         artist_id,
         links.len()
     );
-    let client = state.tidal_client.lock().await;
+    let client = crate::client_timing::lock(&state.tidal_client, "update_profile_links").await;
     client.update_external_links(artist_id, links).await
 }
 
@@ -67,7 +67,7 @@ pub async fn upload_profile_picture(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(image_b64.as_bytes())
         .map_err(|e| SoneError::Parse(format!("decode image_b64: {}", e)))?;
-    let client = state.tidal_client.lock().await;
+    let client = crate::client_timing::lock(&state.tidal_client, "upload_profile_picture").await;
     client.upload_profile_picture(artist_id, bytes).await
 }
 
@@ -77,6 +77,6 @@ pub async fn delete_profile_picture(
     artist_id: u64,
 ) -> Result<(), SoneError> {
     log::debug!("[delete_profile_picture]: artist_id={}", artist_id);
-    let client = state.tidal_client.lock().await;
+    let client = crate::client_timing::lock(&state.tidal_client, "delete_profile_picture").await;
     client.delete_profile_picture(artist_id).await
 }

@@ -11,7 +11,7 @@ pub async fn search_tidal(
     limit: u32,
 ) -> Result<TidalSearchResults, SoneError> {
     log::debug!("[search_tidal]: query=\"{}\", limit={}", query, limit);
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "search_tidal").await;
     client.search(&query, limit).await
 }
 
@@ -22,6 +22,6 @@ pub async fn get_suggestions(
     limit: u32,
 ) -> Result<SuggestionsResponse, SoneError> {
     log::debug!("[get_suggestions]: query=\"{}\", limit={}", query, limit);
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_suggestions").await;
     client.get_suggestions(&query, limit).await
 }

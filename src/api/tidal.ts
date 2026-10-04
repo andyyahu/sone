@@ -27,40 +27,35 @@ import type {
   Track,
 } from "../types";
 
-// ==================== In-memory cache (size-based LRU + TTL + hashed keys) ====================
+// ==================== In-memory cache (size-based LRU + TTL + full keys) ====================
 
 interface CacheEntry {
   data: unknown;
   ts: number;
   ttl: number;
   tags: string[];
-  accessOrder: number;
   estimatedSize: number;
+}
+
+interface PendingRequest<T = unknown> {
+  tags: string[];
+  promise: Promise<T>;
 }
 
 const MAX_BYTES = 150 * 1024 * 1024; // 150 MB
 let currentBytes = 0;
-let accessCounter = 0;
 
-const store = new Map<string, CacheEntry>(); // hashedKey → entry
-const tagIndex = new Map<string, Set<string>>(); // tag → Set<hashedKey>
-const keyMap = new Map<string, string>(); // hashedKey → plaintextKey
+// Map insertion order tracks least-to-most recent use without sorting.
+const store = new Map<string, CacheEntry>();
+const tagIndex = new Map<string, Set<string>>();
+// Share misses as well as hits. The full key keeps distinct requests separate.
+const pendingRequests = new Map<string, PendingRequest>();
 
 const TTL = {
   SHORT: 2 * 60_000, // 2 min  — search, suggestions
   MEDIUM: 2 * 60 * 60_000, // 2 hrs  — lyrics, playlists, favorites, mixes, page sections
   STATIC: 24 * 60 * 60_000, // 24 hrs — albums, artists, credits
 };
-
-/** FNV-1a hash → base-36 string */
-function hashKey(key: string): string {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < key.length; i++) {
-    h ^= key.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return (h >>> 0).toString(36);
-}
 
 function estimateSize(data: unknown): number {
   try {
@@ -70,30 +65,26 @@ function estimateSize(data: unknown): number {
   }
 }
 
-function removeEntry(hk: string): void {
-  const entry = store.get(hk);
+function removeEntry(key: string): void {
+  const entry = store.get(key);
   if (!entry) return;
   currentBytes -= entry.estimatedSize;
   for (const tag of entry.tags) {
     const set = tagIndex.get(tag);
     if (set) {
-      set.delete(hk);
+      set.delete(key);
       if (set.size === 0) tagIndex.delete(tag);
     }
   }
-  store.delete(hk);
-  keyMap.delete(hk);
+  store.delete(key);
 }
 
 function evictIfNeeded(requiredBytes: number): void {
   if (currentBytes + requiredBytes <= MAX_BYTES) return;
-  const entries = [...store.entries()].sort(
-    (a, b) => a[1].accessOrder - b[1].accessOrder,
-  );
   const target = MAX_BYTES * 0.9; // evict down to 90%
-  for (const [hk] of entries) {
+  for (const key of store.keys()) {
     if (currentBytes + requiredBytes <= target) break;
-    removeEntry(hk);
+    removeEntry(key);
   }
 }
 
@@ -124,72 +115,95 @@ function cached<T>(
   fetcher: () => Promise<T>,
   ttl: number,
 ): Promise<T> {
-  const hk = hashKey(key);
-  const entry = store.get(hk);
+  const entry = store.get(key);
   if (entry && Date.now() - entry.ts < entry.ttl) {
-    entry.accessOrder = ++accessCounter;
+    store.delete(key);
+    store.set(key, entry);
     return Promise.resolve(entry.data as T);
   }
-  return fetcher()
-    .catch((err) => {
-      checkNetworkError(err);
-      throw err;
-    })
-    .then((data) => {
-      // Remove stale entry if present
-      if (store.has(hk)) removeEntry(hk);
-      const size = estimateSize(data);
-      evictIfNeeded(size);
-      const newEntry: CacheEntry = {
-        data,
-        ts: Date.now(),
-        ttl,
-        tags,
-        accessOrder: ++accessCounter,
-        estimatedSize: size,
-      };
-      store.set(hk, newEntry);
-      keyMap.set(hk, key);
-      currentBytes += size;
-      for (const tag of tags) {
-        let set = tagIndex.get(tag);
-        if (!set) {
-          set = new Set();
-          tagIndex.set(tag, set);
+  const pending = pendingRequests.get(key);
+  if (pending) return pending.promise as Promise<T>;
+
+  const request: PendingRequest<T> = {
+    tags,
+    promise: fetcher()
+      .catch((err) => {
+        checkNetworkError(err);
+        throw err;
+      })
+      .then((data) => {
+        // Invalidating or clearing the cache detaches pending requests too. An
+        // older response still resolves for its caller, but cannot repopulate
+        // the cache after a mutation/logout or replace a newer request's data.
+        if (pendingRequests.get(key) !== request) return data;
+        // Remove stale entry if present
+        if (store.has(key)) removeEntry(key);
+        const size = estimateSize(data);
+        // Oversized results still reach callers without evicting useful data.
+        if (size > MAX_BYTES) return data;
+        evictIfNeeded(size);
+        const newEntry: CacheEntry = {
+          data,
+          ts: Date.now(),
+          ttl,
+          tags,
+          estimatedSize: size,
+        };
+        store.set(key, newEntry);
+        currentBytes += size;
+        for (const tag of tags) {
+          let set = tagIndex.get(tag);
+          if (!set) {
+            set = new Set();
+            tagIndex.set(tag, set);
+          }
+          set.add(key);
         }
-        set.add(hk);
-      }
-      return data;
-    });
+        return data;
+      })
+      .finally(() => {
+        if (pendingRequests.get(key) === request) pendingRequests.delete(key);
+      }),
+  };
+  pendingRequests.set(key, request);
+  return request.promise;
+}
+
+function detachPending(prefix: string): void {
+  for (const [key, request] of pendingRequests) {
+    if (request.tags.includes(prefix) || key.startsWith(prefix)) {
+      pendingRequests.delete(key);
+    }
+  }
 }
 
 /** Remove all cache entries matching a tag (fast path) or key prefix (fallback). */
 export function invalidateCache(prefix: string): void {
+  detachPending(prefix);
   // Fast path: try tag index
   const tagSet = tagIndex.get(prefix);
   if (tagSet) {
-    for (const hk of [...tagSet]) removeEntry(hk);
+    for (const key of [...tagSet]) removeEntry(key);
     return;
   }
-  // Fallback: scan plaintext keys for prefix match
-  for (const [hk, plainKey] of keyMap.entries()) {
-    if (plainKey.startsWith(prefix)) removeEntry(hk);
+  // Fallback: scan full keys for prefix match
+  for (const key of store.keys()) {
+    if (key.startsWith(prefix)) removeEntry(key);
   }
 }
 
 /** Mutate a cached entry in-place. Scans plaintext keys for prefix match. */
 function mutateCache<T>(keyPrefix: string, updater: (data: T) => T): void {
-  for (const [hk, plainKey] of keyMap.entries()) {
-    if (plainKey.startsWith(keyPrefix)) {
-      const entry = store.get(hk);
-      if (entry) {
-        const oldSize = entry.estimatedSize;
-        entry.data = updater(entry.data as T);
-        entry.estimatedSize = estimateSize(entry.data);
-        currentBytes += entry.estimatedSize - oldSize;
-      }
-    }
+  detachPending(keyPrefix);
+  for (const [key, entry] of store) {
+    if (!key.startsWith(keyPrefix)) continue;
+    const oldSize = entry.estimatedSize;
+    entry.data = updater(entry.data as T);
+    entry.estimatedSize = estimateSize(entry.data);
+    currentBytes += entry.estimatedSize - oldSize;
+    if (entry.estimatedSize > MAX_BYTES) removeEntry(key);
   }
+  evictIfNeeded(0);
 }
 
 /** Optimistically prepend a track to all cached favorite-track pages. */
@@ -287,11 +301,10 @@ export function removeArtistFromFollowedCache(
 
 /** Drop the entire cache (e.g. on logout). */
 export function clearCache(): void {
+  pendingRequests.clear();
   store.clear();
   tagIndex.clear();
-  keyMap.clear();
   currentBytes = 0;
-  accessCounter = 0;
 }
 
 /** Clear both frontend in-memory cache AND backend disk cache. */

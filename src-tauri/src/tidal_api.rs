@@ -62,6 +62,79 @@ mod openapi_catalog;
 
 pub use openapi_catalog::PlaylistItemRef;
 
+#[derive(Serialize)]
+pub struct PlaylistFolderQuery<'a> {
+    pub folder_id: &'a str,
+    pub include_only: &'a str,
+    pub offset: u32,
+    pub limit: u32,
+    pub order: &'a str,
+    pub order_direction: &'a str,
+    pub cursor: &'a str,
+}
+
+impl PlaylistFolderQuery<'_> {
+    pub fn cache_key(&self) -> String {
+        format!(
+            "playlist-folders:{}",
+            serde_json::to_string(self).expect("folder query contains only strings and integers")
+        )
+    }
+}
+
+#[cfg(test)]
+mod folder_query_tests {
+    use super::PlaylistFolderQuery;
+
+    #[test]
+    fn folder_cache_distinguishes_filters_and_every_page_parameter() {
+        let mut query = PlaylistFolderQuery {
+            folder_id: "root",
+            include_only: "",
+            offset: 0,
+            limit: 50,
+            order: "DATE",
+            order_direction: "DESC",
+            cursor: "",
+        };
+        let mut keys = std::collections::HashSet::from([query.cache_key()]);
+        query.include_only = "PLAYLIST";
+        assert!(keys.insert(query.cache_key()));
+        query.include_only = "FOLDER";
+        assert!(keys.insert(query.cache_key()));
+        query.folder_id = "child";
+        assert!(keys.insert(query.cache_key()));
+        query.offset = 50;
+        assert!(keys.insert(query.cache_key()));
+        query.limit = 100;
+        assert!(keys.insert(query.cache_key()));
+        query.order = "NAME";
+        assert!(keys.insert(query.cache_key()));
+        query.order_direction = "ASC";
+        assert!(keys.insert(query.cache_key()));
+        query.cursor = "next:page";
+        assert!(keys.insert(query.cache_key()));
+        assert_eq!(query.cache_key(), query.cache_key());
+    }
+
+    #[test]
+    fn delimiters_in_strings_cannot_alias_other_fields() {
+        let mut query = PlaylistFolderQuery {
+            folder_id: "root:a",
+            include_only: "b",
+            offset: 0,
+            limit: 50,
+            order: "DATE",
+            order_direction: "DESC",
+            cursor: "",
+        };
+        let first = query.cache_key();
+        query.folder_id = "root";
+        query.include_only = "a:b";
+        assert_ne!(first, query.cache_key());
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AuthTokens {
     pub access_token: String,
@@ -1323,7 +1396,14 @@ impl TidalClient {
         generation: crate::proxy_http::Generation,
         req: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, SoneError> {
-        Ok(self.http.observe_at(generation, req.send().await)?)
+        let started = std::time::Instant::now();
+        let result = self.http.observe_at(generation, req.send().await);
+        log::debug!(
+            "[http timing] response_headers_ms={:.2} success={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            result.is_ok()
+        );
+        Ok(result?)
     }
 
     /// Single egress point for API traffic. Consults the cooldown before
@@ -3744,14 +3824,17 @@ impl TidalClient {
     /// Returns raw JSON so we can capture the full response shape.
     pub async fn get_playlist_folders(
         &mut self,
-        folder_id: &str,
-        include_only: &str,
-        offset: u32,
-        limit: u32,
-        order: &str,
-        order_direction: &str,
-        cursor: &str,
+        query: PlaylistFolderQuery<'_>,
     ) -> Result<serde_json::Value, SoneError> {
+        let PlaylistFolderQuery {
+            folder_id,
+            include_only,
+            offset,
+            limit,
+            order,
+            order_direction,
+            cursor,
+        } = query;
         let url = format!("{}/my-collection/playlists/folders", TIDAL_API_V2_URL);
         let cc = self.country_code.clone();
         let limit_str = limit.to_string();

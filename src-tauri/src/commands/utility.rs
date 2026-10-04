@@ -49,24 +49,35 @@ pub async fn get_image_bytes(
     state: State<'_, AppState>,
     url: String,
 ) -> Result<tauri::ipc::Response, SoneError> {
+    cached_image_bytes(&state.disk_cache, &state.proxied_http, &url)
+        .await
+        .map(tauri::ipc::Response::new)
+}
+
+async fn cached_image_bytes(
+    cache: &crate::cache::DiskCache,
+    proxied_http: &crate::proxy_http::ProxiedHttp,
+    url: &str,
+) -> Result<Vec<u8>, SoneError> {
     log::debug!("[get_image_bytes]: url={}", url);
 
-    match state.disk_cache.get(&url, CacheTier::Image).await {
+    let fetch_ticket = cache.begin_fetch().await;
+    match cache.get(url, CacheTier::Image).await {
         CacheResult::Fresh(bytes) | CacheResult::Stale(bytes) => {
             log::debug!("[get_image_bytes]: cache hit ({} bytes)", bytes.len());
-            Ok(tauri::ipc::Response::new(bytes))
+            Ok(bytes)
         }
         CacheResult::Miss => {
-            let http_client = state
-                .proxied_http
+            let http_client = proxied_http
                 .client()
                 .map_err(|e| SoneError::ProxyBlocked { reason: e.cause })?;
-            let res = http_client.get(&url).send().await?;
+            // Error pages are not cover art: caching one would make every
+            // later request fail to decode until the image tier expires.
+            let res = http_client.get(url).send().await?.error_for_status()?;
             let bytes = res.bytes().await?.to_vec();
 
-            state
-                .disk_cache
-                .put(&url, &bytes, CacheTier::Image, &["image"])
+            cache
+                .put_if_current(&fetch_ticket, url, &bytes, CacheTier::Image, &["image"])
                 .await
                 .ok();
             log::debug!(
@@ -74,7 +85,7 @@ pub async fn get_image_bytes(
                 bytes.len()
             );
 
-            Ok(tauri::ipc::Response::new(bytes))
+            Ok(bytes)
         }
     }
 }
@@ -722,6 +733,66 @@ pub fn set_enable_logging(enabled: bool) -> Result<(), SoneError> {
 mod tests {
     use super::*;
     use crate::{ProxySettings, ProxyType};
+
+    #[tokio::test]
+    async fn image_http_errors_are_not_cached_and_a_later_success_is_reused() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/cover.jpg", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for (status, body) in [
+                ("404 Not Found", "missing"),
+                ("500 Internal Server Error", "unavailable"),
+                ("200 OK", "cover bytes"),
+            ] {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut reader = tokio::io::BufReader::new(socket);
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                reader
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let cache = crate::cache::DiskCache::new(
+            dir.path(),
+            std::sync::Arc::new(crate::crypto::Crypto::for_tests()),
+        );
+        let http = direct_cell();
+        for _ in 0..2 {
+            assert!(cached_image_bytes(&cache, &http, &url).await.is_err());
+            assert_eq!(cache.stats().await.total_entries, 0);
+            assert!(matches!(
+                cache.get(&url, CacheTier::Image).await,
+                CacheResult::Miss
+            ));
+        }
+        assert_eq!(
+            cached_image_bytes(&cache, &http, &url).await.unwrap(),
+            b"cover bytes"
+        );
+        server.await.unwrap();
+        // The server is gone: a cache hit must also work with HTTP blocked.
+        let blocked = crate::proxy_http::ProxiedHttp::blocked("offline");
+        assert_eq!(
+            cached_image_bytes(&cache, &blocked, &url).await.unwrap(),
+            b"cover bytes"
+        );
+        assert_eq!(cache.stats().await.total_entries, 1);
+    }
 
     fn caps() -> crate::proxy::HostCaps {
         crate::proxy::HostCaps::assume_all_present()

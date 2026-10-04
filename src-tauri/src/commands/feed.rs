@@ -8,19 +8,14 @@ use crate::AppState;
 /// Invalidation tag for every cached feed entry. Intentionally undiscriminated —
 /// `mark_feed_seen` drops the whole tag, so it must cover all users' entries.
 ///
-/// Ordering assumption: on page open, `get_feed`'s `put` and `mark_feed_seen`'s
-/// `invalidate_tag` are unordered, and a `put` landing second would re-tag a body
-/// with the stale nonzero `unseenCount` for a full TTL. Safe today only because
-/// `mark_feed_seen` waits on the `tidal_client` mutex `get_feed` holds across its
-/// fetch and then makes its own network round-trip, while the `put` is a local
-/// disk write. Reintroducing SWR to `get_feed` makes that race live.
+/// Request tickets fence both misses and future refreshes against mark_feed_seen,
+/// so a response that started before invalidation cannot resurrect unread state.
 const FEED_CACHE_TAG: &str = "feed";
 
 /// Cache key for the activity feed. Scoped per user, matching the
 /// convention of every other user-scoped cache in this codebase
-/// (`user-playlists:{id}`, `fav-albums:{id}`, …) — logging out does not purge
-/// the disk cache, so an undiscriminated key would serve the previous
-/// account's feed and unread count after an account switch.
+/// (`user-playlists:{id}`, `fav-albums:{id}`, …) — account identity must remain explicit even when cached data
+/// is being refreshed during an account switch.
 fn feed_cache_key(user_id: u64) -> String {
     format!("feed:activities:{}", user_id)
 }
@@ -35,6 +30,7 @@ fn feed_cache_key(user_id: u64) -> String {
 pub async fn get_feed(state: State<'_, AppState>, user_id: u64) -> Result<FeedResponse, SoneError> {
     log::debug!("[get_feed] user_id={}", user_id);
 
+    let fetch_ticket = state.disk_cache.begin_fetch().await;
     let cache_key = feed_cache_key(user_id);
     if let CacheResult::Fresh(bytes) = state
         .disk_cache
@@ -46,14 +42,20 @@ pub async fn get_feed(state: State<'_, AppState>, user_id: u64) -> Result<FeedRe
         }
     }
 
-    let mut client = state.tidal_client.lock().await;
+    let mut client = crate::client_timing::lock(&state.tidal_client, "get_feed").await;
     let feed = client.fetch_feed(user_id).await?;
     drop(client);
 
     if let Ok(json) = serde_json::to_vec(&feed) {
         state
             .disk_cache
-            .put(&cache_key, &json, CacheTier::UserContent, &[FEED_CACHE_TAG])
+            .put_if_current(
+                &fetch_ticket,
+                &cache_key,
+                &json,
+                CacheTier::UserContent,
+                &[FEED_CACHE_TAG],
+            )
             .await
             .ok();
     }
@@ -65,7 +67,7 @@ pub async fn get_feed(state: State<'_, AppState>, user_id: u64) -> Result<FeedRe
 /// `get_feed` refetches instead of replaying a body with a nonzero count.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn mark_feed_seen(state: State<'_, AppState>, user_id: u64) -> Result<(), SoneError> {
-    let client = state.tidal_client.lock().await;
+    let client = crate::client_timing::lock(&state.tidal_client, "mark_feed_seen").await;
     let result = client.mark_feed_seen(user_id).await;
     drop(client);
 
