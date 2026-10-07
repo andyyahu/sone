@@ -34,7 +34,7 @@ impl std::fmt::Debug for SoneTray {
 /// as required by the StatusNotifierItem D-Bus protocol.
 fn rgba_to_argb(rgba: &[u8]) -> Vec<u8> {
     let mut argb = Vec::with_capacity(rgba.len());
-    for pixel in rgba.chunks_exact(4) {
+    for pixel in rgba.as_chunks::<4>().0 {
         argb.push(pixel[3]); // A
         argb.push(pixel[0]); // R
         argb.push(pixel[1]); // G

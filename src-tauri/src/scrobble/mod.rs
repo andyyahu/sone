@@ -78,6 +78,8 @@ pub enum ScrobbleResult {
 // Provider trait
 // ---------------------------------------------------------------------------
 
+// async_trait adds must_use to the boxed Future returned by each async method.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ScrobbleProvider: Send + Sync {
     fn name(&self) -> &str;
