@@ -12,6 +12,7 @@ mod embedded_config;
 mod embedded_lastfm;
 mod embedded_librefm;
 mod error;
+mod hqplayer;
 mod http_util;
 mod idle_inhibit;
 pub mod logging;
