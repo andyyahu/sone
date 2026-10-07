@@ -395,6 +395,13 @@ impl PipelineProbe {
         self.signal_path
             .set_output_caps(self.audio_player.snapshot_output_caps());
 
+        // HQPlayer owns downstream output; never attribute SONE's mixer/DAC to it.
+        if self.signal_path.snapshot().backend.as_deref() == Some("HQPlayer") {
+            self.signal_path.set_os_mixer(None);
+            self.signal_path.set_dac(None);
+            return;
+        }
+
         // 2. OS mixer via pactl. Best-effort; None on failure.
         let mixer = query_os_mixer();
         self.signal_path.set_os_mixer(mixer.clone());

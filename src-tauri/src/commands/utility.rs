@@ -1,8 +1,9 @@
 use std::sync::atomic::Ordering;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 use super::playback::compute_norm_gain;
 use crate::audio::AudioDevice;
+use crate::audio_output::{AudioOutputConfig, AudioOutputRoute, AudioOutputState};
 use crate::cache::{CacheResult, CacheTier};
 use crate::AppState;
 use crate::SignalPath;
@@ -163,6 +164,16 @@ pub fn set_volume_normalization(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), SoneError> {
+    if state
+        .audio_player
+        .output_state()
+        .active
+        .is_some_and(|config| config.route == AudioOutputRoute::Hqplayer || config.bit_perfect)
+    {
+        return Err(SoneError::Audio(
+            "Normalization is unavailable on the active output".into(),
+        ));
+    }
     state.settings_store.update_with_apply(
         |settings| {
             settings.volume_normalization = enabled;
@@ -196,11 +207,7 @@ pub fn set_volume_normalization(
 fn apply_output_settings(state: &AppState, settings: &crate::Settings) -> Result<(), SoneError> {
     state
         .audio_player
-        .set_exclusive_mode(settings.exclusive_mode, settings.exclusive_device.clone())
-        .map_err(SoneError::Audio)?;
-    state
-        .audio_player
-        .set_bit_perfect(settings.bit_perfect)
+        .configure_output(AudioOutputConfig::from_settings(settings))
         .map_err(SoneError::Audio)?;
     state
         .exclusive_mode
@@ -213,22 +220,160 @@ fn apply_output_settings(state: &AppState, settings: &crate::Settings) -> Result
 }
 
 #[tauri::command]
+pub fn get_audio_output(state: State<'_, AppState>) -> AudioOutputState {
+    state.audio_player.output_state()
+}
+
+fn prepare_audio_output(mut config: AudioOutputConfig) -> Result<AudioOutputConfig, SoneError> {
+    config.validate().map_err(SoneError::Audio)?;
+    match config.route {
+        AudioOutputRoute::Camilla => {
+            #[cfg(target_os = "linux")]
+            crate::camilla_fir::validate_config_file(
+                config.camilla_config.as_deref().expect("validated path"),
+            )
+            .map_err(SoneError::Audio)?;
+            #[cfg(not(target_os = "linux"))]
+            return Err(SoneError::Audio("CamillaDSP requires Linux".into()));
+        }
+        AudioOutputRoute::Hqplayer => {
+            // GetInfo never changes Desktop's transport or opens/releases a DAC.
+            let mut client = crate::hqplayer::ControlSession::connect(
+                &config.hqplayer_host,
+                config.hqplayer_port,
+            )
+            .map_err(|error| SoneError::Audio(format!("HQPlayer is unavailable: {error}")))?;
+            client
+                .get_info()
+                .map_err(|error| SoneError::Audio(format!("HQPlayer is unavailable: {error}")))?;
+        }
+        AudioOutputRoute::Native => {}
+    }
+    Ok(config)
+}
+
+#[tauri::command]
+pub async fn set_audio_output(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    config: AudioOutputConfig,
+) -> Result<AudioOutputState, SoneError> {
+    let _output_guard = state.audio_output_settings_lock.lock().await;
+    // File reads, trial DSP construction and local control probing are not
+    // allowed to hold the global settings mutex or the audio actor.
+    let config = tokio::task::spawn_blocking(move || prepare_audio_output(config))
+        .await
+        .map_err(|error| SoneError::Audio(error.to_string()))??;
+    let handle = app.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let state = handle.state::<AppState>();
+        state.settings_store.update_with_apply_guarded(
+            || state.audio_player.begin_output_update(),
+            |settings| {
+                config.write_settings(settings);
+                Ok(())
+            },
+            |settings| apply_output_settings(&state, settings),
+        )?;
+        Ok::<_, SoneError>(state.audio_player.output_state())
+    })
+    .await
+    .map_err(|error| SoneError::Audio(error.to_string()))??;
+    let _ = app.emit("audio-output-changed", &result);
+    Ok(result)
+}
+
+/// The native chooser runs on GTK's main loop; waiting for it never holds an
+/// output transaction or a settings lock.
+#[tauri::command]
+pub async fn pick_camilla_config(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = app;
+        Err("CamillaDSP requires Linux".into())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.run_on_main_thread(move || {
+            use gtk::prelude::*;
+            let dialog = gtk::FileChooserDialog::builder()
+                .title("Choose CamillaDSP configuration")
+                .action(gtk::FileChooserAction::Open)
+                .modal(true)
+                .build();
+            dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+            dialog.add_button("Open", gtk::ResponseType::Accept);
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("CamillaDSP YAML"));
+            filter.add_pattern("*.yml");
+            filter.add_pattern("*.yaml");
+            dialog.add_filter(filter);
+            let file = (dialog.run() == gtk::ResponseType::Accept)
+                .then(|| dialog.filename())
+                .flatten();
+            dialog.close();
+            let result = file
+                .map(|file| {
+                    file.into_os_string()
+                        .into_string()
+                        .map_err(|_| "Configuration path is not UTF-8".to_owned())
+                })
+                .transpose();
+            let _ = tx.send(result);
+        })
+        .map_err(|error| error.to_string())?;
+        rx.await
+            .map_err(|_| "Configuration chooser closed".to_owned())?
+    }
+}
+
+#[tauri::command]
 pub fn get_exclusive_mode(state: State<'_, AppState>) -> bool {
     state.exclusive_mode.load(Ordering::Relaxed)
 }
 
+async fn update_native_output(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    edit: impl FnOnce(&mut crate::Settings) + Send + 'static,
+) -> Result<(), SoneError> {
+    let _output_guard = state.audio_output_settings_lock.lock().await;
+    let handle = app.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        let state = handle.state::<AppState>();
+        state.settings_store.update_with_apply_guarded(
+            || state.audio_player.begin_output_update(),
+            |settings| {
+                // Resolve legacy route before changing its native preferences.
+                // Disabling exclusive must not accidentally enable/disable DSP.
+                settings.output_route = Some(AudioOutputConfig::from_settings(settings).route);
+                edit(settings);
+                Ok(())
+            },
+            |settings| apply_output_settings(&state, settings),
+        )?;
+        Ok::<_, SoneError>(state.audio_player.output_state())
+    })
+    .await
+    .map_err(|error| SoneError::Audio(error.to_string()))??;
+    let _ = app.emit("audio-output-changed", &output);
+    Ok(())
+}
+
 #[tauri::command]
-pub fn set_exclusive_mode(state: State<'_, AppState>, enabled: bool) -> Result<(), SoneError> {
-    state.settings_store.update_with_apply(
-        |settings| {
-            settings.exclusive_mode = enabled;
-            if !enabled {
-                settings.bit_perfect = false;
-            }
-            Ok(())
-        },
-        |settings| apply_output_settings(&state, settings),
-    )
+pub async fn set_exclusive_mode(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), SoneError> {
+    update_native_output(app, state, move |settings| {
+        settings.exclusive_mode = enabled;
+        if !enabled {
+            settings.bit_perfect = false;
+        }
+    })
+    .await
 }
 
 #[tauri::command]
@@ -237,17 +382,18 @@ pub fn get_bit_perfect(state: State<'_, AppState>) -> bool {
 }
 
 #[tauri::command]
-pub fn set_bit_perfect(state: State<'_, AppState>, enabled: bool) -> Result<(), SoneError> {
-    state.settings_store.update_with_apply(
-        |settings| {
-            settings.bit_perfect = enabled;
-            if enabled {
-                settings.exclusive_mode = true;
-            }
-            Ok(())
-        },
-        |settings| apply_output_settings(&state, settings),
-    )
+pub async fn set_bit_perfect(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), SoneError> {
+    update_native_output(app, state, move |settings| {
+        settings.bit_perfect = enabled;
+        if enabled {
+            settings.exclusive_mode = true;
+        }
+    })
+    .await
 }
 
 #[tauri::command]
@@ -306,14 +452,15 @@ pub fn get_exclusive_device(state: State<'_, AppState>) -> Option<String> {
 }
 
 #[tauri::command]
-pub fn set_exclusive_device(state: State<'_, AppState>, device: String) -> Result<(), SoneError> {
-    state.settings_store.update_with_apply(
-        |settings| {
-            settings.exclusive_device = Some(device);
-            Ok(())
-        },
-        |settings| apply_output_settings(&state, settings),
-    )
+pub async fn set_exclusive_device(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    device: String,
+) -> Result<(), SoneError> {
+    update_native_output(app, state, move |settings| {
+        settings.exclusive_device = Some(device);
+    })
+    .await
 }
 
 #[tauri::command]

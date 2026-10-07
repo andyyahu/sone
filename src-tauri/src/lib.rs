@@ -301,6 +301,9 @@ pub struct AppState {
     pub overlay_state: crate::overlay::OverlayStateRef,
     pub overlay_handle: Mutex<Option<crate::overlay::OverlayHandle>>,
     pub overlay_settings_lock: Mutex<()>,
+    /// Serializes output preparation as well as its short settings transaction.
+    /// Network and DSP validation never run under SettingsStore's mutex.
+    pub audio_output_settings_lock: Mutex<()>,
     pub signal_path: Arc<SignalPathTracker>,
 }
 
@@ -511,6 +514,7 @@ impl AppState {
             },
             overlay_handle: Mutex::new(None),
             overlay_settings_lock: Mutex::new(()),
+            audio_output_settings_lock: Mutex::new(()),
             signal_path,
         }
     }
@@ -663,16 +667,11 @@ pub fn run() {
             // Apply saved audio mode to audio thread
             {
                 let state = app.state::<AppState>();
-                let excl = state
-                    .exclusive_mode
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let bp = state.bit_perfect.load(std::sync::atomic::Ordering::Relaxed);
-                let dev = state.exclusive_device.lock().unwrap().clone();
-                if excl || bp {
-                    state.audio_player.set_exclusive_mode(excl, dev).ok();
-                }
-                if bp {
-                    state.audio_player.set_bit_perfect(true).ok();
+                if let Some(settings) = state.load_settings() {
+                    let config = audio_output::AudioOutputConfig::from_settings(&settings);
+                    if let Err(error) = state.audio_player.configure_output(config) {
+                        log::warn!("Could not restore output preferences: {error}");
+                    }
                 }
                 let _ = state
                     .audio_player
@@ -1104,6 +1103,9 @@ pub fn run() {
             commands::utility::set_exclusive_mode,
             commands::utility::get_bit_perfect,
             commands::utility::set_bit_perfect,
+            commands::utility::get_audio_output,
+            commands::utility::set_audio_output,
+            commands::utility::pick_camilla_config,
             commands::utility::get_gapless,
             commands::utility::get_gapless_supported,
             commands::utility::set_gapless,

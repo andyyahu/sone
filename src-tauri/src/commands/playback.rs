@@ -226,7 +226,7 @@ pub async fn play_tidal_track(
     let player = state.audio_player.clone();
     tokio::task::spawn_blocking(move || {
         player.set_normalization_gain(norm_gain)?;
-        player.play_url(&uri, None)
+        player.play_url(&uri, None, track_id)
     })
     .await
     .map_err(|e| SoneError::Audio(e.to_string()))?
@@ -314,32 +314,44 @@ pub async fn get_video_metadata(
 #[tauri::command]
 pub async fn pause_track(state: State<'_, AppState>) -> Result<(), SoneError> {
     log::debug!("[pause_track]");
-    let result = state.audio_player.pause().map_err(SoneError::Audio);
+    let player = state.audio_player.clone();
+    tokio::task::spawn_blocking(move || player.pause())
+        .await
+        .map_err(|e| SoneError::Audio(e.to_string()))?
+        .map_err(SoneError::Audio)?;
     state.tidal_reporter.on_pause().await;
     state.scrobble_manager.on_pause().await;
-    result
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn resume_track(state: State<'_, AppState>) -> Result<(), SoneError> {
     log::debug!("[resume_track]");
-    let result = state.audio_player.resume().map_err(SoneError::Audio);
+    let player = state.audio_player.clone();
+    tokio::task::spawn_blocking(move || player.resume())
+        .await
+        .map_err(|e| SoneError::Audio(e.to_string()))?
+        .map_err(SoneError::Audio)?;
     state.tidal_reporter.on_resume().await;
     state.scrobble_manager.on_resume().await;
-    result
+    Ok(())
 }
 
 /// Tear down playback: stop the audio pipeline, clear the MPRIS/Discord
 /// now-playing surfaces, and notify the scrobble manager. Shared by the
 /// `stop_track` command and `logout`.
 pub(crate) async fn stop_playback(state: &AppState) -> Result<(), SoneError> {
-    let result = state.audio_player.stop().map_err(SoneError::Audio);
+    let player = state.audio_player.clone();
+    tokio::task::spawn_blocking(move || player.stop())
+        .await
+        .map_err(|e| SoneError::Audio(e.to_string()))?
+        .map_err(SoneError::Audio)?;
     #[cfg(target_os = "linux")]
     state.mpris.send(crate::mpris::MprisCommand::Stop);
     state.discord.send(crate::discord::DiscordCommand::Stop);
     state.tidal_reporter.on_track_stopped().await;
     state.scrobble_manager.on_track_stopped().await;
-    result
+    Ok(())
 }
 
 #[tauri::command]
@@ -379,10 +391,16 @@ pub fn get_playback_position(state: State<'_, AppState>) -> Result<f32, SoneErro
 #[tauri::command(rename_all = "camelCase")]
 pub async fn seek_track(state: State<'_, AppState>, position_secs: f32) -> Result<(), SoneError> {
     log::debug!("[seek_track]: position_secs={:.1}", position_secs);
-    let result = state
-        .audio_player
-        .seek(position_secs)
-        .map_err(SoneError::Audio);
+    if !position_secs.is_finite() || position_secs < 0.0 {
+        return Err(SoneError::Audio(
+            "Seek position must be finite and non-negative".into(),
+        ));
+    }
+    let player = state.audio_player.clone();
+    tokio::task::spawn_blocking(move || player.seek(position_secs))
+        .await
+        .map_err(|e| SoneError::Audio(e.to_string()))?
+        .map_err(SoneError::Audio)?;
     #[cfg(target_os = "linux")]
     state.mpris.send(crate::mpris::MprisCommand::Seeked {
         position_secs: position_secs as f64,
@@ -392,7 +410,7 @@ pub async fn seek_track(state: State<'_, AppState>, position_secs: f32) -> Resul
     });
     state.tidal_reporter.on_seek().await;
     state.scrobble_manager.on_seek().await;
-    result
+    Ok(())
 }
 
 #[tauri::command]

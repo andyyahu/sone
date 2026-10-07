@@ -1,3 +1,6 @@
+use crate::audio_output::{AudioOutputConfig, AudioOutputRoute, AudioOutputState};
+#[cfg(target_os = "linux")]
+use crate::camilla_fir::{FirOutput, FirSlot};
 use crate::signal_path::SignalPathTracker;
 use gst::prelude::*;
 use gstreamer as gst;
@@ -439,6 +442,13 @@ enum WriterCommand {
         generation: u64,
     },
     Flush,
+    /// Arm CamillaDSP for the next track. The same path and generation keep
+    /// the live engine, so every PlayUrl can send this without reloading.
+    #[cfg(target_os = "linux")]
+    SetFir {
+        path: Option<String>,
+        generation: u64,
+    },
     Shutdown,
 }
 
@@ -461,6 +471,14 @@ enum PlaybackBackend {
         user_volume_el: Option<gst::Element>,
         norm_volume_el: Option<gst::Element>,
     },
+    /// Decode to a sized localhost WAV. HQPlayer Desktop owns the DAC.
+    HqPlayer {
+        pipeline: gst::Pipeline,
+        control: Arc<Mutex<Option<crate::hqplayer::ControlSession>>>,
+        feed: crate::hqplayer::WavFeed,
+        heard: Arc<AtomicU32>,
+        finish_emit: Arc<AtomicBool>,
+    },
 }
 
 impl PlaybackBackend {
@@ -468,6 +486,7 @@ impl PlaybackBackend {
         match self {
             PlaybackBackend::Normal { user_volume_el, .. }
             | PlaybackBackend::DirectAlsa { user_volume_el, .. } => user_volume_el.as_ref(),
+            PlaybackBackend::HqPlayer { .. } => None,
         }
     }
 
@@ -475,6 +494,7 @@ impl PlaybackBackend {
         match self {
             PlaybackBackend::Normal { norm_volume_el, .. }
             | PlaybackBackend::DirectAlsa { norm_volume_el, .. } => norm_volume_el.as_ref(),
+            PlaybackBackend::HqPlayer { .. } => None,
         }
     }
 
@@ -483,7 +503,8 @@ impl PlaybackBackend {
     fn pipeline(&self) -> &gst::Pipeline {
         match self {
             PlaybackBackend::Normal { pipeline, .. }
-            | PlaybackBackend::DirectAlsa { pipeline, .. } => pipeline,
+            | PlaybackBackend::DirectAlsa { pipeline, .. }
+            | PlaybackBackend::HqPlayer { pipeline, .. } => pipeline,
         }
     }
 
@@ -496,6 +517,9 @@ impl PlaybackBackend {
             PlaybackBackend::Normal { concat, .. } => concat,
             PlaybackBackend::DirectAlsa { .. } => {
                 panic!("PlaybackBackend::concat() called on DirectAlsa — gapless is normal-only")
+            }
+            PlaybackBackend::HqPlayer { .. } => {
+                panic!("PlaybackBackend::concat() called on HqPlayer — gapless is normal-only")
             }
         }
     }
@@ -563,6 +587,117 @@ fn alsa_format_to_gst(alsa_fmt: alsa::pcm::Format) -> (&'static str, u32) {
 #[inline]
 fn slider_to_amplitude(slider_val: f64) -> f64 {
     slider_val.clamp(0.0, 1.0).powi(3)
+}
+
+/// Triangular (TPDF) noise in (-1, 1), one LSB once it is added to an
+/// integer sample. Two uniform draws summed and recentered.
+struct TpdfDither {
+    state: u64,
+}
+
+impl TpdfDither {
+    fn new() -> Self {
+        // Non-zero seed. The sequence only decorrelates requantization;
+        // it is not a secret.
+        Self {
+            state: 0x5A17_E4D2_C0FF_EE01,
+        }
+    }
+
+    fn uniform(&mut self) -> f64 {
+        // xorshift64*
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        let u = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        (u >> 11) as f64 * (1.0 / ((1u64 << 53) as f64))
+    }
+
+    fn triangular(&mut self) -> f64 {
+        self.uniform() - self.uniform()
+    }
+}
+
+/// Scale interleaved PCM by `gain`.
+///
+/// Unity gain returns without reading the samples, so bit-perfect playback at
+/// slider 100% and ReplayGain 1 stays byte-identical. A product that already
+/// lands on an integer is stored as that integer. Every other integer sample
+/// gets one LSB of TPDF before it is rounded, which is what keeps attenuation
+/// from turning into correlated quantization distortion. `S24_32LE` keeps its
+/// 24 bits in the low three bytes (GStreamer 1.28); the high byte is the sign
+/// extension. Float samples are multiplied and clamped, with no dither.
+/// Gain 0 is digital silence, including a ragged tail, so mute does not leave
+/// a dither floor.
+fn apply_pcm_gain(data: &mut [u8], gst_format: &str, gain: f32, dither: &mut impl FnMut() -> f64) {
+    if !gain.is_finite() || (gain - 1.0).abs() < f32::EPSILON {
+        return;
+    }
+    // Exact zero, including -0.0. Any other finite gain still scales the samples.
+    #[allow(clippy::float_cmp)]
+    if gain == 0.0 {
+        data.fill(0);
+        return;
+    }
+    let gain_f = gain as f64;
+
+    // f64's ulp around 2^31 is ~5e-7. Anything closer than 1e-4 to an integer
+    // is the multiply landing on that integer, not a real fraction.
+    const EXACT_EPS: f64 = 1e-4;
+
+    let quantize = |sample: i64, lo: i64, hi: i64, dither: &mut dyn FnMut() -> f64| -> i64 {
+        let scaled = sample as f64 * gain_f;
+        let nearest = scaled.round();
+        let quant = if (scaled - nearest).abs() < EXACT_EPS {
+            nearest
+        } else {
+            (scaled + dither()).round()
+        };
+        quant.clamp(lo as f64, hi as f64) as i64
+    };
+
+    match gst_format {
+        "S16LE" => {
+            for chunk in data.as_chunks_mut::<2>().0 {
+                let s = i16::from_le_bytes([chunk[0], chunk[1]]);
+                let v = quantize(s as i64, i16::MIN as i64, i16::MAX as i64, dither) as i16;
+                chunk.copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        "S32LE" => {
+            for chunk in data.as_chunks_mut::<4>().0 {
+                let s = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let v = quantize(s as i64, i32::MIN as i64, i32::MAX as i64, dither) as i32;
+                chunk.copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        "S24_32LE" => {
+            for chunk in data.as_chunks_mut::<4>().0 {
+                let s = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let v = quantize(s as i64, -8_388_608, 8_388_607, dither) as i32;
+                chunk.copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        "S24LE" => {
+            for chunk in data.as_chunks_mut::<3>().0 {
+                let raw = chunk[0] as i32 | (chunk[1] as i32) << 8 | (chunk[2] as i8 as i32) << 16;
+                let v = quantize(raw as i64, -8_388_608, 8_388_607, dither) as i32;
+                chunk[0] = v as u8;
+                chunk[1] = (v >> 8) as u8;
+                chunk[2] = (v >> 16) as u8;
+            }
+        }
+        "F32LE" => {
+            for chunk in data.as_chunks_mut::<4>().0 {
+                let s = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let v = (s * gain).clamp(-1.0, 1.0);
+                chunk.copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Applies a normalization gain across all volume sinks: the GStreamer
@@ -772,6 +907,7 @@ fn run_attach_executor(
     next_bin: Arc<Mutex<Option<NextBinState>>>,
     audio_proxy: Arc<Mutex<AudioProxy>>,
     route_generation: Arc<AtomicU64>,
+    hq_enabled: Arc<AtomicBool>,
 ) {
     for job in job_rx {
         match job {
@@ -791,6 +927,10 @@ fn run_attach_executor(
                 // lands from here on, this branch is built under a route that is
                 // no longer current and must not be armed.
                 let generation_at_start = route_generation.load(Ordering::Acquire);
+                if hq_enabled.load(Ordering::Acquire) {
+                    log::debug!("[hqplayer] skipping gapless preroll");
+                    continue;
+                }
                 // The route below is recomputed from the current settings, but
                 // it is not what configures this branch: the target pipeline's
                 // hook is, and that hook holds the route of `build_generation`.
@@ -833,14 +973,16 @@ fn run_attach_executor(
                             Ok(g) => g,
                             Err(poisoned) => poisoned.into_inner(),
                         };
-                        if route_generation.load(Ordering::Acquire) != generation_at_start {
+                        if route_generation.load(Ordering::Acquire) != generation_at_start
+                            || hq_enabled.load(Ordering::Acquire)
+                        {
                             // The branch is already in the pipeline and linked to
                             // concat's sink_1, so concat would switch to it at the
                             // boundary whether or not this slot names it. Dropping
                             // the reference is not enough — it has to be detached.
                             drop(guard);
                             log::warn!(
-                                "[proxy] discarding a next branch prerolled under the previous route"
+                                "[audio] discarding a next branch that must not become current"
                             );
                             detach_bin(&pipeline, &concat, &bin, &branch_queue);
                             continue;
@@ -1089,6 +1231,7 @@ fn configure_alsa_hwparams(
     pcm: &alsa::PCM,
     fmt: &PcmFormat,
     bit_perfect: bool,
+    exact_rate: bool,
 ) -> Result<PcmFormat, String> {
     use alsa::pcm::{Access, Format, HwParams};
     use alsa::ValueOr;
@@ -1148,36 +1291,34 @@ fn configure_alsa_hwparams(
         })?
     };
 
-    if bit_perfect {
+    let lock_rate = bit_perfect || exact_rate;
+    if lock_rate {
         hwp.set_rate_resample(false)
             .map_err(|e| format!("set_rate_resample: {e}"))?;
     }
     hwp.set_rate(fmt.sample_rate, ValueOr::Nearest)
         .map_err(|e| {
-            if bit_perfect {
-                log::warn!(
-                    "[audio] bit-perfect set_rate({}) failed: {e}",
-                    fmt.sample_rate
-                );
+            if lock_rate {
+                log::warn!("[audio] set_rate({}) failed: {e}", fmt.sample_rate);
                 format!(
-                    "DAC doesn't support {}kHz — turn off bit-perfect mode for compatibility",
-                    fmt.sample_rate / 1000
+                    "Audio device cannot preserve source rate {} Hz",
+                    fmt.sample_rate
                 )
             } else {
                 format!("set_rate({}): {e}", fmt.sample_rate)
             }
         })?;
-    if bit_perfect {
+    if lock_rate {
         let actual_rate = hwp.get_rate().map_err(|e| format!("get_rate: {e}"))?;
         if actual_rate != fmt.sample_rate {
             log::warn!(
-                "[audio] bit-perfect rate mismatch: DAC negotiated {}Hz, track requires {}Hz",
+                "[audio] rate mismatch: DAC negotiated {}Hz, track requires {}Hz",
                 actual_rate,
                 fmt.sample_rate
             );
             return Err(format!(
-                "DAC doesn't support {}kHz — turn off bit-perfect mode for compatibility",
-                fmt.sample_rate / 1000
+                "Audio device cannot preserve source rate {} Hz",
+                fmt.sample_rate
             ));
         }
     }
@@ -1295,6 +1436,7 @@ struct AlsaWriterConfig<'a> {
     writer_gen: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
     bit_perfect: bool,
+    preserve_rate: bool,
     combined_vol: Arc<AtomicU32>,
     signal_path: Arc<SignalPathTracker>,
     decoded_cell: Arc<Mutex<Option<crate::pipeline_probe::PadCaps>>>,
@@ -1323,6 +1465,7 @@ fn spawn_alsa_writer(config: AlsaWriterConfig<'_>) -> Result<AlsaWriterParts, St
         writer_gen,
         paused,
         bit_perfect,
+        preserve_rate,
         combined_vol,
         signal_path,
         decoded_cell,
@@ -1380,7 +1523,7 @@ fn spawn_alsa_writer(config: AlsaWriterConfig<'_>) -> Result<AlsaWriterParts, St
     };
 
     let requested_for_fallback = initial_format.clone();
-    let initial_format = configure_alsa_hwparams(&pcm, &initial_format, false)?;
+    let initial_format = configure_alsa_hwparams(&pcm, &initial_format, false, false)?;
     pcm.prepare().map_err(|e| format!("pcm.prepare: {e}"))?;
     current_sample_rate.store(initial_format.sample_rate, Ordering::Relaxed);
     let negotiated_fmt = initial_format.clone();
@@ -1408,6 +1551,7 @@ fn spawn_alsa_writer(config: AlsaWriterConfig<'_>) -> Result<AlsaWriterParts, St
 
             let silence_frames = (current_fmt.sample_rate as usize * 50) / 1000;
             let mut silence_buf = vec![0u8; silence_frames * current_fmt.channels as usize * current_fmt.bytes_per_sample as usize];
+            let mut tpdf = TpdfDither::new();
 
             // Bit-perfect promotion announcement: pad_added sends only the source format,
             // writer emits the toast once the actually-negotiated `current_fmt` is known.
@@ -1443,53 +1587,90 @@ fn spawn_alsa_writer(config: AlsaWriterConfig<'_>) -> Result<AlsaWriterParts, St
                 }
             };
 
-            /// Scale raw PCM samples in-place by a volume multiplier.
-            fn apply_volume(data: &mut [u8], fmt: &PcmFormat, vol: f32) {
-                if (vol - 1.0).abs() < f32::EPSILON {
-                    return; // unity gain — no-op
+            fn report_fir_failure(app_handle: &tauri::AppHandle, message: &str) {
+                log::warn!("[camilla-fir] failed: {message}");
+                app_handle
+                    .emit(
+                        "camilla-fir-status",
+                        serde_json::json!({ "message": message }),
+                    )
+                    .ok();
+            }
+
+            fn mark_fir(_fir: &mut FirSlot, fir_live: &mut bool, signal_path: &SignalPathTracker, app_handle: &tauri::AppHandle, failed: Option<&str>) {
+                if let Some(message) = failed {
+                    if *fir_live {
+                        *fir_live = false;
+                        signal_path.set_camilla_fir(false);
+                    }
+                    report_fir_failure(app_handle, message);
+                    return;
                 }
-                match fmt.gst_format.as_str() {
-                    "S16LE" => {
-                        for chunk in data.chunks_exact_mut(2) {
-                            let s = i16::from_le_bytes([chunk[0], chunk[1]]);
-                            let v = (s as f32 * vol).round() as i32;
-                            let clamped = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                            chunk.copy_from_slice(&clamped.to_le_bytes());
+                // A track start clears the snapshot without telling this
+                // thread. Publish every chunk and let the tracker drop duplicates.
+                signal_path.set_camilla_fir(true);
+                *fir_live = true;
+            }
+
+            /// CamillaDSP, then the byte path. Volume dither stays in
+            /// `apply_pcm_gain` when Camilla is off. An empty `Processed`
+            /// buffer is held inside Camilla.
+            #[allow(clippy::too_many_arguments)]
+            fn play_chunk(
+                pcm: &alsa::PCM,
+                data: &mut [u8],
+                source: &PcmFormat,
+                device: &PcmFormat,
+                vol: f32,
+                dither: &mut TpdfDither,
+                fir: &mut FirSlot,
+                fir_live: &mut bool,
+                signal_path: &SignalPathTracker,
+                app_handle: &tauri::AppHandle,
+                frames_written: &AtomicU64,
+                _silence_buf: &[u8],
+                cancelled: &AtomicBool,
+                paused: &AtomicBool,
+            ) -> Result<(), &'static str> {
+                if source.gst_format != device.gst_format || source.channels != device.channels {
+                    log::error!(
+                        "[alsa-writer] PCM layout {}/{}ch does not match the device {}/{}ch",
+                        source.gst_format,
+                        source.channels,
+                        device.gst_format,
+                        device.channels
+                    );
+                    return Err("write_error");
+                }
+                let output = fir.render(
+                    data,
+                    source.sample_rate,
+                    source.channels,
+                    &source.gst_format,
+                    vol,
+                    &mut || dither.triangular(),
+                );
+                match output {
+                    FirOutput::Off => {
+                        if *fir_live {
+                            *fir_live = false;
+                            signal_path.set_camilla_fir(false);
+                        }
+                        apply_pcm_gain(data, &source.gst_format, vol, &mut || dither.triangular());
+                        write_pcm(&mut AlsaIo(pcm), data, device.channels as usize * device.bytes_per_sample as usize, cancelled, paused, frames_written)
+                    }
+                    FirOutput::Processed(bytes) => {
+                        mark_fir(fir, fir_live, signal_path, app_handle, None);
+                        if bytes.is_empty() {
+                            Ok(())
+                        } else {
+                            write_pcm(&mut AlsaIo(pcm), &bytes, device.channels as usize * device.bytes_per_sample as usize, cancelled, paused, frames_written)
                         }
                     }
-                    "S32LE" => {
-                        for chunk in data.chunks_exact_mut(4) {
-                            let s = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                            let v = (s as f64 * vol as f64).round() as i64;
-                            let clamped = v.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-                            chunk.copy_from_slice(&clamped.to_le_bytes());
-                        }
+                    FirOutput::Failed(message) => {
+                        mark_fir(fir, fir_live, signal_path, app_handle, Some(&message));
+                        Err("dsp_processing_failed")
                     }
-                    "S24_32LE" => {
-                        for chunk in data.chunks_exact_mut(4) {
-                            let s = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                            let v = (s as f64 * vol as f64).round() as i64;
-                            let clamped = v.clamp(-8_388_608, 8_388_607) as i32;
-                            chunk.copy_from_slice(&clamped.to_le_bytes());
-                        }
-                    }
-                    "S24LE" => {
-                        for chunk in data.chunks_exact_mut(3) {
-                            let raw = chunk[0] as i32 | (chunk[1] as i32) << 8 | (chunk[2] as i8 as i32) << 16;
-                            let v = (raw as f64 * vol as f64).round() as i64;
-                            let clamped = v.clamp(-8_388_608, 8_388_607) as i32;
-                            chunk[0] = clamped as u8;
-                            chunk[1] = (clamped >> 8) as u8;
-                            chunk[2] = (clamped >> 16) as u8;
-                        }
-                    }
-                    "F32LE" => {
-                        for chunk in data.chunks_exact_mut(4) {
-                            let s = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                            chunk.copy_from_slice(&(s * vol).clamp(-1.0, 1.0).to_le_bytes());
-                        }
-                    }
-                    _ => {}
                 }
             }
 
@@ -1502,10 +1683,11 @@ fn spawn_alsa_writer(config: AlsaWriterConfig<'_>) -> Result<AlsaWriterParts, St
                 sr: &AtomicU32,
                 sbuf: &mut Vec<u8>,
                 bit_perfect: bool,
+                exact_rate: bool,
             ) -> Result<(alsa::PCM, PcmFormat), String> {
                 let pcm = alsa::PCM::new(device, alsa::Direction::Playback, true)
                     .map_err(|e| format!("Failed to reopen ALSA device: {e}"))?;
-                let negotiated = configure_alsa_hwparams(&pcm, fmt, bit_perfect)?;
+                let negotiated = configure_alsa_hwparams(&pcm, fmt, bit_perfect, exact_rate)?;
                 pcm.prepare().map_err(|e| format!("pcm.prepare: {e}"))?;
                 sr.store(negotiated.sample_rate, Ordering::Relaxed);
                 let silence_frames = (negotiated.sample_rate as usize * 50) / 1000;
@@ -1513,18 +1695,15 @@ fn spawn_alsa_writer(config: AlsaWriterConfig<'_>) -> Result<AlsaWriterParts, St
                 Ok((pcm, negotiated))
             }
 
-            fn drain_writer_rx(rx: &crossbeam_channel::Receiver<WriterCommand>) -> bool {
-                while let Ok(cmd) = rx.try_recv() {
-                    if let WriterCommand::Shutdown = cmd { return true; }
-                }
-                false
-            }
-
             log::info!(
                 "[alsa-writer] started, device={device}, format={}, rate={}Hz, channels={}, bps={}, combined_vol={}",
                 current_fmt.gst_format, current_fmt.sample_rate, current_fmt.channels, current_fmt.bytes_per_sample,
                 f32::from_bits(combined_vol.load(Ordering::Relaxed))
             );
+
+            let mut fir_slot = FirSlot::new();
+            let mut fir_live = false;
+            let mut last_data_generation: u64 = 0;
 
             'main: loop {
                 if cancelled.load(Ordering::Acquire) { break; }
@@ -1576,7 +1755,7 @@ fn spawn_alsa_writer(config: AlsaWriterConfig<'_>) -> Result<AlsaWriterParts, St
                         if chunk.format != current_fmt {
                             log::info!("[alsa-writer] format change: {current_fmt:?} -> {:?}", chunk.format);
                             drop(pcm);
-                            match reopen_alsa(&device, &chunk.format, &current_sample_rate, &mut silence_buf, bit_perfect) {
+                            match reopen_alsa(&device, &chunk.format, &current_sample_rate, &mut silence_buf, bit_perfect, preserve_rate) {
                                 Ok((new_pcm, negotiated)) => {
                                     pcm = new_pcm;
                                     if negotiated.gst_format != chunk.format.gst_format
@@ -1609,9 +1788,27 @@ fn spawn_alsa_writer(config: AlsaWriterConfig<'_>) -> Result<AlsaWriterParts, St
                             }
                         }
                         resolve_pending(&mut pending_promotion_from, &current_fmt);
+                        if chunk.generation != last_data_generation {
+                            fir_slot.discard();
+                            last_data_generation = chunk.generation;
+                        }
                         let vol = f32::from_bits(combined_vol.load(Ordering::Relaxed));
-                        apply_volume(&mut chunk.data, &current_fmt, vol);
-                        if let Err(kind) = write_bytes(&pcm, &chunk.data, &current_fmt, &frames_written, &silence_buf) {
+                        if let Err(kind) = play_chunk(
+                            &pcm,
+                            &mut chunk.data,
+                            &chunk.format,
+                            &current_fmt,
+                            vol,
+                            &mut tpdf,
+                            &mut fir_slot,
+                            &mut fir_live,
+                            sp.as_ref(),
+                            &app_handle,
+                            frames_written.as_ref(),
+                            &silence_buf,
+                            &cancelled,
+                            &paused,
+                        ) {
                             if kind == "cancelled" { break 'main; }
                             app_handle.emit("audio-error", serde_json::json!({ "kind": kind })).ok();
                             tearing_down.store(true, Ordering::SeqCst);
@@ -1624,7 +1821,7 @@ fn spawn_alsa_writer(config: AlsaWriterConfig<'_>) -> Result<AlsaWriterParts, St
                             log::info!("[alsa-writer] format hint: {current_fmt:?} -> {new_fmt:?}");
                             let requested = new_fmt.clone();
                             drop(pcm);
-                            match reopen_alsa(&device, &new_fmt, &current_sample_rate, &mut silence_buf, bit_perfect) {
+                            match reopen_alsa(&device, &new_fmt, &current_sample_rate, &mut silence_buf, bit_perfect, preserve_rate) {
                                 Ok((new_pcm, negotiated)) => {
                                     pcm = new_pcm;
                                     // Format fallback is allowed here (handled below); a
@@ -1657,13 +1854,6 @@ fn spawn_alsa_writer(config: AlsaWriterConfig<'_>) -> Result<AlsaWriterParts, St
                         }
                     }
 
-                    Ok(WriterCommand::Resampling { from, to }) => {
-                        log::info!("[alsa-writer] resampling: {}kHz -> {}kHz", from / 1000, to / 1000);
-                        sp.record_resample(from, to);
-                        app_handle.emit("audio-resampled",
-                            serde_json::json!({ "from": from, "to": to })).ok();
-                    }
-
                     Ok(WriterCommand::PendingPromotion { from, generation }) => {
                         if generation < writer_gen.load(Ordering::Acquire) {
                             continue; // stale promotion from old pipeline
@@ -1678,7 +1868,44 @@ fn spawn_alsa_writer(config: AlsaWriterConfig<'_>) -> Result<AlsaWriterParts, St
                         if generation < writer_gen.load(Ordering::Acquire) {
                             continue; // stale EOS from old pipeline
                         }
-                        let got_shutdown = drain_writer_rx(&rx);
+                        let vol = f32::from_bits(combined_vol.load(Ordering::Relaxed));
+                        let mut end_failed = false;
+                        match fir_slot.flush(
+                            current_fmt.sample_rate,
+                            current_fmt.channels,
+                            &current_fmt.gst_format,
+                            vol,
+                            &mut || tpdf.triangular(),
+                        ) {
+                            FirOutput::Processed(bytes) => {
+                                if !bytes.is_empty() {
+                                    if let Err(kind) = write_bytes(
+                                        &pcm,
+                                        &bytes,
+                                        &current_fmt,
+                                        &frames_written,
+                                        &silence_buf,
+                                    ) {
+                                        app_handle
+                                            .emit("audio-error", serde_json::json!({ "kind": kind }))
+                                            .ok();
+                                        tearing_down.store(true, Ordering::SeqCst);
+                                        end_failed = true;
+                                    }
+                                }
+                            }
+                            FirOutput::Failed(message) => {
+                                report_fir_failure(&app_handle, &message);
+                                app_handle.emit("audio-error", serde_json::json!({"kind":"dsp_processing_failed", "message":message})).ok();
+                                tearing_down.store(true, Ordering::SeqCst);
+                                end_failed = true;
+                            },
+                            FirOutput::Off => {}
+                        }
+                        if end_failed {
+                            break 'main;
+                        }
+                        fir_slot.discard();
                         if let Err(kind) = write_silence(&pcm, &silence_buf) {
                                 if kind == "cancelled" { break 'main; }
                             *decoded_cell.lock().unwrap() = None;
@@ -1694,7 +1921,6 @@ fn spawn_alsa_writer(config: AlsaWriterConfig<'_>) -> Result<AlsaWriterParts, St
                             app_handle.emit("track-finished", ()).ok();
                         }
 
-                        if got_shutdown { break; }
 
                         // Idle silence loop — keep DAC clock alive between tracks
                         log::debug!("[alsa-writer] entering idle silence loop");
@@ -1718,7 +1944,7 @@ fn spawn_alsa_writer(config: AlsaWriterConfig<'_>) -> Result<AlsaWriterParts, St
                                     if chunk.format != current_fmt {
                                                     // reopen_alsa drops old PCM — buffer cleared implicitly
                                         drop(pcm);
-                                        match reopen_alsa(&device, &chunk.format, &current_sample_rate, &mut silence_buf, bit_perfect) {
+                                        match reopen_alsa(&device, &chunk.format, &current_sample_rate, &mut silence_buf, bit_perfect, preserve_rate) {
                                             Ok((new_pcm, negotiated)) => {
                                                 pcm = new_pcm;
                                                 if negotiated.gst_format != chunk.format.gst_format
@@ -1753,23 +1979,53 @@ fn spawn_alsa_writer(config: AlsaWriterConfig<'_>) -> Result<AlsaWriterParts, St
                                         pcm.prepare().ok();
                                     }
                                     resolve_pending(&mut pending_promotion_from, &current_fmt);
+                                    if chunk.generation != last_data_generation {
+                                        fir_slot.discard();
+                                        last_data_generation = chunk.generation;
+                                    }
                                     let vol = f32::from_bits(combined_vol.load(Ordering::Relaxed));
-                                    apply_volume(&mut chunk.data, &current_fmt, vol);
-                                    if let Err(kind) = write_bytes(&pcm, &chunk.data, &current_fmt, &frames_written, &silence_buf) {
-                            if kind == "cancelled" { break 'main; }
+                                    if let Err(kind) = play_chunk(
+                                        &pcm,
+                                        &mut chunk.data,
+                                        &chunk.format,
+                                        &current_fmt,
+                                        vol,
+                                        &mut tpdf,
+                                        &mut fir_slot,
+                                        &mut fir_live,
+                                        sp.as_ref(),
+                                        &app_handle,
+                                        frames_written.as_ref(),
+                                        &silence_buf,
+                                        &cancelled,
+                                        &paused,
+                                    ) {
+                                        if kind == "cancelled" { break 'main; }
                                         app_handle.emit("audio-error", serde_json::json!({ "kind": kind })).ok();
                                         break 'main;
                                     }
                                     break; // back to main loop
                                 }
                                 Ok(WriterCommand::Shutdown) => break 'main,
-                                Ok(WriterCommand::Flush) => { drain_writer_rx(&rx); pcm.drop().ok(); pcm.prepare().ok(); pending_promotion_from = None; break; }
+                                Ok(WriterCommand::Flush) => {
+                                    pcm.drop().ok();
+                                    pcm.prepare().ok();
+                                    pending_promotion_from = None;
+                                    fir_slot.discard();
+                                    break;
+                                }
+                                Ok(WriterCommand::SetFir { path, generation }) => {
+                                    if fir_slot.set_path(path, generation) && fir_live {
+                                        fir_live = false;
+                                        sp.set_camilla_fir(false);
+                                    }
+                                }
                                 Ok(WriterCommand::FormatHint(new_fmt)) => {
                                                 if new_fmt != current_fmt {
                                         log::info!("[alsa-writer] format hint (idle): {current_fmt:?} -> {new_fmt:?}");
                                         let requested = new_fmt.clone();
                                         drop(pcm);
-                                        match reopen_alsa(&device, &new_fmt, &current_sample_rate, &mut silence_buf, bit_perfect) {
+                                        match reopen_alsa(&device, &new_fmt, &current_sample_rate, &mut silence_buf, bit_perfect, preserve_rate) {
                                             Ok((new_pcm, negotiated)) => {
                                                 pcm = new_pcm;
                                                 if negotiated.channels != requested.channels {
@@ -1815,10 +2071,22 @@ fn spawn_alsa_writer(config: AlsaWriterConfig<'_>) -> Result<AlsaWriterParts, St
                     }
 
                     Ok(WriterCommand::Flush) => {
-                        drain_writer_rx(&rx);
                         pcm.drop().ok();
                         pcm.prepare().ok();
                         pending_promotion_from = None;
+                        fir_slot.discard();
+                    }
+
+                    Ok(WriterCommand::Resampling { from, to }) => {
+                        sp.record_resample(from, to);
+                        app_handle.emit("audio-resampled", serde_json::json!({ "from": from, "to": to })).ok();
+                    }
+
+                    Ok(WriterCommand::SetFir { path, generation }) => {
+                        if fir_slot.set_path(path, generation) && fir_live {
+                            fir_live = false;
+                            sp.set_camilla_fir(false);
+                        }
                     }
 
                     Ok(WriterCommand::Shutdown) => {
@@ -1869,6 +2137,9 @@ enum AudioCommand {
         /// `Some` is a rebuild that has to resume where the torn-down pipeline
         /// was, which is how a mid-track route change stays inaudible.
         start_secs: Option<f32>,
+        preserve_output: bool,
+        track_id: Option<u64>,
+        resume_paused: bool,
         reply: Reply<Result<(), String>>,
     },
     Pause {
@@ -1898,15 +2169,7 @@ enum AudioCommand {
     IsFinished {
         reply: Reply<Result<bool, String>>,
     },
-    SetExclusiveMode {
-        enabled: bool,
-        device: Option<String>,
-        reply: Reply<Result<(), String>>,
-    },
-    SetBitPerfect {
-        enabled: bool,
-        reply: Reply<Result<(), String>>,
-    },
+    OutputChanged,
     SetProxySettings {
         settings: crate::ProxySettings,
         reply: Reply<()>,
@@ -1933,6 +2196,9 @@ enum AudioCommand {
     /// (by pad identity) that concat switched to the prerolled next branch.
     /// Fieldless (C6) — the handler reads everything from the `next_bin` slot.
     HandleGaplessAdvance,
+    /// HQPlayer stayed in play and its position restarted near the start of the
+    /// queued WAV. Fieldless: the handler takes the prepared next slot.
+    HandleHqAdvance,
     /// 2b-A3: forwarded by the Normal bus watcher when an Error originates inside
     /// the prerolled next bin. The worker detaches that bin (gated on
     /// !next_active) without disturbing the currently-playing track.
@@ -1947,6 +2213,8 @@ enum AudioCommand {
 #[derive(Clone)]
 pub struct AudioPlayer {
     cmd_tx: mpsc::Sender<AudioCommand>,
+    output_state: Arc<Mutex<AudioOutputState>>,
+    output_transaction: Arc<Mutex<()>>,
     /// Latest exclusive ALSA device set via `SetExclusiveMode`. Mirrored from
     /// the audio thread so the pipeline probe can read it without messaging.
     exclusive_device: Arc<Mutex<Option<String>>>,
@@ -1965,6 +2233,10 @@ impl AudioPlayer {
         // HandleGaplessAdvance back to this loop (Task 3). `cmd_tx` itself is
         // owned by AudioPlayer, not the worker closure.
         let cmd_tx_worker = cmd_tx.clone();
+        let output_state = Arc::new(Mutex::new(AudioOutputState::default()));
+        let output_state_thread = Arc::clone(&output_state);
+        let output_transaction = Arc::new(Mutex::new(()));
+        let output_transaction_thread = Arc::clone(&output_transaction);
         let exclusive_device: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let exclusive_device_thread = exclusive_device.clone();
         let decoded_caps_cell: Arc<Mutex<Option<crate::pipeline_probe::PadCaps>>> =
@@ -2020,6 +2292,7 @@ impl AudioPlayer {
             // negotiation), so a same-device exclusive↔bit-perfect toggle must
             // force a respawn rather than reuse a stale-mode writer.
             let mut writer_bit_perfect: Option<bool> = None;
+            let mut writer_preserve_rate = false;
             let frames_written = Arc::new(AtomicU64::new(0));
             let current_sample_rate = Arc::new(AtomicU32::new(48000));
             let writer_gen = Arc::new(AtomicU64::new(0));
@@ -2033,6 +2306,12 @@ impl AudioPlayer {
             let mut exclusive = false;
             let mut bit_perfect = false;
             let mut device: Option<String> = None;
+            // CamillaDSP FIR path. None leaves exclusive output as direct PCM.
+            // Applied to the ALSA writer on the next PlayUrl, not mid-buffer.
+            #[cfg(target_os = "linux")]
+            let mut camilla_path: Option<String> = None;
+            #[cfg(target_os = "linux")]
+            let mut camilla_generation: u64 = 0;
 
             let mut current_volume: f64 = 1.0;
             let mut current_norm_gain: f64 = 1.0;
@@ -2047,6 +2326,29 @@ impl AudioPlayer {
             // Normal bus thread clones for gapless advance handling (2b-A3).
             let mut gapless_setting: bool = true;
             let cmd_tx_worker = cmd_tx_worker;
+            // HQPlayer Desktop handoff. The flag is shared with the gapless
+            // executor so a preroll already in flight is not armed after the
+            // switch. The committed configuration selects a loopback address
+            // and control port; pending settings never change this live endpoint.
+            let hq_enabled = Arc::new(AtomicBool::new(false));
+            let mut hq_host = "127.0.0.1".to_string();
+            let mut hq_port: u16 = crate::hqplayer::DEFAULT_PORT;
+            let hq_control: Arc<Mutex<Option<crate::hqplayer::ControlSession>>> =
+                Arc::new(Mutex::new(None));
+            let hq_gen = Arc::new(AtomicU64::new(0));
+            // `started_gen` is the `hq_gen` whose watcher has seen state 2.
+            // A bool would let the previous watcher mark the next track started.
+            let hq_watch = Arc::new(HqWatch {
+                cmd_tx: cmd_tx_worker.clone(),
+                next: Mutex::new(None),
+                preparing: Mutex::new(None),
+                last_status: Mutex::new(None),
+                output_state: Arc::clone(&output_state_thread),
+                output_transaction: Arc::clone(&output_transaction_thread),
+                started_gen: AtomicU64::new(0),
+                advancing: AtomicBool::new(false),
+                next_gen: AtomicU64::new(0),
+            });
 
             // 2b-A2: the prerolled next bin. Shared between this worker (dedup /
             // replace / gating), the attach executor (which fills it), and the
@@ -2071,6 +2373,7 @@ impl AudioPlayer {
             // state is `has_uri`. Without it a route change mid-track has nothing
             // to re-issue, and this whole path is a no-op.
             let mut current_uri: Option<String> = None;
+            let mut current_track_id: Option<u64> = None;
             // Bumped by every `SetProxySettings`. The executor snapshots it before
             // it starts prerolling and re-reads it under the `next_bin` mutex
             // before storing, so a branch built under the previous route is
@@ -2091,12 +2394,14 @@ impl AudioPlayer {
                 let next_bin_exec = Arc::clone(&next_bin);
                 let audio_proxy_exec = Arc::clone(&audio_proxy);
                 let route_generation_exec = Arc::clone(&route_generation);
+                let hq_enabled_exec = Arc::clone(&hq_enabled);
                 std::thread::spawn(move || {
                     run_attach_executor(
                         attach_rx,
                         next_bin_exec,
                         audio_proxy_exec,
                         route_generation_exec,
+                        hq_enabled_exec,
                     )
                 });
             }
@@ -2106,9 +2411,29 @@ impl AudioPlayer {
                     AudioCommand::PlayUrl {
                         uri,
                         start_secs,
+                        preserve_output,
+                        track_id,
+                        resume_paused,
                         reply,
                     } => {
+                        let mut config = {
+                            let _transaction = output_transaction_thread.lock().unwrap();
+                            let state = output_state_thread.lock().unwrap();
+                            playback_config(&state, preserve_output)
+                        };
+                        let mut startup = None;
                         let result = (|| -> Result<(), String> {
+                            config.validate()?;
+                            if matches!(backend.as_ref(), Some(PlaybackBackend::HqPlayer { .. })) {
+                                hq_send_stop(&hq_control, &hq_host, hq_port)?;
+                            }
+                            // A queued HQPlayer WAV belongs to the track being
+                            // replaced. Drop it before the new handoff clears
+                            // Desktop's playlist.
+                            cancel_hq_prepared(&hq_watch, &hq_control, &hq_host, hq_port);
+                            hq_watch.started_gen.store(0, Ordering::Release);
+                            *hq_watch.last_status.lock().unwrap() = None;
+                            hq_watch.advancing.store(false, Ordering::Release);
                             // ── Teardown old backend (GStreamer pipeline only) ──
                             if let Some(old_backend) = backend.take() {
                                 tearing_down.store(true, Ordering::SeqCst);
@@ -2160,10 +2485,36 @@ impl AudioPlayer {
                                         let _ = pipeline.state(gst::ClockTime::from_mseconds(500));
                                         drop(pipeline);
                                     }
+                                    PlaybackBackend::HqPlayer {
+                                        pipeline,
+                                        control,
+                                        feed,
+                                        finish_emit,
+                                        ..
+                                    } => {
+                                        // Stop the watcher from treating this as the end
+                                        // of the track, then tell Desktop to release the DAC.
+                                        finish_emit.store(false, Ordering::SeqCst);
+                                        feed.cancel();
+                                        bump_hq_generation(&output_transaction_thread, &hq_gen);
+                                        let _ = control;
+                                        if let Some(bus) = pipeline.bus() {
+                                            bus.set_flushing(true);
+                                        }
+                                        pipeline.set_state(gst::State::Null).ok();
+                                        let _ = pipeline.state(gst::ClockTime::from_mseconds(500));
+                                        drop(pipeline);
+                                    }
                                 }
 
                                 log::debug!("[audio] teardown: complete");
                             }
+                            publish_output_state(
+                                &app_handle,
+                                &output_state_thread,
+                                &output_transaction_thread,
+                                None,
+                            );
                             // 2b-A3 (detach matrix): the whole old pipeline is being
                             // torn down (its elements die with it), so we don't dispatch
                             // an executor detach — just null the gapless slots. The
@@ -2184,12 +2535,58 @@ impl AudioPlayer {
                             *decoded_cell_thread.lock().unwrap() = None;
                             *output_cell_thread.lock().unwrap() = None;
                             signal_path.reset_for_track();
-                            if exclusive || bit_perfect {
+                            exclusive = config.exclusive_mode;
+                            bit_perfect = config.bit_perfect;
+                            device = config.device.clone();
+                            camilla_path = if config.route == AudioOutputRoute::Camilla {
+                                config.camilla_config.clone()
+                            } else {
+                                None
+                            };
+                            camilla_generation = camilla_generation.wrapping_add(1);
+                            paused.store(resume_paused, Ordering::Release);
+                            hq_enabled.store(
+                                config.route == AudioOutputRoute::Hqplayer,
+                                Ordering::Release,
+                            );
+                            hq_host = config.hqplayer_host.clone();
+                            hq_port = config.hqplayer_port;
+                            *exclusive_device_thread.lock().unwrap() =
+                                if exclusive { device.clone() } else { None };
+                            signal_path.set_camilla_fir(camilla_path.is_some());
+                            let amplitude = slider_to_amplitude(current_volume);
+                            combined_vol.store(
+                                (if bit_perfect {
+                                    1.0f32
+                                } else {
+                                    (amplitude * current_norm_gain) as f32
+                                })
+                                .to_bits(),
+                                Ordering::Relaxed,
+                            );
+                            signal_path.set_user_volume(if bit_perfect {
+                                1.0
+                            } else {
+                                amplitude as f32
+                            });
+                            signal_path.set_norm_gain_factor(if bit_perfect {
+                                1.0
+                            } else {
+                                current_norm_gain as f32
+                            });
+                            let hand_to_hqplayer = hq_enabled.load(Ordering::Acquire);
+                            if hand_to_hqplayer {
+                                signal_path.set_backend("HQPlayer", None);
+                                signal_path.set_audio_modes(false, false);
+                                signal_path.set_user_volume(1.0);
+                                signal_path.set_norm_gain_factor(1.0);
+                            } else if exclusive || bit_perfect {
                                 signal_path.set_backend("DirectAlsa", device.clone());
+                                signal_path.set_audio_modes(exclusive, bit_perfect);
                             } else {
                                 signal_path.set_backend("Normal", None);
+                                signal_path.set_audio_modes(exclusive, bit_perfect);
                             }
-                            signal_path.set_audio_modes(exclusive, bit_perfect);
 
                             // One decision for both arms below. Each used to
                             // sniff the URI for itself, and neither could see
@@ -2221,7 +2618,75 @@ impl AudioPlayer {
                             // build with the generation this route came from.
                             pipeline_route_generation = route_generation.load(Ordering::Acquire);
 
-                            if exclusive || bit_perfect {
+                            if hand_to_hqplayer {
+                                // DirectAlsa teardown leaves the writer holding the
+                                // DAC. Desktop needs that device, so close it even
+                                // when the control port is down.
+                                writer_cancel.store(true, Ordering::Release);
+                                release_alsa_writer(
+                                    &mut writer_tx,
+                                    &mut writer_thread,
+                                    &mut writer_fmt,
+                                    &mut writer_supported_fmts,
+                                    &mut writer_supported_rates,
+                                    &mut writer_device,
+                                    &mut writer_bit_perfect,
+                                );
+                                let host = hq_host.clone();
+                                let port = hq_port;
+                                {
+                                    let mut slot = hq_control
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    crate::hqplayer::retry_read(&mut slot, &host, port, |session| {
+                                        session.get_info()
+                                    })
+                                    .map_err(|err| {
+                                        format!(
+                                            "HQPlayer is not accepting control on {host}:{port}. \
+                                             Start HQPlayer Desktop and close its settings dialog ({err})"
+                                        )
+                                    })?;
+                                }
+                                let gen = bump_hq_generation(&output_transaction_thread, &hq_gen);
+                                hq_watch.started_gen.store(0, Ordering::Release);
+                                let origin = start_secs.unwrap_or(0.0);
+                                let launch = launch_hqplayer_track(
+                                    &uri,
+                                    is_dash,
+                                    route,
+                                    origin,
+                                    gen,
+                                    Arc::clone(&hq_gen),
+                                    Arc::clone(&hq_control),
+                                    host,
+                                    port,
+                                    app_handle.clone(),
+                                    Arc::clone(&tearing_down),
+                                    Arc::clone(&eos),
+                                    Arc::clone(&signal_path),
+                                    Arc::clone(&decoded_cell_thread),
+                                    Arc::clone(&output_cell_thread),
+                                    Arc::clone(&hq_watch),
+                                    None,
+                                    resume_paused,
+                                    track_id,
+                                    Arc::clone(&paused),
+                                )?;
+                                startup = Some((
+                                    launch.started,
+                                    launch.playback_generation,
+                                    launch.feed.clone(),
+                                    launch.pipeline.clone(),
+                                ));
+                                backend = Some(PlaybackBackend::HqPlayer {
+                                    pipeline: launch.pipeline,
+                                    control: Arc::clone(&hq_control),
+                                    feed: launch.feed,
+                                    heard: launch.heard,
+                                    finish_emit: launch.finish_emit,
+                                });
+                            } else if exclusive || bit_perfect {
                                 // ── DirectAlsa path ──
                                 #[cfg(not(target_os = "linux"))]
                                 return Err("Exclusive/bit-perfect mode requires Linux".into());
@@ -2254,7 +2719,8 @@ impl AudioPlayer {
                                         .unwrap_or(false);
 
                                     let device_changed = writer_device.as_deref() != Some(dev);
-                                    let mode_changed = writer_bit_perfect != Some(bit_perfect);
+                                    let mode_changed = writer_bit_perfect != Some(bit_perfect)
+                                        || writer_preserve_rate != camilla_path.is_some();
 
                                     if !writer_alive
                                         || writer_tx.is_none()
@@ -2287,6 +2753,7 @@ impl AudioPlayer {
                                             writer_gen: Arc::clone(&writer_gen),
                                             paused: Arc::clone(&paused),
                                             bit_perfect,
+                                            preserve_rate: camilla_path.is_some(),
                                             combined_vol: Arc::clone(&combined_vol),
                                             signal_path: Arc::clone(&signal_path),
                                             decoded_cell: Arc::clone(&decoded_cell_thread),
@@ -2299,9 +2766,20 @@ impl AudioPlayer {
                                         writer_supported_rates = Some(supported_rates);
                                         writer_device = Some(dev.to_string());
                                         writer_bit_perfect = Some(bit_perfect);
+                                        writer_preserve_rate = camilla_path.is_some();
                                     }
 
                                     let wtx = writer_tx.as_ref().unwrap().clone();
+
+                                    if let Err(err) = wtx.send_timeout(
+                                        WriterCommand::SetFir {
+                                            path: camilla_path.clone(),
+                                            generation: camilla_generation,
+                                        },
+                                        std::time::Duration::from_millis(500),
+                                    ) {
+                                        return Err(format!("Could not arm CamillaDSP: {err}"));
+                                    }
 
                                     // Build appsink pipeline
                                     let fmt_for_pipeline =
@@ -2319,6 +2797,7 @@ impl AudioPlayer {
                                             route,
                                             exclusive,
                                             bit_perfect,
+                                            preserve_rate: camilla_path.is_some(),
                                             writer_tx: wtx.clone(),
                                             writer_gen: Arc::clone(&writer_gen),
                                             negotiated_fmt: fmt_for_pipeline,
@@ -2878,6 +3357,11 @@ impl AudioPlayer {
                                         let pipeline = pipeline.clone();
                                         std::thread::spawn(move || seek_to(&pipeline));
                                     }
+                                    Some(PlaybackBackend::HqPlayer { .. }) => {
+                                        // The arm thread seeks the decoder before
+                                        // capture. Seeking the live WAV would skip
+                                        // inside a file HQPlayer is already reading.
+                                    }
                                     Some(PlaybackBackend::DirectAlsa { pipeline, .. }) => {
                                         // The generation is bumped here, on the
                                         // worker, because it is worker-local state;
@@ -2937,16 +3421,66 @@ impl AudioPlayer {
                             }
                             Ok(())
                         })();
-                        // Retained only on success: a failed build leaves no
-                        // pipeline, and re-issuing a URI that never played would
-                        // resume something that was never torn down.
                         if result.is_ok() {
                             current_uri = Some(uri);
+                            current_track_id = track_id;
                         }
-                        reply.send(result).ok();
+                        if let (Ok(()), Some((started, playback_generation, feed, pipeline))) =
+                            (&result, startup)
+                        {
+                            let app = app_handle.clone();
+                            let watch = Arc::clone(&hq_watch);
+                            let generation = hq_gen.load(Ordering::Acquire);
+                            let generation_cell = Arc::clone(&hq_gen);
+                            std::thread::spawn(move || {
+                                let result = started
+                                    .recv_timeout(std::time::Duration::from_secs(60))
+                                    .unwrap_or_else(|_| {
+                                        Err("HQPlayer did not confirm playback in time".into())
+                                    });
+                                if generation_cell.load(Ordering::Acquire) != generation {
+                                    let _ = reply.send(Err("Playback superseded".into()));
+                                    return;
+                                }
+                                if result.is_ok() {
+                                    if !publish_hq_output(
+                                        &app,
+                                        &watch,
+                                        Some(config),
+                                        (&generation_cell, generation),
+                                        playback_generation,
+                                    ) {
+                                        let _ = reply.send(Err("Playback superseded".into()));
+                                        return;
+                                    }
+                                } else {
+                                    feed.cancel();
+                                    let _ = pipeline.set_state(gst::State::Null);
+                                    publish_hq_output(
+                                        &app,
+                                        &watch,
+                                        None,
+                                        (&generation_cell, generation),
+                                        playback_generation,
+                                    );
+                                }
+                                let _ = reply.send(result);
+                            });
+                        } else {
+                            if result.is_ok() {
+                                publish_output_state(
+                                    &app_handle,
+                                    &output_state_thread,
+                                    &output_transaction_thread,
+                                    Some(config),
+                                );
+                            }
+                            reply.send(result).ok();
+                        }
                     }
 
                     AudioCommand::Pause { reply } => {
+                        paused.store(true, Ordering::Release);
                         let result = match backend.as_ref() {
                             Some(PlaybackBackend::Normal { pipeline, .. }) => pipeline
                                 .set_state(gst::State::Paused)
@@ -2959,6 +3493,18 @@ impl AudioPlayer {
                                     .map(|_| ())
                                     .map_err(|e| format!("Failed to pause decode: {e}"))
                             }
+                            Some(PlaybackBackend::HqPlayer {
+                                pipeline, control, ..
+                            }) => hq_send_transport(control, &hq_host, hq_port, |session| {
+                                session.pause()
+                            })
+                            .and_then(|()| {
+                                pipeline
+                                    .set_state(gst::State::Paused)
+                                    .map_err(|e| e.to_string())?;
+                                paused.store(true, Ordering::Release);
+                                Ok(())
+                            }),
                             None => Err("No active pipeline".into()),
                         };
                         reply.send(result).ok();
@@ -2977,13 +3523,38 @@ impl AudioPlayer {
                                     .map(|_| ())
                                     .map_err(|e| format!("Failed to resume decode: {e}"))
                             }
+                            Some(PlaybackBackend::HqPlayer {
+                                pipeline, control, ..
+                            }) => hq_send_transport(control, &hq_host, hq_port, |session| {
+                                session.play()
+                            })
+                            .and_then(|()| {
+                                pipeline
+                                    .set_state(gst::State::Playing)
+                                    .map_err(|e| e.to_string())?;
+                                paused.store(false, Ordering::Release);
+                                Ok(())
+                            }),
                             None => Err("No active pipeline".into()),
                         };
+                        if result.is_ok() {
+                            paused.store(false, Ordering::Release);
+                        }
                         reply.send(result).ok();
                     }
 
                     AudioCommand::Stop { reply } => {
+                        if matches!(backend.as_ref(), Some(PlaybackBackend::HqPlayer { .. })) {
+                            if let Err(error) = hq_send_stop(&hq_control, &hq_host, hq_port) {
+                                let _ = reply.send(Err(error));
+                                continue;
+                            }
+                        }
+
                         writer_cancel.store(true, Ordering::Release);
+                        cancel_hq_prepared(&hq_watch, &hq_control, &hq_host, hq_port);
+                        hq_watch.started_gen.store(0, Ordering::Release);
+                        hq_watch.advancing.store(false, Ordering::Release);
                         // 2b-A3 (detach matrix): Stop tears down the whole pipeline,
                         // so the next-bin + current-branch elements die with it. Just
                         // null the gapless slots (no executor detach — moot, and it
@@ -3037,6 +3608,39 @@ impl AudioPlayer {
                                 *output_cell_thread.lock().unwrap() = None;
                                 Ok(())
                             }
+                            Some(PlaybackBackend::HqPlayer {
+                                pipeline,
+                                control,
+                                feed,
+                                finish_emit,
+                                ..
+                            }) => {
+                                finish_emit.store(false, Ordering::SeqCst);
+                                feed.cancel();
+                                bump_hq_generation(&output_transaction_thread, &hq_gen);
+                                let _ = control;
+                                if let Some(bus) = pipeline.bus() {
+                                    bus.set_flushing(true);
+                                }
+                                pipeline.set_state(gst::State::Null).ok();
+                                let _ = pipeline.state(gst::ClockTime::from_mseconds(500));
+                                drop(pipeline);
+                                writer_cancel.store(true, Ordering::Release);
+                                release_alsa_writer(
+                                    &mut writer_tx,
+                                    &mut writer_thread,
+                                    &mut writer_fmt,
+                                    &mut writer_supported_fmts,
+                                    &mut writer_supported_rates,
+                                    &mut writer_device,
+                                    &mut writer_bit_perfect,
+                                );
+                                eos.store(false, Ordering::SeqCst);
+                                has_uri.store(false, Ordering::SeqCst);
+                                *decoded_cell_thread.lock().unwrap() = None;
+                                *output_cell_thread.lock().unwrap() = None;
+                                Ok(())
+                            }
                             None => {
                                 // Clean up orphaned writer (e.g. pipeline build failed after spawn)
                                 if let Some(tx) = writer_tx.take() {
@@ -3048,10 +3652,34 @@ impl AudioPlayer {
                                 Ok(())
                             }
                         };
+                        if result.is_ok() {
+                            publish_output_state(
+                                &app_handle,
+                                &output_state_thread,
+                                &output_transaction_thread,
+                                None,
+                            );
+                        }
                         reply.send(result).ok();
                     }
 
                     AudioCommand::SetVolume { level, reply } => {
+                        if !level.is_finite() || !(0.0..=1.0).contains(&level) {
+                            let _ = reply.send(Err("Volume must be between 0 and 1".into()));
+                            continue;
+                        }
+                        if backend.is_some()
+                            && (bit_perfect
+                                || matches!(
+                                    backend.as_ref(),
+                                    Some(PlaybackBackend::HqPlayer { .. })
+                                ))
+                        {
+                            let _ = reply.send(Err(
+                                "Volume is controlled by the active output route".into(),
+                            ));
+                            continue;
+                        }
                         current_volume = level as f64;
                         let amplitude = slider_to_amplitude(current_volume);
                         if let Some(vol) = backend.as_ref().and_then(|b| b.user_volume_el()) {
@@ -3061,19 +3689,32 @@ impl AudioPlayer {
                             ((amplitude * current_norm_gain) as f32).to_bits(),
                             Ordering::Relaxed,
                         );
-                        signal_path.set_user_volume(amplitude as f32);
+                        if !matches!(backend.as_ref(), Some(PlaybackBackend::HqPlayer { .. })) {
+                            signal_path.set_user_volume(amplitude as f32);
+                        }
                         reply.send(Ok(())).ok();
                     }
 
                     AudioCommand::SetNormalizationGain { gain, reply } => {
-                        apply_normalization_gain(
-                            gain,
-                            &mut current_norm_gain,
-                            backend.as_ref().and_then(|b| b.norm_volume_el()),
-                            &combined_vol,
-                            current_volume,
-                            &signal_path,
-                        );
+                        if backend.is_some()
+                            && (bit_perfect
+                                || matches!(
+                                    backend.as_ref(),
+                                    Some(PlaybackBackend::HqPlayer { .. })
+                                ))
+                        {
+                            current_norm_gain = gain;
+                            signal_path.set_norm_gain_factor(1.0);
+                        } else {
+                            apply_normalization_gain(
+                                gain,
+                                &mut current_norm_gain,
+                                backend.as_ref().and_then(|b| b.norm_volume_el()),
+                                &combined_vol,
+                                current_volume,
+                                &signal_path,
+                            );
+                        }
                         reply.send(Ok(())).ok();
                     }
 
@@ -3081,6 +3722,21 @@ impl AudioPlayer {
                         position_secs,
                         reply,
                     } => {
+                        if matches!(backend.as_ref(), Some(PlaybackBackend::HqPlayer { .. })) {
+                            if let Some(uri) = current_uri.clone() {
+                                let _ = cmd_tx_worker.send(AudioCommand::PlayUrl {
+                                    uri,
+                                    start_secs: Some(position_secs),
+                                    preserve_output: true,
+                                    track_id: current_track_id,
+                                    resume_paused: paused.load(Ordering::Acquire),
+                                    reply,
+                                });
+                            } else {
+                                let _ = reply.send(Err("No active track".into()));
+                            }
+                            continue;
+                        }
                         // 2b-A3 (detach matrix): a flush seek must NOT detach the
                         // prerolled next branch. Empirically verified on GStreamer
                         // 1.24.2 (python-gi, concat + dual uridecodebin→queue): a
@@ -3132,6 +3788,9 @@ impl AudioPlayer {
                                 }
                                 result
                             }
+                            Some(PlaybackBackend::HqPlayer { .. }) => {
+                                unreachable!("HQ seek is rebuilt above")
+                            }
                             None => Err("No active pipeline".into()),
                         };
                         reply.send(result).ok();
@@ -3155,6 +3814,12 @@ impl AudioPlayer {
                                     0.0
                                 }
                             }
+                            Some(PlaybackBackend::HqPlayer { heard, .. }) => {
+                                // The watcher writes this. A Status roundtrip
+                                // here would stall pause, stop, and the next
+                                // track on the control port.
+                                f32::from_bits(heard.load(Ordering::Relaxed))
+                            }
                             None => 0.0,
                         };
                         reply.send(Ok(pos)).ok();
@@ -3166,72 +3831,41 @@ impl AudioPlayer {
                         reply.send(Ok(finished)).ok();
                     }
 
-                    AudioCommand::SetExclusiveMode {
-                        enabled,
-                        device: dev,
-                        reply,
-                    } => {
-                        exclusive = enabled;
-                        // Callers pass the complete saved choice. None also
-                        // clears a choice when a settings transaction rolls back.
-                        device = dev;
-                        if !enabled {
-                            bit_perfect = false;
-                        }
-                        // Mirror the device into the shared cell so the
-                        // pipeline probe can read it without messaging.
-                        if let Ok(mut cell) = exclusive_device_thread.lock() {
-                            *cell = if enabled { device.clone() } else { None };
-                        }
-                        // 2b-A3 (detach matrix): enabling exclusive invalidates any
-                        // Normal-pipeline next bin. Detach it (gated on !next_active).
-                        if enabled && !next_active.load(Ordering::Acquire) {
-                            if let (
-                                Some(stale),
-                                Some(PlaybackBackend::Normal {
-                                    pipeline, concat, ..
-                                }),
-                            ) = (
-                                next_bin.lock().ok().and_then(|mut g| g.take()),
-                                backend.as_ref(),
-                            ) {
-                                let _ = attach_tx.send(AttachJob::Detach {
-                                    pipeline: pipeline.clone(),
-                                    concat: concat.clone(),
-                                    bin: stale.bin,
-                                    branch_queue: stale.branch_queue,
-                                });
+                    AudioCommand::OutputChanged => {
+                        let stale = {
+                            let mut guard = next_bin.lock().unwrap();
+                            let previous_generation =
+                                route_generation.fetch_add(1, Ordering::AcqRel);
+                            // Output changes cancel in-flight attaches without changing
+                            // the active pipeline's proxy hook. Keep a current hook
+                            // current so a rolled-back preference can preroll again.
+                            // Never bless a hook already made stale by a proxy save.
+                            if pipeline_route_generation == previous_generation {
+                                pipeline_route_generation = previous_generation + 1;
                             }
-                        }
-                        reply.send(Ok(())).ok();
-                    }
-
-                    AudioCommand::SetBitPerfect { enabled, reply } => {
-                        bit_perfect = enabled;
-                        if enabled {
-                            exclusive = true;
-                        }
-                        // 2b-A3 (detach matrix): enabling bit-perfect invalidates any
-                        // Normal-pipeline next bin. Detach it (gated on !next_active).
-                        if enabled && !next_active.load(Ordering::Acquire) {
-                            if let (
-                                Some(stale),
-                                Some(PlaybackBackend::Normal {
-                                    pipeline, concat, ..
-                                }),
-                            ) = (
-                                next_bin.lock().ok().and_then(|mut g| g.take()),
-                                backend.as_ref(),
-                            ) {
-                                let _ = attach_tx.send(AttachJob::Detach {
-                                    pipeline: pipeline.clone(),
-                                    concat: concat.clone(),
-                                    bin: stale.bin,
-                                    branch_queue: stale.branch_queue,
-                                });
+                            if next_active.load(Ordering::Acquire) {
+                                None
+                            } else {
+                                guard.take()
                             }
+                        };
+                        if let (
+                            Some(stale),
+                            Some(PlaybackBackend::Normal {
+                                pipeline, concat, ..
+                            }),
+                        ) = (stale, backend.as_ref())
+                        {
+                            let _ = attach_tx.send(AttachJob::Detach {
+                                pipeline: pipeline.clone(),
+                                concat: concat.clone(),
+                                bin: stale.bin,
+                                branch_queue: stale.branch_queue,
+                            });
                         }
-                        reply.send(Ok(())).ok();
+                        if !hq_watch.advancing.load(Ordering::Acquire) {
+                            cancel_hq_for_output_change(&hq_watch, &hq_control, &hq_host, hq_port);
+                        }
                     }
 
                     AudioCommand::SetProxySettings { settings, reply } => {
@@ -3398,6 +4032,9 @@ impl AudioPlayer {
                                             0.0
                                         }
                                     }
+                                    Some(PlaybackBackend::HqPlayer { heard, .. }) => {
+                                        f32::from_bits(heard.load(Ordering::Relaxed))
+                                    }
                                     None => 0.0,
                                 };
                                 log::info!(
@@ -3443,11 +4080,20 @@ impl AudioPlayer {
                                     Some(PlaybackBackend::DirectAlsa { .. }) => {
                                         paused.load(Ordering::Acquire)
                                     }
+                                    Some(PlaybackBackend::HqPlayer { pipeline, .. }) => {
+                                        let (_, cur, pending) =
+                                            pipeline.state(gst::ClockTime::ZERO);
+                                        cur == gst::State::Paused
+                                            && pending == gst::State::VoidPending
+                                    }
                                     None => false,
                                 };
                                 let _ = cmd_tx_worker.send(AudioCommand::PlayUrl {
                                     uri,
                                     start_secs: Some(position_secs),
+                                    preserve_output: true,
+                                    track_id: current_track_id,
+                                    resume_paused,
                                     reply: rebuilt_tx,
                                 });
                                 if resume_paused {
@@ -3464,6 +4110,9 @@ impl AudioPlayer {
                     AudioCommand::SetGapless { enabled, reply } => {
                         // 2b-A2: drives SetNextTrack's effective-gapless gate.
                         gapless_setting = enabled;
+                        if !enabled {
+                            cancel_hq_for_output_change(&hq_watch, &hq_control, &hq_host, hq_port);
+                        }
                         // 2b-A3 (detach matrix): disabling gapless invalidates any
                         // prerolled next bin. Detach it (gated on !next_active).
                         if !enabled && !next_active.load(Ordering::Acquire) {
@@ -3501,10 +4150,125 @@ impl AudioPlayer {
                         is_dash,
                         reply,
                     } => {
+                        if output_state_thread.lock().unwrap().pending {
+                            let _ = reply.send(Ok(()));
+                            continue;
+                        }
+
+                        // HQPlayer gapless ignores the saved exclusive flags: the
+                        // mode leaves them set and still owns the handoff.
+                        if hq_enabled.load(Ordering::Acquire) && gapless_setting {
+                            let playing =
+                                matches!(backend.as_ref(), Some(PlaybackBackend::HqPlayer { .. }));
+                            if !playing || hq_watch.advancing.load(Ordering::Acquire) {
+                                let _ = reply.send(Ok(()));
+                                continue;
+                            }
+                            {
+                                let mut guard = hq_watch
+                                    .next
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                if let Some(existing) = guard.as_mut() {
+                                    if existing.track_id == track_id {
+                                        existing.qid = qid;
+                                        drop(guard);
+                                        let _ = reply.send(Ok(()));
+                                        continue;
+                                    }
+                                }
+                            }
+                            if hq_watch
+                                .preparing
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .is_some_and(|pending| {
+                                    pending.track_id == track_id && pending.qid == qid
+                                })
+                            {
+                                let _ = reply.send(Ok(()));
+                                continue;
+                            }
+                            cancel_hq_prepared(&hq_watch, &hq_control, &hq_host, hq_port);
+                            let token = hq_watch.next_gen.load(Ordering::Acquire);
+                            let route = {
+                                let ap = audio_proxy
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                ap.route_for(capability_of(is_dash))
+                            };
+                            let route = match route {
+                                Ok(route) => route,
+                                Err(blocked) => {
+                                    log::warn!(
+                                        "[hqplayer] next track not queued: {}",
+                                        blocked.cause
+                                    );
+                                    let _ = reply.send(Ok(()));
+                                    continue;
+                                }
+                            };
+                            if matches!(route, crate::proxy::Route::Via { .. })
+                                && !http_source_is_configurable()
+                            {
+                                log::warn!(
+                                    "[hqplayer] next track not queued: https source \
+                                     cannot be pointed at a proxy"
+                                );
+                                let _ = reply.send(Ok(()));
+                                continue;
+                            }
+                            let gen = hq_gen.load(Ordering::Acquire);
+                            let queued_uri = uri.clone();
+                            match launch_hqplayer_track(
+                                &uri,
+                                is_dash,
+                                route,
+                                0.0,
+                                gen,
+                                Arc::clone(&hq_gen),
+                                Arc::clone(&hq_control),
+                                hq_host.clone(),
+                                hq_port,
+                                app_handle.clone(),
+                                Arc::clone(&tearing_down),
+                                Arc::clone(&eos),
+                                Arc::clone(&signal_path),
+                                Arc::clone(&decoded_cell_thread),
+                                Arc::clone(&output_cell_thread),
+                                Arc::clone(&hq_watch),
+                                Some(HqQueueMeta {
+                                    token,
+                                    uri: queued_uri,
+                                    track_id,
+                                    qid,
+                                    norm_gain,
+                                    replay_gain,
+                                    peak_amplitude,
+                                }),
+                                false,
+                                Some(track_id),
+                                Arc::clone(&paused),
+                            ) {
+                                Ok(_) => {
+                                    let _ = reply.send(Ok(()));
+                                }
+                                Err(err) => {
+                                    log::warn!("[hqplayer] next track not queued: {err}");
+                                    let _ = reply.send(Err(err));
+                                }
+                            }
+                            continue;
+                        }
+
                         // Effective gapless = setting on AND normal mode (C5: never
                         // attach a concat branch under exclusive/bit-perfect — the
                         // DirectAlsa path has no concat).
-                        let effective_gapless = gapless_setting && !exclusive && !bit_perfect;
+                        let effective_gapless = gapless_setting
+                            && !exclusive
+                            && !bit_perfect
+                            && !hq_enabled.load(Ordering::Acquire);
 
                         // Normal-mode pipeline/concat clones for the executor. If the
                         // backend isn't Normal (or absent), we can't (and mustn't,
@@ -3515,7 +4279,11 @@ impl AudioPlayer {
                             }) => Some((pipeline.clone(), concat.clone())),
                             _ => None,
                         };
-                        log::debug!("[gapless-diag] SetNextTrack track={track_id}: effective_gapless={effective_gapless} (setting={gapless_setting} excl={exclusive} bp={bit_perfect}), backend_normal={}", normal_clones.is_some());
+                        log::debug!(
+                            "[gapless-diag] SetNextTrack track={track_id}: effective_gapless={effective_gapless} (setting={gapless_setting} excl={exclusive} bp={bit_perfect} hq={}), backend_normal={}",
+                            hq_enabled.load(Ordering::Acquire),
+                            normal_clones.is_some()
+                        );
 
                         if !effective_gapless || normal_clones.is_none() {
                             // Gapless off / wrong mode: detach any existing next_bin
@@ -3601,6 +4369,7 @@ impl AudioPlayer {
                     // 2b-A2: detach the prerolled next bin (gated on !next_active per
                     // C5 — if concat is already switching, leave it for 2b-A3).
                     AudioCommand::ClearNextTrack { reply } => {
+                        cancel_hq_for_output_change(&hq_watch, &hq_control, &hq_host, hq_port);
                         if !next_active.load(Ordering::Acquire) {
                             if let Some(stale) = next_bin.lock().ok().and_then(|mut g| g.take()) {
                                 if let Some(PlaybackBackend::Normal {
@@ -3665,6 +4434,7 @@ impl AudioPlayer {
                         // change from here must rebuild *this* one.
                         current_branch = Some((promoted.bin, promoted.branch_queue));
                         current_uri = Some(promoted.uri);
+                        current_track_id = Some(promoted.track_id);
 
                         // Apply the promoted track's normalization gain across the
                         // shared volume chain (concat is upstream of norm_vol, so the
@@ -3697,6 +4467,132 @@ impl AudioPlayer {
                         eos.store(false, Ordering::SeqCst);
                         has_uri.store(true, Ordering::SeqCst);
                         next_active.store(false, Ordering::Release);
+                    }
+
+                    AudioCommand::HandleHqAdvance => {
+                        let prepared = match hq_watch.next.lock() {
+                            Ok(mut guard) => guard.take(),
+                            Err(poisoned) => poisoned.into_inner().take(),
+                        };
+                        let Some(prepared) = prepared.filter(|item| item.sent) else {
+                            hq_watch.advancing.store(false, Ordering::Release);
+                            continue;
+                        };
+                        match backend.take() {
+                            Some(PlaybackBackend::HqPlayer {
+                                pipeline,
+                                feed,
+                                finish_emit,
+                                ..
+                            }) => {
+                                finish_emit.store(false, Ordering::SeqCst);
+                                feed.cancel();
+                                let _ = pipeline.set_state(gst::State::Null);
+                            }
+                            other => {
+                                backend = other;
+                                prepared.finish_emit.store(false, Ordering::SeqCst);
+                                prepared.feed.cancel();
+                                let _ = prepared.pipeline.set_state(gst::State::Null);
+                                hq_watch.advancing.store(false, Ordering::Release);
+                                continue;
+                            }
+                        }
+                        let HqPrepared {
+                            playback_generation,
+                            pipeline,
+                            feed,
+                            heard,
+                            finish_emit,
+                            uri,
+                            track_id,
+                            qid,
+                            norm_gain,
+                            replay_gain,
+                            peak_amplitude,
+                            rate,
+                            channels,
+                            sent: _,
+                        } = prepared;
+                        signal_path.reset_for_track();
+                        signal_path.set_backend("HQPlayer", None);
+                        signal_path.set_audio_modes(false, false);
+                        current_norm_gain = norm_gain;
+                        signal_path.set_user_volume(1.0);
+                        signal_path.set_norm_gain_factor(1.0);
+                        signal_path.set_decoded("S32LE", rate, channels);
+                        signal_path.set_output("S32LE", rate, channels);
+                        let caps = crate::pipeline_probe::PadCaps {
+                            format: "S32LE".to_string(),
+                            rate,
+                            channels,
+                        };
+                        if let Ok(mut guard) = decoded_cell_thread.lock() {
+                            *guard = Some(caps.clone());
+                        }
+                        if let Ok(mut guard) = output_cell_thread.lock() {
+                            *guard = Some(caps);
+                        }
+                        current_uri = Some(uri);
+                        current_track_id = Some(track_id);
+                        let active_config = output_state_thread.lock().unwrap().active.clone();
+                        publish_hq_output(
+                            &app_handle,
+                            &hq_watch,
+                            active_config,
+                            (&hq_gen, hq_gen.load(Ordering::Acquire)),
+                            playback_generation,
+                        );
+                        eos.store(false, Ordering::SeqCst);
+                        has_uri.store(true, Ordering::SeqCst);
+                        let _ = app_handle.emit(
+                            "track-advanced",
+                            serde_json::json!({
+                                "trackId": track_id,
+                                "qid": qid,
+                                "replayGain": replay_gain,
+                                "peakAmplitude": peak_amplitude,
+                            }),
+                        );
+                        // Same generation as the track that just finished. A new
+                        // PlayUrl is what bumps it.
+                        let gen = hq_gen.load(Ordering::Acquire);
+                        *hq_watch.last_status.lock().unwrap() = None;
+                        let arm = HqArm {
+                            playback_generation,
+                            startup: Arc::new(Mutex::new(None)),
+                            resume_paused: false,
+                            track_id: Some(track_id),
+                            paused: Arc::clone(&paused),
+                            pipeline: pipeline.clone(),
+                            feed: feed.clone(),
+                            control: Arc::clone(&hq_control),
+                            gen,
+                            gen_cell: Arc::clone(&hq_gen),
+                            origin: 0.0,
+                            heard: Arc::clone(&heard),
+                            finish_emit: Arc::clone(&finish_emit),
+                            eos: Arc::clone(&eos),
+                            reported: Arc::new(AtomicBool::new(false)),
+                            app: app_handle.clone(),
+                            signal: Arc::clone(&signal_path),
+                            decoded_cell: Arc::clone(&decoded_cell_thread),
+                            output_cell: Arc::clone(&output_cell_thread),
+                            host: hq_host.clone(),
+                            port: hq_port,
+                            tearing_down: Arc::clone(&tearing_down),
+                            watch: Arc::clone(&hq_watch),
+                            queue: None,
+                        };
+                        backend = Some(PlaybackBackend::HqPlayer {
+                            pipeline,
+                            control: Arc::clone(&hq_control),
+                            feed,
+                            heard,
+                            finish_emit,
+                        });
+                        hq_watch.advancing.store(false, Ordering::Release);
+                        spawn_hq_watcher(arm, true);
                     }
 
                     // 2b-A3: a prerolled next bin reported a decode error on the bus.
@@ -3733,6 +4629,8 @@ impl AudioPlayer {
 
         Self {
             cmd_tx,
+            output_state,
+            output_transaction,
             exclusive_device,
             decoded_caps_cell,
             output_caps_cell,
@@ -3746,10 +4644,18 @@ impl AudioPlayer {
         rx.recv().expect("Audio thread dead")
     }
 
-    pub fn play_url(&self, uri: &str, start_secs: Option<f32>) -> Result<(), String> {
+    pub fn play_url(
+        &self,
+        uri: &str,
+        start_secs: Option<f32>,
+        track_id: u64,
+    ) -> Result<(), String> {
         self.send_cmd(|reply| AudioCommand::PlayUrl {
             uri: uri.to_string(),
             start_secs,
+            preserve_output: false,
+            track_id: Some(track_id),
+            resume_paused: false,
             reply,
         })
     }
@@ -3780,16 +4686,49 @@ impl AudioPlayer {
     pub fn is_finished(&self) -> Result<bool, String> {
         self.send_cmd(|reply| AudioCommand::IsFinished { reply })
     }
+    /// Hold across the settings transaction; PlayUrl only takes this gate to
+    /// snapshot a committed route, then releases it before any audio/network IO.
+    pub fn begin_output_update(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.output_transaction.lock().unwrap()
+    }
+
+    pub fn configure_output(&self, config: AudioOutputConfig) -> Result<(), String> {
+        let mut state = self.output_state.lock().unwrap();
+        let changed = !state.configured.same_processing_as(&config);
+        let previous = state.clone();
+        let active = state.active.clone();
+        replace_output_state(&mut state, config, active);
+        if changed && self.cmd_tx.send(AudioCommand::OutputChanged).is_err() {
+            replace_output_state(&mut state, previous.configured, previous.active);
+            return Err("Audio worker is unavailable".into());
+        }
+        Ok(())
+    }
+
+    pub fn output_state(&self) -> AudioOutputState {
+        let _transaction = self.output_transaction.lock().unwrap();
+        self.output_state.lock().unwrap().clone()
+    }
+
     pub fn set_exclusive_mode(&self, enabled: bool, device: Option<String>) -> Result<(), String> {
-        self.send_cmd(|reply| AudioCommand::SetExclusiveMode {
-            enabled,
-            device,
-            reply,
-        })
+        let mut config = self.output_state().configured;
+        config.exclusive_mode = enabled;
+        config.device = device;
+        if !enabled {
+            config.bit_perfect = false;
+        }
+        self.configure_output(config)
     }
+
     pub fn set_bit_perfect(&self, enabled: bool) -> Result<(), String> {
-        self.send_cmd(|reply| AudioCommand::SetBitPerfect { enabled, reply })
+        let mut config = self.output_state().configured;
+        config.bit_perfect = enabled;
+        if enabled {
+            config.exclusive_mode = true;
+        }
+        self.configure_output(config)
     }
+
     pub fn set_proxy_settings(&self, settings: crate::ProxySettings) {
         self.send_cmd(|reply| AudioCommand::SetProxySettings { settings, reply });
     }
@@ -3839,6 +4778,1236 @@ impl AudioPlayer {
     }
 }
 
+fn release_alsa_writer(
+    writer_tx: &mut Option<crossbeam_channel::Sender<WriterCommand>>,
+    writer_thread: &mut Option<JoinHandle<()>>,
+    writer_fmt: &mut Option<PcmFormat>,
+    writer_supported_fmts: &mut Option<Vec<&'static str>>,
+    writer_supported_rates: &mut Option<Vec<u32>>,
+    writer_device: &mut Option<String>,
+    writer_bit_perfect: &mut Option<bool>,
+) {
+    if let Some(tx) = writer_tx.take() {
+        tx.try_send(WriterCommand::Shutdown).ok();
+    }
+    if let Some(handle) = writer_thread.take() {
+        handle.join().ok();
+    }
+    *writer_fmt = None;
+    *writer_supported_fmts = None;
+    *writer_supported_rates = None;
+    *writer_device = None;
+    *writer_bit_perfect = None;
+}
+
+fn hq_send_transport(
+    control: &Mutex<Option<crate::hqplayer::ControlSession>>,
+    host: &str,
+    port: u16,
+    op: impl FnMut(&mut crate::hqplayer::ControlSession) -> Result<(), crate::hqplayer::ControlError>,
+) -> Result<(), String> {
+    let mut slot = control.lock().unwrap_or_else(|p| p.into_inner());
+    crate::hqplayer::call(&mut slot, host, port, op).map_err(|e| e.to_string())
+}
+
+fn hq_send_stop(
+    control: &Mutex<Option<crate::hqplayer::ControlSession>>,
+    host: &str,
+    port: u16,
+) -> Result<(), String> {
+    hq_send_transport(control, host, port, |session| session.stop())?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let status = {
+            let mut slot = control.lock().unwrap_or_else(|p| p.into_inner());
+            crate::hqplayer::retry_read(&mut slot, host, port, |session| session.status())
+                .map_err(|e| e.to_string())?
+        };
+        if matches!(status.state, 0 | 3) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("HQPlayer did not confirm stop; local output remains closed".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn playback_config(state: &AudioOutputState, preserve_output: bool) -> AudioOutputConfig {
+    if preserve_output {
+        state
+            .active
+            .clone()
+            .unwrap_or_else(|| state.configured.effective())
+    } else {
+        state.configured.effective()
+    }
+}
+
+fn replace_output_state(
+    state: &mut AudioOutputState,
+    configured: AudioOutputConfig,
+    active: Option<AudioOutputConfig>,
+) {
+    let revision = state.revision.saturating_add(1);
+    let playback_generation = state.playback_generation.filter(|_| active.is_some());
+    *state = AudioOutputState::new(configured, active);
+    state.revision = revision;
+    state.playback_generation = playback_generation;
+}
+
+static NEXT_PLAYBACK_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_playback_generation() -> u64 {
+    NEXT_PLAYBACK_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+fn bump_hq_generation(transaction: &Mutex<()>, generation: &AtomicU64) -> u64 {
+    let _transaction = transaction.lock().unwrap();
+    generation.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+fn with_current_generation(
+    transaction: &Mutex<()>,
+    generation: (&AtomicU64, u64),
+    apply: impl FnOnce(),
+) -> bool {
+    let _transaction = transaction.lock().unwrap();
+    if generation.0.load(Ordering::Acquire) != generation.1 {
+        return false;
+    }
+    apply();
+    true
+}
+
+fn publish_output_state(
+    app: &tauri::AppHandle,
+    state: &Mutex<AudioOutputState>,
+    transaction: &Mutex<()>,
+    active: Option<AudioOutputConfig>,
+) {
+    let _transaction = transaction.lock().unwrap();
+    let snapshot = {
+        let mut state = state.lock().unwrap();
+        let configured = state.configured.clone();
+        let playback_generation = active.as_ref().map(|_| next_playback_generation());
+        replace_output_state(&mut state, configured, active);
+        state.playback_generation = playback_generation;
+        state.clone()
+    };
+    let _ = app.emit("audio-output-changed", snapshot);
+}
+
+fn publish_hq_output(
+    app: &tauri::AppHandle,
+    watch: &HqWatch,
+    active: Option<AudioOutputConfig>,
+    generation: (&AtomicU64, u64),
+    playback_generation: u64,
+) -> bool {
+    with_current_generation(&watch.output_transaction, generation, || {
+        let snapshot = {
+            let mut state = watch.output_state.lock().unwrap();
+            // A finished old gapless arm must not clear its successor's route.
+            if active.is_none()
+                && state
+                    .playback_generation
+                    .is_some_and(|token| token != playback_generation)
+            {
+                return;
+            }
+            let configured = state.configured.clone();
+            let token = active.as_ref().map(|_| playback_generation);
+            replace_output_state(&mut state, configured, active);
+            state.playback_generation = token;
+            state.clone()
+        };
+        let _ = app.emit("audio-output-changed", snapshot);
+    })
+}
+
+fn emit_hq_buffering(arm: &HqArm, buffering: bool) -> bool {
+    let mut emitted = false;
+    with_current_generation(
+        &arm.watch.output_transaction,
+        (&arm.gen_cell, arm.gen),
+        || {
+            if arm.feed.is_cancelled() {
+                return;
+            }
+            let current = arm.watch.output_state.lock().unwrap().playback_generation;
+            if current != Some(arm.playback_generation) {
+                return;
+            }
+            if let Some(track_id) = arm.track_id {
+                let _ = arm.app.emit(
+                    "audio-buffering",
+                    serde_json::json!({
+                        "buffering": buffering, "trackId": track_id,
+                        "playbackGeneration": arm.playback_generation,
+                    }),
+                );
+                emitted = true;
+            }
+        },
+    );
+    emitted
+}
+
+/// A decoded next track waiting for HQPlayer to cross into it.
+struct HqPrepared {
+    playback_generation: u64,
+    pipeline: gst::Pipeline,
+    feed: crate::hqplayer::WavFeed,
+    heard: Arc<AtomicU32>,
+    finish_emit: Arc<AtomicBool>,
+    uri: String,
+    track_id: u64,
+    qid: String,
+    norm_gain: f64,
+    replay_gain: f64,
+    peak_amplitude: f64,
+    rate: u32,
+    channels: u32,
+    /// `PlayNextURI` has been sent. Until then the row is not in Desktop's playlist.
+    sent: bool,
+}
+
+#[derive(Clone)]
+struct HqQueueMeta {
+    token: u64,
+    uri: String,
+    track_id: u64,
+    qid: String,
+    norm_gain: f64,
+    replay_gain: f64,
+    peak_amplitude: f64,
+}
+
+/// Shared with the arm threads and the status watcher.
+struct HqPreparing {
+    token: u64,
+    track_id: u64,
+    qid: String,
+    feed: crate::hqplayer::WavFeed,
+    pipeline: gst::Pipeline,
+}
+
+struct HqWatch {
+    cmd_tx: mpsc::Sender<AudioCommand>,
+    next: Mutex<Option<HqPrepared>>,
+    preparing: Mutex<Option<HqPreparing>>,
+    last_status: Mutex<Option<crate::hqplayer::Status>>,
+    output_state: Arc<Mutex<AudioOutputState>>,
+    output_transaction: Arc<Mutex<()>>,
+    /// `hq_gen` of the track whose watcher has observed play. Zero before that.
+    started_gen: AtomicU64,
+    advancing: AtomicBool,
+    next_gen: AtomicU64,
+}
+
+fn hq_crossed_boundary(
+    previous: crate::hqplayer::Status,
+    current: crate::hqplayer::Status,
+) -> bool {
+    current.state == 2
+        && previous.length > 1.0
+        && previous.position + 5.0 >= previous.length
+        && current.position < 2.0
+        && previous.position > current.position + 5.0
+}
+
+fn cancel_hq_for_output_change(
+    watch: &HqWatch,
+    control: &Mutex<Option<crate::hqplayer::ControlSession>>,
+    host: &str,
+    port: u16,
+) {
+    if watch.advancing.load(Ordering::Acquire) {
+        return;
+    }
+    let prepared = watch
+        .next
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|item| item.sent);
+    if prepared {
+        // A control snapshot closes the window between Desktop switching and
+        // our periodic watcher observing it. Never remove a WAV already heard.
+        let previous = *watch.last_status.lock().unwrap();
+        let current = {
+            let mut session = control.lock().unwrap_or_else(|p| p.into_inner());
+            crate::hqplayer::retry_read(&mut session, host, port, |session| session.status())
+        };
+        if let (Some(previous), Ok(current)) = (previous, current) {
+            if hq_crossed_boundary(previous, current) {
+                if !watch.advancing.swap(true, Ordering::AcqRel) {
+                    let _ = watch.cmd_tx.send(AudioCommand::HandleHqAdvance);
+                }
+                return;
+            }
+        }
+    }
+    cancel_hq_prepared(watch, control, host, port);
+}
+
+fn cancel_hq_prepared(
+    watch: &HqWatch,
+    control: &Mutex<Option<crate::hqplayer::ControlSession>>,
+    host: &str,
+    port: u16,
+) {
+    watch.next_gen.fetch_add(1, Ordering::AcqRel);
+    if let Some(preparing) = watch.preparing.lock().unwrap().take() {
+        preparing.feed.cancel();
+        if let Some(bus) = preparing.pipeline.bus() {
+            bus.set_flushing(true);
+        }
+        let _ = preparing.pipeline.set_state(gst::State::Null);
+    }
+    let prepared = match watch.next.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
+    let Some(prepared) = prepared else {
+        return;
+    };
+    if prepared.sent {
+        let _ = hq_send_transport(control, host, port, |session| session.playlist_remove(1));
+    }
+    prepared.finish_emit.store(false, Ordering::SeqCst);
+    prepared.feed.cancel();
+    let _ = prepared.pipeline.set_state(gst::State::Null);
+}
+
+struct HqLaunch {
+    playback_generation: u64,
+    started: mpsc::Receiver<Result<(), String>>,
+    pipeline: gst::Pipeline,
+    feed: crate::hqplayer::WavFeed,
+    heard: Arc<AtomicU32>,
+    finish_emit: Arc<AtomicBool>,
+}
+
+type HqStartupReply = Arc<Mutex<Option<Reply<Result<(), String>>>>>;
+
+struct HqArm {
+    playback_generation: u64,
+    startup: HqStartupReply,
+    resume_paused: bool,
+    track_id: Option<u64>,
+    paused: Arc<AtomicBool>,
+    pipeline: gst::Pipeline,
+    feed: crate::hqplayer::WavFeed,
+    control: Arc<Mutex<Option<crate::hqplayer::ControlSession>>>,
+    gen: u64,
+    gen_cell: Arc<AtomicU64>,
+    origin: f32,
+    heard: Arc<AtomicU32>,
+    finish_emit: Arc<AtomicBool>,
+    eos: Arc<AtomicBool>,
+    reported: Arc<AtomicBool>,
+    app: tauri::AppHandle,
+    signal: Arc<SignalPathTracker>,
+    decoded_cell: Arc<Mutex<Option<crate::pipeline_probe::PadCaps>>>,
+    output_cell: Arc<Mutex<Option<crate::pipeline_probe::PadCaps>>>,
+    host: String,
+    port: u16,
+    tearing_down: Arc<AtomicBool>,
+    watch: Arc<HqWatch>,
+    queue: Option<HqQueueMeta>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_hqplayer_track(
+    uri: &str,
+    is_dash: bool,
+    route: crate::proxy::Route,
+    origin: f32,
+    gen: u64,
+    gen_cell: Arc<AtomicU64>,
+    control: Arc<Mutex<Option<crate::hqplayer::ControlSession>>>,
+    host: String,
+    port: u16,
+    app: tauri::AppHandle,
+    tearing_down: Arc<AtomicBool>,
+    eos: Arc<AtomicBool>,
+    signal: Arc<SignalPathTracker>,
+    decoded_cell: Arc<Mutex<Option<crate::pipeline_probe::PadCaps>>>,
+    output_cell: Arc<Mutex<Option<crate::pipeline_probe::PadCaps>>>,
+    watch: Arc<HqWatch>,
+    queue: Option<HqQueueMeta>,
+    resume_paused: bool,
+    track_id: Option<u64>,
+    paused: Arc<AtomicBool>,
+) -> Result<HqLaunch, String> {
+    let feed = crate::hqplayer::WavFeed::bind()?;
+    let pipeline = match build_hqplayer_pipeline(uri, is_dash, route, &feed) {
+        Ok(pipeline) => pipeline,
+        Err(err) => {
+            feed.cancel();
+            return Err(err);
+        }
+    };
+    if let Some(meta) = queue.as_ref() {
+        let mut preparing = watch.preparing.lock().unwrap();
+        if watch.next_gen.load(Ordering::Acquire) != meta.token {
+            feed.cancel();
+            let _ = pipeline.set_state(gst::State::Null);
+            return Err("Preload was superseded".into());
+        }
+        *preparing = Some(HqPreparing {
+            token: meta.token,
+            track_id: meta.track_id,
+            qid: meta.qid.clone(),
+            feed: feed.clone(),
+            pipeline: pipeline.clone(),
+        });
+    }
+    let heard = Arc::new(AtomicU32::new(origin.to_bits()));
+    let finish_emit = Arc::new(AtomicBool::new(true));
+    let (started_tx, started) = mpsc::channel();
+    let playback_generation = next_playback_generation();
+    let arm = HqArm {
+        playback_generation,
+        startup: Arc::new(Mutex::new(Some(started_tx))),
+        resume_paused,
+        track_id,
+        paused,
+        pipeline: pipeline.clone(),
+        feed: feed.clone(),
+        control,
+        gen,
+        gen_cell,
+        origin,
+        heard: Arc::clone(&heard),
+        finish_emit: Arc::clone(&finish_emit),
+        eos,
+        reported: Arc::new(AtomicBool::new(false)),
+        app,
+        signal,
+        decoded_cell,
+        output_cell,
+        host,
+        port,
+        tearing_down,
+        watch,
+        queue,
+    };
+    if let Err(err) = std::thread::Builder::new()
+        .name("hqplayer-arm".into())
+        .spawn(move || run_hqplayer_arm(arm))
+    {
+        feed.cancel();
+        let _ = pipeline.set_state(gst::State::Null);
+        return Err(format!("Failed to start HQPlayer handoff: {err}"));
+    }
+    Ok(HqLaunch {
+        playback_generation,
+        started,
+        pipeline,
+        feed,
+        heard,
+        finish_emit,
+    })
+}
+
+fn build_hqplayer_pipeline(
+    uri: &str,
+    is_dash: bool,
+    route: crate::proxy::Route,
+    feed: &crate::hqplayer::WavFeed,
+) -> Result<gst::Pipeline, String> {
+    use gst_app::prelude::*;
+
+    let pipe = gst::Pipeline::new();
+    let built = (|| -> Result<(), String> {
+        watch_pipeline_sources(&pipe, route);
+        let mut udb = gst::ElementFactory::make("uridecodebin").property("uri", uri);
+        if is_dash {
+            udb = udb
+                .property("buffer-duration", 15_000_000_000i64)
+                .property("use-buffering", true);
+        } else {
+            udb = udb
+                .property("buffer-duration", 5_000_000_000i64)
+                .property("use-buffering", true);
+        }
+        let uridecodebin = udb
+            .build()
+            .map_err(|err| format!("Failed to create uridecodebin: {err}"))?;
+        let audioconvert = gst::ElementFactory::make("audioconvert")
+            .property_from_str("dithering", "none")
+            .property_from_str("noise-shaping", "none")
+            .build()
+            .map_err(|err| format!("Failed to create audioconvert: {err}"))?;
+        let caps = gst::Caps::builder("audio/x-raw")
+            .field("format", "S32LE")
+            .build();
+        let capsfilter = gst::ElementFactory::make("capsfilter")
+            .property("caps", &caps)
+            .build()
+            .map_err(|err| format!("Failed to create capsfilter: {err}"))?;
+        let appsink = gst_app::AppSink::builder()
+            .sync(false)
+            .drop(false)
+            .max_buffers(64)
+            .build();
+
+        let feed_samples = feed.clone();
+        let feed_eos = feed.clone();
+        appsink.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    if feed_samples.is_cancelled() {
+                        return Err(gst::FlowError::Eos);
+                    }
+                    let token = feed_samples.capture_token();
+                    let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                    let caps = sample.caps().ok_or(gst::FlowError::Error)?;
+                    let format = parse_pcm_format(caps).ok_or(gst::FlowError::Error)?;
+                    if format.gst_format != "S32LE" || format.bytes_per_sample != 4 {
+                        return Err(gst::FlowError::Error);
+                    }
+                    feed_samples.set_format(format.sample_rate, format.channels);
+                    let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                    feed_samples.offer(token, map.as_slice());
+                    if feed_samples.failure().is_some() {
+                        return Err(gst::FlowError::Error);
+                    }
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .eos(move |_sink| {
+                    feed_eos.finish();
+                })
+                .build(),
+        );
+
+        pipe.add_many([
+            &uridecodebin,
+            &audioconvert,
+            &capsfilter,
+            appsink.upcast_ref(),
+        ])
+        .map_err(|err| format!("Failed to add elements: {err}"))?;
+        gst::Element::link_many([&audioconvert, &capsfilter, appsink.upcast_ref()])
+            .map_err(|err| format!("Failed to link HQPlayer chain: {err}"))?;
+
+        let convert_weak = audioconvert.downgrade();
+        uridecodebin.connect_pad_added(move |_src, src_pad| {
+            if let Some(caps) = src_pad.current_caps() {
+                if let Some(structure) = caps.structure(0) {
+                    if !structure.name().as_str().starts_with("audio/") {
+                        return;
+                    }
+                }
+            }
+            let Some(convert) = convert_weak.upgrade() else {
+                return;
+            };
+            let Some(sink_pad) = convert.static_pad("sink") else {
+                return;
+            };
+            if sink_pad.is_linked() {
+                return;
+            }
+            if let Err(err) = src_pad.link(&sink_pad) {
+                log::warn!("[hqplayer] pad link failed: {err:?}");
+            }
+        });
+        Ok(())
+    })();
+    if let Err(err) = built {
+        let _ = pipe.set_state(gst::State::Null);
+        return Err(err);
+    }
+    Ok(pipe)
+}
+
+fn hq_superseded(arm: &HqArm) -> bool {
+    arm.feed.is_cancelled()
+        || arm.gen_cell.load(Ordering::Acquire) != arm.gen
+        || arm
+            .queue
+            .as_ref()
+            .is_some_and(|meta| arm.watch.next_gen.load(Ordering::Acquire) != meta.token)
+}
+
+fn hq_emit_error(arm: &HqArm, message: &str) {
+    let _transaction = arm.watch.output_transaction.lock().unwrap();
+    let active_generation = arm.watch.output_state.lock().unwrap().playback_generation;
+    if active_generation.is_some_and(|token| token != arm.playback_generation) {
+        return;
+    }
+    log::error!("[hqplayer] {message}");
+    if arm.tearing_down.load(Ordering::SeqCst) {
+        return;
+    }
+    if arm.gen_cell.load(Ordering::Acquire) != arm.gen {
+        return;
+    }
+    if arm
+        .reported
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let _ = arm.app.emit(
+        "audio-error",
+        serde_json::json!({
+            "kind": "playback_error",
+            "message": message,
+        }),
+    );
+}
+
+fn hq_fail(arm: &HqArm, message: &str) {
+    hq_start_result(arm, Err(message.into()));
+    arm.feed.cancel();
+    let _ = arm.pipeline.set_state(gst::State::Null);
+    if arm.queue.is_some() {
+        if message != "cancelled" {
+            log::warn!("[hqplayer] next track not queued: {message}");
+        }
+        return;
+    }
+    if arm.gen_cell.load(Ordering::Acquire) != arm.gen {
+        return;
+    }
+    publish_hq_output(
+        &arm.app,
+        &arm.watch,
+        None,
+        (&arm.gen_cell, arm.gen),
+        arm.playback_generation,
+    );
+    hq_emit_error(arm, message);
+}
+
+fn wait_until_paused(
+    pipeline: &gst::Pipeline,
+    budget: std::time::Duration,
+    mut stale: impl FnMut() -> bool,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if stale() {
+            return Err("cancelled".into());
+        }
+        let (ret, cur, _) = pipeline.state(gst::ClockTime::from_mseconds(200));
+        if let Err(err) = ret {
+            return Err(format!("decoder failed: {err}"));
+        }
+        if cur >= gst::State::Paused {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("timed out waiting for the decoder".into());
+        }
+    }
+}
+
+fn hq_wav_len(arm: &HqArm, rate: u32, channels: u32) -> Result<Option<u32>, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if hq_superseded(arm) {
+            return Err("cancelled".into());
+        }
+        if let Some(duration) = arm.pipeline.query_duration::<gst::ClockTime>() {
+            if duration.nseconds() > 0 {
+                let dur_secs = duration.nseconds() as f64 / 1_000_000_000.0;
+                let remain = (dur_secs - f64::from(arm.origin)).max(0.0);
+                return match crate::hqplayer::bytes_from_duration(remain, rate, channels) {
+                    Some(0) => Err("HQPlayer seek is past the end of the track".into()),
+                    Some(bytes) => Ok(Some(bytes)),
+                    None => Err("track is too long for a WAV handoff".into()),
+                };
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn hq_handoff(arm: &HqArm) -> Result<(), crate::hqplayer::ControlError> {
+    let url = arm.feed.url();
+    let gen = arm.gen;
+    let gen_cell = Arc::clone(&arm.gen_cell);
+    let feed = arm.feed.clone();
+    let host = arm.host.clone();
+    let port = arm.port;
+    log::info!("[hqplayer] handoff {url}");
+    let mut slot = arm
+        .control
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    crate::hqplayer::call(&mut slot, &host, port, |session| {
+        if gen_cell.load(Ordering::Acquire) != gen || feed.is_cancelled() {
+            return Ok(());
+        }
+        if let Err(err) = session.stop() {
+            if matches!(err, crate::hqplayer::ControlError::Transport(_)) {
+                return Err(err);
+            }
+            log::warn!("[hqplayer] stop before handoff: {err}");
+        }
+        if gen_cell.load(Ordering::Acquire) != gen || feed.is_cancelled() {
+            return Ok(());
+        }
+        session.playlist_clear()?;
+        if gen_cell.load(Ordering::Acquire) != gen || feed.is_cancelled() {
+            return Ok(());
+        }
+        session.play_next_uri(&url)?;
+        if gen_cell.load(Ordering::Acquire) != gen || feed.is_cancelled() {
+            let _ = session.stop();
+            return Ok(());
+        }
+        if let Err(err) = session.play() {
+            if matches!(err, crate::hqplayer::ControlError::Transport(_)) {
+                return Err(err);
+            }
+            log::warn!("[hqplayer] play after PlayNextURI: {err}");
+        }
+        Ok(())
+    })
+}
+
+fn spawn_hq_bus(arm: &HqArm) {
+    let Some(bus) = arm.pipeline.bus() else {
+        return;
+    };
+    let feed = arm.feed.clone();
+    let reported = Arc::clone(&arm.reported);
+    let app = arm.app.clone();
+    let tearing = Arc::clone(&arm.tearing_down);
+    let gen = arm.gen;
+    let gen_cell = Arc::clone(&arm.gen_cell);
+    let report_errors = arm.queue.is_none();
+    std::thread::spawn(move || {
+        for msg in bus.iter_timed(gst::ClockTime::NONE) {
+            if gen_cell.load(Ordering::Acquire) != gen || feed.is_cancelled() {
+                break;
+            }
+            match msg.view() {
+                gst::MessageView::Eos(..) => {
+                    feed.finish();
+                    break;
+                }
+                gst::MessageView::Error(err) => {
+                    let err_msg = err.error().to_string();
+                    log::error!("[hqplayer] gstreamer: {err_msg}");
+                    feed.cancel();
+                    if report_errors
+                        && !tearing.load(Ordering::SeqCst)
+                        && gen_cell.load(Ordering::Acquire) == gen
+                        && reported
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        let _ = app.emit(
+                            "audio-error",
+                            serde_json::json!({
+                                "kind": "playback_error",
+                                "message": err_msg,
+                            }),
+                        );
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+fn run_hqplayer_arm(arm: HqArm) {
+    spawn_hq_bus(&arm);
+    if let Err(err) = arm.pipeline.set_state(gst::State::Paused) {
+        hq_fail(&arm, &format!("Failed to pause the decoder: {err}"));
+        return;
+    }
+    let paused_budget = std::time::Duration::from_secs(20);
+    let feed = arm.feed.clone();
+    let gen = arm.gen;
+    let gen_cell = Arc::clone(&arm.gen_cell);
+    if let Err(err) = wait_until_paused(&arm.pipeline, paused_budget, move || {
+        feed.is_cancelled() || gen_cell.load(Ordering::Acquire) != gen
+    }) {
+        if err != "cancelled" {
+            hq_fail(&arm, &err);
+        }
+        return;
+    }
+    if hq_superseded(&arm) {
+        return;
+    }
+    if arm.origin > 0.5 {
+        arm.feed.drop_early();
+        let pos = gst::ClockTime::from_nseconds((f64::from(arm.origin) * 1_000_000_000.0) as u64);
+        if let Err(err) = arm
+            .pipeline
+            .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, pos)
+        {
+            hq_fail(&arm, &format!("HQPlayer seek failed: {err}"));
+            return;
+        }
+        let feed = arm.feed.clone();
+        let gen = arm.gen;
+        let gen_cell = Arc::clone(&arm.gen_cell);
+        if let Err(err) = wait_until_paused(&arm.pipeline, paused_budget, move || {
+            feed.is_cancelled() || gen_cell.load(Ordering::Acquire) != gen
+        }) {
+            if err != "cancelled" {
+                hq_fail(&arm, &err);
+            }
+            return;
+        }
+        if hq_superseded(&arm) {
+            return;
+        }
+    }
+    arm.feed.begin_capture();
+    if let Err(err) = arm.pipeline.set_state(gst::State::Playing) {
+        hq_fail(&arm, &format!("Failed to start the decoder: {err}"));
+        return;
+    }
+    let (rate, channels) = match arm.feed.wait_format(std::time::Duration::from_secs(15)) {
+        Ok(format) => format,
+        Err(err) => {
+            if err == "cancelled" || hq_superseded(&arm) {
+                return;
+            }
+            hq_fail(&arm, &err);
+            return;
+        }
+    };
+    if hq_superseded(&arm) {
+        return;
+    }
+    if arm.queue.is_none() {
+        let caps = crate::pipeline_probe::PadCaps {
+            format: "S32LE".to_string(),
+            rate,
+            channels,
+        };
+        if let Ok(mut guard) = arm.decoded_cell.lock() {
+            *guard = Some(caps.clone());
+        }
+        if let Ok(mut guard) = arm.output_cell.lock() {
+            *guard = Some(caps);
+        }
+        arm.signal.set_decoded("S32LE", rate, channels);
+        arm.signal.set_output("S32LE", rate, channels);
+    }
+
+    match hq_wav_len(&arm, rate, channels) {
+        Ok(Some(bytes)) => {
+            if let Err(err) = arm.feed.set_data_bytes(bytes) {
+                if err == "cancelled" || hq_superseded(&arm) {
+                    return;
+                }
+                hq_fail(&arm, &err);
+                return;
+            }
+        }
+        Ok(None) => {
+            if let Err(err) = arm.feed.wait_finished(std::time::Duration::from_secs(30)) {
+                if err == "cancelled" || hq_superseded(&arm) {
+                    return;
+                }
+                hq_fail(&arm, &err);
+                return;
+            }
+        }
+        Err(err) => {
+            if err == "cancelled" || hq_superseded(&arm) {
+                return;
+            }
+            hq_fail(&arm, &err);
+            return;
+        }
+    }
+    if hq_superseded(&arm) {
+        return;
+    }
+    if arm.queue.is_some() {
+        let meta = arm.queue.clone().expect("queue meta");
+        if let Err(err) = queue_hq_uri(&arm, &meta, rate, channels) {
+            if err != "cancelled" {
+                log::warn!("[hqplayer] next track not queued: {err}");
+            }
+            arm.feed.cancel();
+            let _ = arm.pipeline.set_state(gst::State::Null);
+        }
+        return;
+    }
+    if let Err(err) = hq_handoff(&arm) {
+        hq_fail(&arm, &err.to_string());
+        return;
+    }
+    if hq_superseded(&arm) {
+        return;
+    }
+    spawn_hq_watcher(arm, false);
+}
+
+fn spawn_hq_watcher(arm: HqArm, assume_started: bool) {
+    if let Err(err) = std::thread::Builder::new()
+        .name("hqplayer-watch".into())
+        .spawn(move || run_hq_watcher(arm, assume_started))
+    {
+        log::error!("[hqplayer] watcher failed to start: {err}");
+    }
+}
+
+fn queue_hq_uri(arm: &HqArm, meta: &HqQueueMeta, rate: u32, channels: u32) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if hq_superseded(arm) || arm.watch.next_gen.load(Ordering::Acquire) != meta.token {
+            return Err("cancelled".into());
+        }
+        if arm.watch.started_gen.load(Ordering::Acquire) == arm.gen {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("current track did not start".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let url = arm.feed.url();
+    let host = arm.host.clone();
+    let port = arm.port;
+    let gen = arm.gen;
+    let gen_cell = Arc::clone(&arm.gen_cell);
+    let token = meta.token;
+    let next_gen = Arc::clone(&arm.watch);
+    let sent = {
+        let mut slot = arm
+            .control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::hqplayer::call(&mut slot, &host, port, |session| {
+            if gen_cell.load(Ordering::Acquire) != gen
+                || next_gen.next_gen.load(Ordering::Acquire) != token
+            {
+                return Ok(false);
+            }
+            session.play_next_uri(&url)?;
+            Ok(true)
+        })
+        .map_err(|err| err.to_string())?
+    };
+    // `sent` is false when the closure returned before PlayNextURI. Removing
+    // index 1 then would drop a row this arm did not add.
+    if !sent {
+        return Err("cancelled".into());
+    }
+    if hq_superseded(arm) || arm.watch.next_gen.load(Ordering::Acquire) != meta.token {
+        let _ = hq_send_transport(&arm.control, &arm.host, arm.port, |session| {
+            session.playlist_remove(1)
+        });
+        return Err("cancelled".into());
+    }
+    let prepared = HqPrepared {
+        playback_generation: arm.playback_generation,
+        pipeline: arm.pipeline.clone(),
+        feed: arm.feed.clone(),
+        heard: Arc::clone(&arm.heard),
+        finish_emit: Arc::clone(&arm.finish_emit),
+        uri: meta.uri.clone(),
+        track_id: meta.track_id,
+        qid: meta.qid.clone(),
+        norm_gain: meta.norm_gain,
+        replay_gain: meta.replay_gain,
+        peak_amplitude: meta.peak_amplitude,
+        rate,
+        channels,
+        sent: true,
+    };
+    let mut guard = arm
+        .watch
+        .next
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if arm.watch.next_gen.load(Ordering::Acquire) != meta.token {
+        drop(guard);
+        let _ = hq_send_transport(&arm.control, &arm.host, arm.port, |session| {
+            session.playlist_remove(1)
+        });
+        return Err("cancelled".into());
+    }
+    *guard = Some(prepared);
+    drop(guard);
+    let mut preparing = arm.watch.preparing.lock().unwrap();
+    if preparing
+        .as_ref()
+        .is_some_and(|item| item.token == meta.token)
+    {
+        preparing.take();
+    }
+    Ok(())
+}
+
+enum HqPoll {
+    Status(crate::hqplayer::Status),
+    Transport,
+    Rejected,
+    Superseded,
+}
+
+fn hq_poll_status(arm: &HqArm) -> HqPoll {
+    let host = arm.host.clone();
+    let port = arm.port;
+    let gen = arm.gen;
+    let gen_cell = Arc::clone(&arm.gen_cell);
+    let mut slot = arm
+        .control
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match crate::hqplayer::retry_read(&mut slot, &host, port, |session| {
+        if gen_cell.load(Ordering::Acquire) != gen {
+            return Ok(None);
+        }
+        session.status().map(Some)
+    }) {
+        Ok(Some(status)) => HqPoll::Status(status),
+        Ok(None) => HqPoll::Superseded,
+        Err(crate::hqplayer::ControlError::Transport(_)) => HqPoll::Transport,
+        Err(err) => {
+            log::warn!("[hqplayer] status: {err}");
+            HqPoll::Rejected
+        }
+    }
+}
+
+fn hq_did_not_start(arm: &HqArm) {
+    hq_start_result(arm, Err("HQPlayer did not start playback".into()));
+    arm.feed.cancel();
+    let _ = arm.pipeline.set_state(gst::State::Null);
+    hq_emit_error(
+        arm,
+        "HQPlayer did not start playback. It needs the DAC free and the settings dialog closed.",
+    );
+    arm.finish_emit.store(false, Ordering::SeqCst);
+}
+
+fn hq_start_result(arm: &HqArm, result: Result<(), String>) {
+    if let Some(reply) = arm.startup.lock().unwrap().take() {
+        let _ = reply.send(result);
+    }
+}
+
+fn hq_mark_started(arm: &HqArm) {
+    if arm.gen_cell.load(Ordering::Acquire) == arm.gen {
+        if arm.resume_paused && arm.startup.lock().unwrap().is_some() {
+            if let Err(error) =
+                hq_send_transport(&arm.control, &arm.host, arm.port, |session| session.pause())
+            {
+                hq_fail(arm, &error);
+                return;
+            }
+        }
+        hq_start_result(arm, Ok(()));
+        arm.watch.started_gen.store(arm.gen, Ordering::Release);
+    }
+}
+
+fn hq_next_is_sent(arm: &HqArm) -> bool {
+    let guard = arm
+        .watch
+        .next
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.as_ref().is_some_and(|prepared| prepared.sent)
+}
+
+fn run_hq_watcher(arm: HqArm, assume_started: bool) {
+    if !arm.finish_emit.load(Ordering::SeqCst) {
+        return;
+    }
+    let started_at = std::time::Instant::now();
+    let mut started = assume_started;
+    if assume_started {
+        hq_mark_started(&arm);
+    }
+    let mut seen_position = 0.0f64;
+    let mut seen_length = 0.0f64;
+    let mut stopped_polls = 0u8;
+    let mut idle_since = std::time::Instant::now();
+    let mut transport_since: Option<std::time::Instant> = None;
+    let mut buffering = false;
+    loop {
+        if !arm.finish_emit.load(Ordering::SeqCst)
+            || arm.feed.is_cancelled()
+            || arm.watch.advancing.load(Ordering::Acquire)
+        {
+            return;
+        }
+        if arm.gen_cell.load(Ordering::Acquire) != arm.gen {
+            return;
+        }
+        if !started && started_at.elapsed() >= std::time::Duration::from_secs(20) {
+            hq_did_not_start(&arm);
+            return;
+        }
+        if let Some(error) = arm.feed.failure() {
+            hq_fail(&arm, &error);
+            return;
+        }
+        let readers = arm.feed.reader_count();
+        if readers > 0 {
+            idle_since = std::time::Instant::now();
+        }
+        match hq_poll_status(&arm) {
+            HqPoll::Superseded => return,
+            HqPoll::Rejected | HqPoll::Transport => {
+                if !buffering && started {
+                    buffering = emit_hq_buffering(&arm, true);
+                }
+                let since = transport_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= std::time::Duration::from_secs(12) {
+                    arm.feed.cancel();
+                    let _ = arm.pipeline.set_state(gst::State::Null);
+                    hq_fail(&arm, "HQPlayer control connection closed");
+                    arm.finish_emit.store(false, Ordering::SeqCst);
+                    return;
+                }
+            }
+            HqPoll::Status(status) => {
+                if hq_superseded(&arm) {
+                    return;
+                }
+                if status.state == 2 && arm.paused.load(Ordering::Acquire) {
+                    if let Err(error) =
+                        hq_send_transport(&arm.control, &arm.host, arm.port, |session| {
+                            session.pause()
+                        })
+                    {
+                        hq_fail(&arm, &error);
+                        return;
+                    }
+                }
+                if buffering && status.state == 2 && !arm.paused.load(Ordering::Acquire) {
+                    emit_hq_buffering(&arm, false);
+                    buffering = false;
+                }
+                transport_since = None;
+                let pos = arm.origin + status.position as f32;
+                arm.heard.store(pos.to_bits(), Ordering::Relaxed);
+                match status.state {
+                    2 => {
+                        hq_mark_started(&arm);
+                        stopped_polls = 0;
+                        idle_since = std::time::Instant::now();
+                        // The previous sample is the end of the track that was
+                        // playing. A restart is the queued WAV taking over
+                        // while Desktop stays in play. Length is not required
+                        // to change: two tracks can share a duration.
+                        let crossed = hq_crossed_boundary(
+                            crate::hqplayer::Status {
+                                state: 2,
+                                position: seen_position,
+                                length: seen_length,
+                            },
+                            status,
+                        );
+                        let ready = hq_next_is_sent(&arm);
+                        if started
+                            && crossed
+                            && ready
+                            && arm.finish_emit.swap(false, Ordering::SeqCst)
+                            && arm.gen_cell.load(Ordering::Acquire) == arm.gen
+                        {
+                            if arm.watch.advancing.swap(true, Ordering::AcqRel) {
+                                return;
+                            }
+                            if arm
+                                .watch
+                                .cmd_tx
+                                .send(AudioCommand::HandleHqAdvance)
+                                .is_err()
+                            {
+                                arm.watch.advancing.store(false, Ordering::Release);
+                            }
+                            return;
+                        }
+                        started = true;
+                        if status.length > 0.0 {
+                            seen_length = status.length;
+                            seen_position = status.position;
+                        }
+                        *arm.watch.last_status.lock().unwrap() = Some(status);
+                    }
+                    1 => {
+                        stopped_polls = 0;
+                        idle_since = std::time::Instant::now();
+                    }
+                    0 | 3 => {
+                        if started {
+                            // A queued next that was already at the end is the
+                            // gapless boundary, not an early stop. Two stopped
+                            // polls still fall back to track-finished.
+                            let queued_near_end = hq_next_is_sent(&arm)
+                                && seen_length > 1.0
+                                && seen_position + 5.0 >= seen_length;
+                            let near_end = queued_near_end
+                                || (status.length > 0.0 && status.position + 1.5 >= status.length);
+                            stopped_polls = stopped_polls.saturating_add(1);
+                            if stopped_polls >= 2 {
+                                if near_end {
+                                    arm.feed.finish();
+                                    let _ = arm.pipeline.set_state(gst::State::Null);
+                                    if arm.finish_emit.swap(false, Ordering::SeqCst) {
+                                        arm.eos.store(true, Ordering::SeqCst);
+                                        publish_hq_output(
+                                            &arm.app,
+                                            &arm.watch,
+                                            None,
+                                            (&arm.gen_cell, arm.gen),
+                                            arm.playback_generation,
+                                        );
+                                        let _ = arm.app.emit("track-finished", ());
+                                    }
+                                } else if arm.finish_emit.load(Ordering::SeqCst) {
+                                    arm.feed.cancel();
+                                    let _ = arm.pipeline.set_state(gst::State::Null);
+                                    hq_emit_error(
+                                        &arm,
+                                        "HQPlayer stopped before the end of the track",
+                                    );
+                                    arm.finish_emit.store(false, Ordering::SeqCst);
+                                }
+                                return;
+                            }
+                        } else if readers == 0
+                            && idle_since.elapsed() >= std::time::Duration::from_secs(12)
+                        {
+                            hq_did_not_start(&arm);
+                            return;
+                        }
+                    }
+                    _ => {
+                        if !started
+                            && readers == 0
+                            && idle_since.elapsed() >= std::time::Duration::from_secs(12)
+                        {
+                            hq_did_not_start(&arm);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+}
+
 // ── Appsink pipeline builder ───────────────────────────────────────────
 
 /// audioconvert `mix-matrix` that maps a stereo source (in0=L, in1=R) onto the
@@ -3865,6 +6034,7 @@ struct AppSinkConfig<'a> {
     route: crate::proxy::Route,
     exclusive: bool,
     bit_perfect: bool,
+    preserve_rate: bool,
     writer_tx: crossbeam_channel::Sender<WriterCommand>,
     writer_gen: Arc<AtomicU64>,
     negotiated_fmt: &'a PcmFormat,
@@ -3912,6 +6082,7 @@ fn build_appsink_pipeline(config: AppSinkConfig<'_>) -> Result<PipelineParts, St
         route,
         exclusive,
         bit_perfect,
+        preserve_rate,
         writer_tx,
         writer_gen,
         negotiated_fmt,
@@ -3987,7 +6158,7 @@ fn build_appsink_pipeline(config: AppSinkConfig<'_>) -> Result<PipelineParts, St
             )
             .field("channels", device_channels as i32);
         let rate_list: Vec<i32> = supported_rates.iter().map(|&r| r as i32).collect();
-        if !bit_perfect && !rate_list.is_empty() {
+        if !bit_perfect && !preserve_rate && !rate_list.is_empty() {
             caps_builder = caps_builder.field("rate", gst::List::new(rate_list));
         }
         appsink.set_caps(Some(&caps_builder.build()));
@@ -4010,7 +6181,7 @@ fn build_appsink_pipeline(config: AppSinkConfig<'_>) -> Result<PipelineParts, St
         Option<gst::Element>,
         Option<gst::Element>,
         Option<gst::glib::WeakRef<gst::Element>>,
-    ) = if bit_perfect {
+    ) = if bit_perfect || preserve_rate {
         audioconvert.set_property_from_str("dithering", "none");
         audioconvert.set_property_from_str("noise-shaping", "none");
 
@@ -4172,7 +6343,7 @@ fn build_appsink_pipeline(config: AppSinkConfig<'_>) -> Result<PipelineParts, St
         }
 
         // Detect if resampling will occur (non-bit-perfect exclusive only)
-        if !is_bit_perfect {
+        if !is_bit_perfect && !preserve_rate {
             if let Some(caps) = src_pad.current_caps() {
                 if let Some(s) = caps.structure(0) {
                     if let Ok(native_rate) = s.get::<i32>("rate") {
@@ -4195,7 +6366,7 @@ fn build_appsink_pipeline(config: AppSinkConfig<'_>) -> Result<PipelineParts, St
 
         // Compatibility mode can choose a lossy format or resample to a rate
         // supported by the DAC. Strict mode locks every decoded CAPS event above.
-        if !is_dash && !is_bit_perfect {
+        if (!is_dash || preserve_rate) && !is_bit_perfect {
             let caps = src_pad.current_caps().or_else(|| {
                 let query = src_pad.query_caps(None);
                 if query.is_fixed() {
@@ -4228,10 +6399,14 @@ fn build_appsink_pipeline(config: AppSinkConfig<'_>) -> Result<PipelineParts, St
                             if let Some(cf) = cf_weak.upgrade() {
                                 // Keep a rate list so audioresample can select a
                                 // supported rate when the native one is unavailable.
-                                let rate_list: Vec<i32> = supported_rates_for_closure
-                                    .iter()
-                                    .map(|&r| r as i32)
-                                    .collect();
+                                let rate_list: Vec<i32> = if preserve_rate {
+                                    vec![rate]
+                                } else {
+                                    supported_rates_for_closure
+                                        .iter()
+                                        .map(|&r| r as i32)
+                                        .collect()
+                                };
                                 let locked = gst::Caps::builder("audio/x-raw")
                                     .field("format", chosen.as_str())
                                     .field("channels", device_channels as i32)
@@ -4779,7 +6954,13 @@ mod proxy_source_tests {
             let next_bin = Arc::clone(&next_bin);
             let route_generation = Arc::clone(&route_generation);
             std::thread::spawn(move || {
-                run_attach_executor(rx, next_bin, audio_proxy, route_generation)
+                run_attach_executor(
+                    rx,
+                    next_bin,
+                    audio_proxy,
+                    route_generation,
+                    Arc::new(AtomicBool::new(false)),
+                )
             })
         };
 
@@ -5315,6 +7496,7 @@ mod proxy_source_tests {
                     route: crate::proxy::Route::NoProxy,
                     exclusive: true,
                     bit_perfect: true,
+                    preserve_rate: false,
                     writer_tx: tx,
                     writer_gen: Arc::new(AtomicU64::new(1)),
                     negotiated_fmt: &output,
@@ -5420,11 +7602,15 @@ mod proxy_source_tests {
                     assert_eq!(chunk.format, pcm("S32LE", 44100, output_channels));
                     let actual: Vec<i32> = chunk
                         .data
-                        .chunks_exact(4)
-                        .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|b| i32::from_le_bytes(*b))
                         .collect();
                     let expected: Vec<i32> = source
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .flat_map(|frame| {
                             let mut samples =
                                 vec![(frame[0] as i32) << 16, (frame[1] as i32) << 16];
@@ -5550,6 +7736,350 @@ mod proxy_source_tests {
                     ));
                 chain.assert_rejected();
             }
+        }
+    }
+
+    mod output_transition_tests {
+        use super::super::*;
+
+        fn player_with_inbox() -> (AudioPlayer, mpsc::Receiver<AudioCommand>) {
+            let (cmd_tx, inbox) = mpsc::channel();
+            (
+                AudioPlayer {
+                    cmd_tx,
+                    output_transaction: Arc::new(Mutex::new(())),
+                    output_state: Arc::new(Mutex::new(AudioOutputState::new(
+                        AudioOutputConfig::default(),
+                        Some(AudioOutputConfig::default()),
+                    ))),
+                    exclusive_device: Arc::new(Mutex::new(None)),
+                    decoded_caps_cell: Arc::new(Mutex::new(None)),
+                    output_caps_cell: Arc::new(Mutex::new(None)),
+                },
+                inbox,
+            )
+        }
+
+        #[test]
+        fn settings_commit_never_waits_for_busy_audio_worker() {
+            let (player, inbox) = player_with_inbox();
+            let wanted = AudioOutputConfig {
+                route: AudioOutputRoute::Hqplayer,
+                ..Default::default()
+            };
+            player.configure_output(wanted.clone()).unwrap();
+            let state = player.output_state();
+            assert_eq!(state.configured, wanted);
+            assert_eq!(state.active.unwrap().route, AudioOutputRoute::Native);
+            assert!(state.pending);
+            assert!(matches!(inbox.try_recv(), Ok(AudioCommand::OutputChanged)));
+        }
+
+        #[test]
+        fn paused_seek_keeps_active_route_until_explicit_new_play() {
+            let native = AudioOutputConfig::default();
+            let wanted = AudioOutputConfig {
+                route: AudioOutputRoute::Hqplayer,
+                ..Default::default()
+            };
+            let state = AudioOutputState::new(wanted, Some(native.clone()));
+            assert_eq!(playback_config(&state, true), native);
+            assert_eq!(
+                playback_config(&state, false).route,
+                AudioOutputRoute::Hqplayer
+            );
+        }
+
+        #[test]
+        fn failed_worker_delivery_rolls_desired_state_back() {
+            let (player, inbox) = player_with_inbox();
+            drop(inbox);
+            let wanted = AudioOutputConfig {
+                route: AudioOutputRoute::Hqplayer,
+                ..Default::default()
+            };
+            assert!(player.configure_output(wanted).is_err());
+            assert_eq!(
+                player.output_state().configured,
+                AudioOutputConfig::default()
+            );
+            assert!(!player.output_state().pending);
+        }
+
+        #[test]
+        fn stale_start_cannot_publish_after_waiting_for_settings_commit() {
+            let gate = Arc::new(Mutex::new(()));
+            let generation = Arc::new(AtomicU64::new(4));
+            let held = gate.lock().unwrap();
+            let other_gate = Arc::clone(&gate);
+            let other_generation = Arc::clone(&generation);
+            let worker = std::thread::spawn(move || {
+                let mut published = false;
+                let current = with_current_generation(&other_gate, (&other_generation, 4), || {
+                    published = true
+                });
+                (current, published)
+            });
+            // A new play claims the generation while the old completion waits.
+            generation.fetch_add(1, Ordering::AcqRel);
+            drop(held);
+            assert_eq!(worker.join().unwrap(), (false, false));
+        }
+
+        #[test]
+        fn configured_updates_preserve_the_active_playback_instance() {
+            let mut state = AudioOutputState::new(
+                AudioOutputConfig::default(),
+                Some(AudioOutputConfig::default()),
+            );
+            state.playback_generation = Some(42);
+            let active = state.active.clone();
+            replace_output_state(
+                &mut state,
+                AudioOutputConfig {
+                    route: AudioOutputRoute::Hqplayer,
+                    ..Default::default()
+                },
+                active,
+            );
+            assert_eq!(state.playback_generation, Some(42));
+            assert!(state.pending);
+            let config = state.configured.clone();
+            replace_output_state(&mut state, config, None);
+            assert_eq!(state.playback_generation, None);
+        }
+
+        #[test]
+        fn rollback_and_active_updates_never_reuse_revision() {
+            let mut state = AudioOutputState::default();
+            replace_output_state(&mut state, AudioOutputConfig::default(), None);
+            assert_eq!(state.revision, 1);
+            replace_output_state(
+                &mut state,
+                AudioOutputConfig {
+                    route: AudioOutputRoute::Hqplayer,
+                    ..Default::default()
+                },
+                None,
+            );
+            assert_eq!(state.revision, 2);
+            replace_output_state(
+                &mut state,
+                AudioOutputConfig::default(),
+                Some(AudioOutputConfig::default()),
+            );
+            assert_eq!(state.revision, 3);
+            assert!(!state.pending);
+        }
+
+        #[test]
+        fn inactive_preference_changes_do_not_cancel_preload() {
+            let (player, inbox) = player_with_inbox();
+            let wanted = AudioOutputConfig {
+                hqplayer_port: 4322,
+                ..Default::default()
+            };
+            player.configure_output(wanted).unwrap();
+            assert!(!player.output_state().pending);
+            assert!(inbox.try_recv().is_err());
+        }
+        fn mock_hq(
+            replies: Vec<(&'static str, &'static str)>,
+        ) -> (u16, std::thread::JoinHandle<()>) {
+            use std::io::{BufRead, BufReader, Write};
+            let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = server.local_addr().unwrap().port();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = server.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut input = BufReader::new(socket.try_clone().unwrap());
+                for (expected, response) in replies {
+                    let mut line = String::new();
+                    input.read_line(&mut line).unwrap();
+                    assert!(line.contains(expected), "unexpected request: {line}");
+                    socket.write_all(response.as_bytes()).unwrap();
+                }
+            });
+            (port, worker)
+        }
+
+        #[test]
+        fn local_output_requires_confirmed_remote_stop() {
+            let (port, worker) = mock_hq(vec![
+                ("<Stop/>", "<Stop result=\"OK\"/>"),
+                (
+                    "<Status",
+                    "<Status state=\"2\" position=\"10\" length=\"200\"/>",
+                ),
+                (
+                    "<Status",
+                    "<Status state=\"0\" position=\"0\" length=\"0\"/>",
+                ),
+            ]);
+            assert!(hq_send_stop(&Mutex::new(None), "127.0.0.1", port).is_ok());
+            worker.join().unwrap();
+        }
+
+        #[test]
+        fn rejected_remote_pause_and_stop_are_not_success() {
+            let (port, worker) =
+                mock_hq(vec![("<Pause/>", "<Pause result=\"Error\">busy</Pause>")]);
+            assert!(
+                hq_send_transport(&Mutex::new(None), "127.0.0.1", port, |s| s.pause()).is_err()
+            );
+            worker.join().unwrap();
+            let (port, worker) = mock_hq(vec![("<Stop/>", "<Stop result=\"Error\">busy</Stop>")]);
+            assert!(hq_send_stop(&Mutex::new(None), "127.0.0.1", port).is_err());
+            worker.join().unwrap();
+        }
+
+        #[test]
+        fn gapless_promotion_requires_playing_reset_near_previous_end() {
+            let previous = crate::hqplayer::Status {
+                state: 2,
+                position: 199.0,
+                length: 200.0,
+            };
+            let next = crate::hqplayer::Status {
+                state: 2,
+                position: 0.4,
+                length: 200.0,
+            };
+            assert!(hq_crossed_boundary(previous, next));
+            assert!(!hq_crossed_boundary(
+                previous,
+                crate::hqplayer::Status { state: 1, ..next }
+            ));
+            assert!(!hq_crossed_boundary(
+                crate::hqplayer::Status {
+                    position: 20.0,
+                    ..previous
+                },
+                next
+            ));
+            assert!(!hq_crossed_boundary(
+                previous,
+                crate::hqplayer::Status {
+                    position: 199.5,
+                    ..next
+                }
+            ));
+        }
+
+        #[test]
+        fn uncommitted_route_snapshot_waits_for_settings_transaction() {
+            let (player, _inbox) = player_with_inbox();
+            let gate = player.begin_output_update();
+            let other = player.clone();
+            let (tx, rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let _gate = other.begin_output_update();
+                tx.send(other.output_state.lock().unwrap().configured.route)
+                    .unwrap();
+            });
+            player
+                .configure_output(AudioOutputConfig {
+                    route: AudioOutputRoute::Hqplayer,
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(rx.try_recv().is_err());
+            // A failed settings rename rolls back before releasing the gate.
+            player
+                .configure_output(AudioOutputConfig::default())
+                .unwrap();
+            drop(gate);
+            assert_eq!(rx.recv().unwrap(), AudioOutputRoute::Native);
+            worker.join().unwrap();
+        }
+    }
+
+    mod pcm_gain_tests {
+        use super::apply_pcm_gain;
+
+        fn panic_if_dithered() -> f64 {
+            panic!("exact gain must not dither");
+        }
+
+        #[test]
+        fn unity_gain_leaves_every_byte_alone() {
+            let mut s16 = vec![0x00, 0x80, 0xFF, 0x7F];
+            let before = s16.clone();
+            apply_pcm_gain(&mut s16, "S16LE", 1.0, &mut panic_if_dithered);
+            assert_eq!(s16, before);
+
+            // High byte is the sign pad. A distinctive pattern must survive.
+            let mut s24 = vec![0x11, 0x22, 0x33, 0xFF, 0xFF, 0xFF, 0x80, 0x00];
+            let before = s24.clone();
+            apply_pcm_gain(&mut s24, "S24_32LE", 1.0, &mut panic_if_dithered);
+            assert_eq!(s24, before);
+        }
+
+        #[test]
+        fn zero_gain_is_digital_silence() {
+            let mut s16 = vec![0x34, 0x12, 0xFF, 0x7F];
+            apply_pcm_gain(&mut s16, "S16LE", 0.0, &mut panic_if_dithered);
+            assert_eq!(s16, vec![0, 0, 0, 0]);
+
+            let mut s24 = vec![0xFF, 0xFF, 0x7F, 0x00];
+            apply_pcm_gain(&mut s24, "S24_32LE", 0.0, &mut panic_if_dithered);
+            assert_eq!(s24, vec![0, 0, 0, 0]);
+        }
+
+        #[test]
+        fn an_exact_integer_product_is_not_dithered() {
+            // 1000 * 0.5 = 500 exactly.
+            let mut data = 1000i16.to_le_bytes().to_vec();
+            apply_pcm_gain(&mut data, "S16LE", 0.5, &mut panic_if_dithered);
+            assert_eq!(i16::from_le_bytes([data[0], data[1]]), 500);
+
+            let mut neg = (-1000i16).to_le_bytes().to_vec();
+            apply_pcm_gain(&mut neg, "S16LE", 0.5, &mut panic_if_dithered);
+            assert_eq!(i16::from_le_bytes([neg[0], neg[1]]), -500);
+        }
+
+        #[test]
+        fn an_inexact_sample_stays_within_one_lsb_of_the_rounded_value() {
+            // 1 * 0.4 = 0.4, which rounds to 0. A +0.9 LSB nudge rounds to 1.
+            let mut down = 1i16.to_le_bytes().to_vec();
+            apply_pcm_gain(&mut down, "S16LE", 0.4, &mut || 0.0);
+            assert_eq!(i16::from_le_bytes([down[0], down[1]]), 0);
+
+            let mut up = 1i16.to_le_bytes().to_vec();
+            apply_pcm_gain(&mut up, "S16LE", 0.4, &mut || 0.9);
+            assert_eq!(i16::from_le_bytes([up[0], up[1]]), 1);
+        }
+
+        #[test]
+        fn full_scale_attenuation_does_not_overflow() {
+            let mut data = i16::MAX.to_le_bytes().to_vec();
+            apply_pcm_gain(&mut data, "S16LE", 1.5, &mut || 0.9);
+            assert_eq!(i16::from_le_bytes([data[0], data[1]]), i16::MAX);
+
+            let mut wide = i32::MAX.to_le_bytes().to_vec();
+            apply_pcm_gain(&mut wide, "S32LE", 1.5, &mut || 0.9);
+            assert_eq!(
+                i32::from_le_bytes(wide.as_slice().try_into().unwrap()),
+                i32::MAX
+            );
+
+            // 24-bit full scale must clamp inside the 24-bit range rather than wrap.
+            let mut s24 = 8_388_607i32.to_le_bytes().to_vec();
+            apply_pcm_gain(&mut s24, "S24_32LE", 1.5, &mut || 0.9);
+            assert_eq!(
+                i32::from_le_bytes(s24.as_slice().try_into().unwrap()),
+                8_388_607
+            );
+        }
+
+        #[test]
+        fn float_samples_are_multiplied_without_dither() {
+            let mut data = 0.5f32.to_le_bytes().to_vec();
+            apply_pcm_gain(&mut data, "F32LE", 0.5, &mut panic_if_dithered);
+            let v = f32::from_le_bytes(data.as_slice().try_into().unwrap());
+            assert!((v - 0.25).abs() < 1e-6);
         }
     }
 }

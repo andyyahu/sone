@@ -18,7 +18,8 @@ use tauri::Emitter;
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SignalPath {
-    /// "Normal" (autoaudiosink → system mixer) or "DirectAlsa" (exclusive ALSA).
+    /// "Normal" (autoaudiosink → system mixer), "DirectAlsa" (exclusive ALSA),
+    /// or "HQPlayer" (PCM handed to HQPlayer Desktop).
     pub backend: Option<String>,
 
     /// PCM format the GStreamer pipeline decodes to (DirectAlsa only — the
@@ -36,6 +37,10 @@ pub struct SignalPath {
     /// Mode flags reflected from settings.
     pub exclusive_mode: bool,
     pub bit_perfect: bool,
+    /// True only while a CamillaDSP pipeline is filtering the exclusive
+    /// writer. Cleared when the track ends, when the config changes, and
+    /// while the filter is bypassed.
+    pub camilla_fir: bool,
     pub volume_normalization: bool,
 
     /// User-set volume multiplier (1.0 = unity, no software attenuation).
@@ -108,6 +113,7 @@ impl SignalPathTracker {
             s.format_fallback_from = None;
             s.format_fallback_to = None;
             s.norm_gain_factor = 1.0; // next track may have no RG; don't carry old gain
+            s.camilla_fir = false;
             s.clone()
         };
         self.emit(snap);
@@ -117,7 +123,15 @@ impl SignalPathTracker {
         let snap = {
             let mut s = self.state.lock().unwrap();
             s.backend = Some(backend.to_string());
-            s.output_device = device;
+            if backend == "HQPlayer" {
+                // Desktop owns the device. Drop the previous exclusive card
+                // and the OS mixer so the diagram does not keep them.
+                s.output_device = None;
+                s.dac = None;
+                s.os_mixer = None;
+            } else {
+                s.output_device = device;
+            }
             s.clone()
         };
         self.emit(snap);
@@ -128,6 +142,20 @@ impl SignalPathTracker {
             let mut s = self.state.lock().unwrap();
             s.exclusive_mode = exclusive;
             s.bit_perfect = bit_perfect;
+            s.clone()
+        };
+        self.emit(snap);
+    }
+
+    /// Live FIR flag. The settings switch can be on while this stays false:
+    /// the writer publishes true only after a pipeline has loaded.
+    pub fn set_camilla_fir(&self, enabled: bool) {
+        let snap = {
+            let mut s = self.state.lock().unwrap();
+            if s.camilla_fir == enabled {
+                return;
+            }
+            s.camilla_fir = enabled;
             s.clone()
         };
         self.emit(snap);

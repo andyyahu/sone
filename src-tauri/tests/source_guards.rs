@@ -59,7 +59,7 @@
 //!   `&pipe`, so a hook threaded through a differently-named variable stops
 //!   being counted — but that moves the hooks count alone, so it fails red
 //!   against an unchanged `pipelines`. The spelling that moves *both* counts is
-//!   `gst::Pipeline::builder()`, and the `pipelines == 2` backstop is what
+//!   `gst::Pipeline::builder()`, and the `pipelines == 3` backstop is what
 //!   catches it.
 //! - `the_unproxied_http_source_selection_still_prefers_soup_over_curl` reads
 //!   the host's plugin registry, not our source. It cannot observe SONE's audio
@@ -536,6 +536,14 @@ fn the_proxy_save_claims_its_generation_beside_the_write_not_inside_the_build() 
         claims, 1,
         "src/commands/utility.rs has {claims} `.claim()` calls; this guard          reasons about exactly one, so a second would be unchecked"
     );
+    let start = body
+        .find("async fn persist_then_reconfigure(")
+        .expect("proxy persistence and reconfiguration helper");
+    let remaining = &body[start..];
+    let end = remaining
+        .find("\n#[tauri::command")
+        .unwrap_or(remaining.len());
+    let body = &remaining[..end];
     let claim = body.find(".claim()").unwrap_or_else(|| {
         panic!(
             "no `.claim()` in src/commands/utility.rs: the proxy save is back              to letting `apply` claim for itself, which puts the cell's write              order back in the hands of the blocking pool"
@@ -704,8 +712,8 @@ fn the_proxy_hook_is_attached_once_per_pipeline() {
          leaving the gapless second branch unproxied"
     );
     assert_eq!(
-        pipelines, 2,
-        "audio.rs is expected to build exactly two pipelines"
+        pipelines, 3,
+        "audio.rs is expected to build exactly three pipelines"
     );
 }
 
