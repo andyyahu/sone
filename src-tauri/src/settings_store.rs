@@ -55,6 +55,27 @@ impl SettingsStore {
         self.update_with_apply(edit, |_| Ok(()))
     }
 
+    /// Lock the store before the runtime gate, and retain both through rollback.
+    /// Other transactions may wait for the audio actor while holding the store;
+    /// acquiring the playback gate first would prevent that actor from replying.
+    pub fn update_with_apply_guarded<R, G>(
+        &self,
+        acquire: impl FnOnce() -> G,
+        edit: impl FnOnce(&mut Settings) -> Result<R, SoneError>,
+        apply: impl Fn(&Settings) -> Result<(), SoneError>,
+    ) -> Result<R, SoneError> {
+        let mut guard = None;
+        let result = self.update_with_apply(
+            |settings| {
+                guard = Some(acquire());
+                edit(settings)
+            },
+            apply,
+        );
+        drop(guard);
+        result
+    }
+
     /// Prepare durable bytes before touching runtime state. Apply and rollback
     /// run under the transaction lock; callbacks must not re-enter this store.
     pub fn update_with_apply<R>(
@@ -155,6 +176,105 @@ mod tests {
             Arc::new(Crypto::for_tests()),
         ));
         (dir, store)
+    }
+
+    #[test]
+    fn waiting_output_transaction_does_not_block_the_current_settings_actor() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (_dir, store) = fixture();
+        let gate = Arc::new(Mutex::new(()));
+        let (in_apply, apply_started) = mpsc::channel();
+        let (reply, actor_reply) = mpsc::channel();
+        let first_store = store.clone();
+        let first = std::thread::spawn(move || {
+            first_store.update_with_apply(
+                |_| Ok(()),
+                |_| {
+                    in_apply.send(()).unwrap();
+                    actor_reply.recv_timeout(Duration::from_secs(2)).unwrap();
+                    Ok(())
+                },
+            )
+        });
+        apply_started.recv_timeout(Duration::from_secs(2)).unwrap();
+        let next_store = store.clone();
+        let next_gate = gate.clone();
+        let (attempting, attempted) = mpsc::channel();
+        let (acquired, observed) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            attempting.send(()).unwrap();
+            next_store.update_with_apply_guarded(
+                || {
+                    let guard = next_gate.lock().unwrap();
+                    acquired.send(()).unwrap();
+                    guard
+                },
+                |settings| {
+                    settings.bit_perfect = true;
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+        });
+        attempted.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(observed.recv_timeout(Duration::from_millis(50)).is_err());
+        // A PlayUrl already ahead of the first setter's actor command can
+        // still take its snapshot, allowing that command to complete.
+        drop(
+            gate.try_lock()
+                .expect("pending setter took the gate too early"),
+        );
+        reply.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(store.snapshot().unwrap().bit_perfect);
+    }
+
+    #[test]
+    fn guarded_reader_only_sees_rollback_after_failed_rename() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (dir, store) = fixture();
+        fs::create_dir(dir.path().join("settings.json")).unwrap();
+        let gate = Arc::new(Mutex::new(()));
+        let runtime = Arc::new(AtomicBool::new(false));
+        let (applied, apply_seen) = mpsc::channel();
+        let (proceed, continue_commit) = mpsc::channel();
+        let writer_gate = gate.clone();
+        let writer_runtime = runtime.clone();
+        let writer = std::thread::spawn(move || {
+            store.update_with_apply_guarded(
+                || writer_gate.lock().unwrap(),
+                |settings| {
+                    settings.bit_perfect = true;
+                    Ok(())
+                },
+                |settings| {
+                    writer_runtime.store(settings.bit_perfect, Ordering::SeqCst);
+                    if settings.bit_perfect {
+                        applied.send(()).unwrap();
+                        continue_commit
+                            .recv_timeout(Duration::from_secs(2))
+                            .unwrap();
+                    }
+                    Ok(())
+                },
+            )
+        });
+        apply_seen.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (read, read_result) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _guard = gate.lock().unwrap();
+            read.send(runtime.load(Ordering::SeqCst)).unwrap();
+        });
+        assert!(read_result.recv_timeout(Duration::from_millis(50)).is_err());
+        proceed.send(()).unwrap();
+        assert!(writer.join().unwrap().is_err());
+        assert!(!read_result.recv_timeout(Duration::from_secs(2)).unwrap());
+        reader.join().unwrap();
     }
 
     #[test]
@@ -377,6 +497,70 @@ mod tests {
             })
             .is_err());
         assert_eq!(fs::read(path).unwrap(), b"SONEbroken");
+    }
+
+    #[test]
+    fn output_rollback_restores_native_choice_without_touching_active_track() {
+        use crate::audio_output::{AudioOutputConfig, AudioOutputRoute};
+        let (dir, store) = fixture();
+        store
+            .update(|s| {
+                s.bit_perfect = true;
+                s.exclusive_mode = true;
+                s.volume = 0.3;
+                Ok(())
+            })
+            .unwrap();
+        let original = AudioOutputConfig::from_settings(&store.snapshot().unwrap());
+        let active = original.effective();
+        let configured = std::cell::RefCell::new(original.clone());
+        let mut next = original.clone();
+        next.route = AudioOutputRoute::Hqplayer;
+        let before = fs::read(dir.path().join("settings.json")).unwrap();
+        let result = store.update_with_apply(
+            |settings| {
+                next.write_settings(settings);
+                Ok(())
+            },
+            |settings| {
+                let config = AudioOutputConfig::from_settings(settings);
+                *configured.borrow_mut() = config.clone();
+                if config.route == AudioOutputRoute::Hqplayer {
+                    Err(SoneError::Audio("injected configuration failure".into()))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(*configured.borrow(), original);
+        assert_eq!(active.route, AudioOutputRoute::Native);
+        assert!(active.bit_perfect);
+        assert_eq!(store.snapshot().unwrap().volume, 0.3);
+        assert_eq!(fs::read(dir.path().join("settings.json")).unwrap(), before);
+    }
+
+    #[test]
+    fn legacy_audio_fields_survive_unrelated_settings_updates_and_reload() {
+        use crate::audio_output::{AudioOutputConfig, AudioOutputRoute};
+        let (dir, _) = fixture();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, br#"{"auth_tokens":null,"last_track_id":null,"hqplayer":true,"hqplayer_host":"127.0.0.1","hqplayer_port":4322,"bit_perfect":true,"camilla_fir":true,"camilla_config":"room.yml"}"#).unwrap();
+        let store = SettingsStore::open(path.clone(), Arc::new(Crypto::for_tests()));
+        let config = AudioOutputConfig::from_settings(&store.snapshot().unwrap());
+        assert_eq!(config.route, AudioOutputRoute::Hqplayer);
+        assert!(config.bit_perfect);
+        store
+            .update(|s| {
+                s.volume = 0.2;
+                Ok(())
+            })
+            .unwrap();
+        let restored = SettingsStore::open(path, Arc::new(Crypto::for_tests()));
+        assert_eq!(
+            AudioOutputConfig::from_settings(&restored.snapshot().unwrap()),
+            config
+        );
     }
 
     #[test]

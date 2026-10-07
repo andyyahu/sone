@@ -1,4 +1,5 @@
 mod audio;
+mod audio_output;
 pub mod cache;
 mod client_timing;
 mod commands;
@@ -160,6 +161,20 @@ pub struct Settings {
     pub exclusive_device: Option<String>,
     #[serde(default)]
     pub bit_perfect: bool,
+    /// Missing on older builds; interpreted using the legacy flags on read.
+    #[serde(default)]
+    pub output_route: Option<audio_output::AudioOutputRoute>,
+    #[serde(default)]
+    pub camilla_config: Option<String>,
+    #[serde(default = "audio_output::default_hqplayer_host")]
+    pub hqplayer_host: String,
+    #[serde(default = "audio_output::default_hqplayer_port")]
+    pub hqplayer_port: u16,
+    /// Legacy experimental fields, kept in sync when output settings change.
+    #[serde(default)]
+    pub camilla_fir: bool,
+    #[serde(default)]
+    pub hqplayer: bool,
     #[serde(default = "defaults::yes")]
     pub gapless: bool,
     #[serde(default = "defaults::max_quality")]
@@ -212,6 +227,12 @@ impl Default for Settings {
             exclusive_mode: false,
             exclusive_device: None,
             bit_perfect: false,
+            output_route: None,
+            camilla_config: None,
+            hqplayer_host: audio_output::default_hqplayer_host(),
+            hqplayer_port: audio_output::default_hqplayer_port(),
+            camilla_fir: false,
+            hqplayer: false,
             gapless: true,
             max_quality: "HI_RES_LOSSLESS".to_string(),
             scrobble: Default::default(),
