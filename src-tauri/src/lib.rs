@@ -1,6 +1,8 @@
 mod audio;
 mod audio_output;
 pub mod cache;
+#[cfg(target_os = "linux")]
+mod camilla_fir;
 mod client_timing;
 mod commands;
 mod crypto;

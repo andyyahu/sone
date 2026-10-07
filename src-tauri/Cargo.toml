@@ -67,6 +67,8 @@ gtk = "0.18"
 gdk = "0.18"
 mpris-server = "0.9"
 alsa = "0.10"
+# Embedded processing only: SONE owns ALSA and the playback lifecycle.
+camillalib = { package = "CamillaDSP", git = "https://github.com/HEnquist/camilladsp", tag = "v4.1.3", default-features = false }
 libc = "0.2"
 ksni = "0.3"
 x11rb = { version = "0.13.2", features = ["screensaver", "dpms"] }
