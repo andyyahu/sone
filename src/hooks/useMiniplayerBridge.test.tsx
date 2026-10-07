@@ -198,3 +198,18 @@ describe("useMiniplayerBridge", () => {
     expect(mocks.emitTo).toHaveBeenCalledTimes(sent);
   });
 });
+
+it("updates an HQPlayer volume lock without treating position heartbeats as display changes", () => {
+  const rendered = vi.fn();
+  const { result } = renderHook(() => {
+    rendered();
+    return useMiniplayerBridge();
+  });
+  update({ volumeLock: null });
+  const before = rendered.mock.calls.length;
+  update({ volumeLock: "hqplayer" });
+  expect(result.current.state.volumeLock).toBe("hqplayer");
+  expect(rendered).toHaveBeenCalledTimes(before + 1);
+  update({ volumeLock: "hqplayer", position: 11 });
+  expect(rendered).toHaveBeenCalledTimes(before + 1);
+});

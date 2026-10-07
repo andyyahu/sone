@@ -26,6 +26,10 @@ import { userNameAtom, currentUserAvatarAtom } from "../atoms/auth";
 import { currentViewAtom } from "../atoms/navigation";
 import { exclusiveDeviceAtom, exclusiveModeAtom } from "../atoms/playback";
 import { invoke } from "@tauri-apps/api/core";
+import {
+  acceptAudioOutputAtom,
+  configuredAudioOutputAtom,
+} from "../atoms/audioOutput";
 
 function renderMenu(avatar: string | null, exclusiveDevice?: string) {
   const store = createStore();
@@ -33,6 +37,14 @@ function renderMenu(avatar: string | null, exclusiveDevice?: string) {
   store.set(currentUserAvatarAtom, avatar);
   store.set(exclusiveModeAtom, exclusiveDevice !== undefined);
   store.set(exclusiveDeviceAtom, exclusiveDevice ?? "");
+  const configured = store.get(configuredAudioOutputAtom);
+  store.set(acceptAudioOutputAtom, {
+    configured,
+    active: configured,
+    pending: false,
+    playbackGeneration: 1,
+    revision: 0,
+  });
   const wrapper = ({ children }: PropsWithChildren) => (
     <Provider store={store}>
       <ToastProvider>{children}</ToastProvider>
@@ -85,7 +97,19 @@ describe("audio device discovery", () => {
   afterEach(cleanup);
 
   it("preserves the selected output when discovery returns other devices", async () => {
-    vi.mocked(invoke).mockResolvedValue([{ id: "hw:2", name: "Other DAC" }]);
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "list_audio_devices")
+        return [{ id: "hw:2", name: "Other DAC" }];
+      if (command === "set_audio_output")
+        return {
+          configured: (args as { config: unknown }).config,
+          active: null,
+          playbackGeneration: 1,
+          revision: 0,
+          pending: false,
+        };
+      return undefined;
+    });
     const { store } = renderMenu(null, "hw:1");
     await screen.findByRole("button", { name: "Refresh devices" });
     expect(invoke).toHaveBeenCalledWith("list_audio_devices", {
@@ -99,9 +123,10 @@ describe("audio device discovery", () => {
     ).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "Select device" }));
     fireEvent.click(screen.getByRole("button", { name: "Other DAC" }));
-    expect(store.get(exclusiveDeviceAtom)).toBe("hw:2");
-    expect(invoke).toHaveBeenCalledWith("set_exclusive_device", {
-      device: "hw:2",
+    expect(store.get(exclusiveDeviceAtom)).toBe("hw:1");
+    await waitFor(() => expect(store.get(exclusiveDeviceAtom)).toBe("hw:2"));
+    expect(invoke).toHaveBeenCalledWith("set_audio_output", {
+      config: expect.objectContaining({ device: "hw:2" }),
     });
   });
 

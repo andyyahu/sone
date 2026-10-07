@@ -3,10 +3,8 @@ import { useAtom, useAtomValue, useStore } from "jotai";
 import { invoke } from "@tauri-apps/api/core";
 import {
   autoplayAtom,
-  bitPerfectAtom,
   volumeNormalizationAtom,
   gaplessAtom,
-  exclusiveModeAtom,
   allowExplicitAtom,
   currentTrackAtom,
   isPlayingAtom,
@@ -17,6 +15,11 @@ import {
   playbackSourceAtom,
   contextSourceAtom,
 } from "../../atoms/playback";
+import {
+  audioControlLockAtom,
+  effectiveAudioOutputAtom,
+} from "../../atoms/audioOutput";
+import { usePlaybackActions } from "../../hooks/usePlaybackActions";
 import { videoCoversAtom } from "../../atoms/ui";
 import Toggle from "../Toggle";
 import SettingRow from "./SettingRow";
@@ -25,13 +28,12 @@ import QualityPicker from "./QualityPicker";
 export default function PlaybackTab() {
   const [autoplay, setAutoplay] = useAtom(autoplayAtom);
   const [videoCovers, setVideoCovers] = useAtom(videoCoversAtom);
-  const [volumeNormalization, setVolumeNormalization] = useAtom(
-    volumeNormalizationAtom,
-  );
+  const volumeNormalization = useAtomValue(volumeNormalizationAtom);
+  const { setVolumeNormalization } = usePlaybackActions();
   const [allowExplicit, setAllowExplicit] = useAtom(allowExplicitAtom);
   const [gapless, setGapless] = useAtom(gaplessAtom);
-  const bitPerfect = useAtomValue(bitPerfectAtom);
-  const exclusiveMode = useAtomValue(exclusiveModeAtom);
+  const controlLock = useAtomValue(audioControlLockAtom);
+  const output = useAtomValue(effectiveAudioOutputAtom);
   const [gaplessSupported, setGaplessSupported] = useState(false);
   const store = useStore();
 
@@ -41,7 +43,12 @@ export default function PlaybackTab() {
       .catch(() => {});
   }, []);
 
-  const gaplessDisabled = !gaplessSupported || exclusiveMode || bitPerfect;
+  const gaplessDisabled =
+    output.route !== "hqplayer" &&
+    (output.route === "camilla" ||
+      !gaplessSupported ||
+      output.exclusiveMode ||
+      output.bitPerfect);
 
   return (
     <div>
@@ -75,7 +82,7 @@ export default function PlaybackTab() {
             <span className="flex items-center gap-2">
               Gapless playback
               <span className="text-[10px] font-bold text-th-accent bg-th-accent/12 border border-th-accent/35 rounded-full px-2 py-px">
-                Normal mode
+                Native / HQPlayer
               </span>
             </span>
           }
@@ -84,9 +91,11 @@ export default function PlaybackTab() {
           tooltip={
             !gaplessDisabled
               ? undefined
-              : !gaplessSupported
-                ? "Requires GStreamer 1.24 or newer"
-                : "Available in normal mode only"
+              : output.route === "camilla"
+                ? "CamillaDSP uses non-gapless exclusive output"
+                : !gaplessSupported
+                  ? "Requires GStreamer 1.24 or newer"
+                  : "Available in native shared output or HQPlayer"
           }
         >
           <button
@@ -98,35 +107,37 @@ export default function PlaybackTab() {
               await invoke("set_gapless", { enabled: next }).catch(() => {});
             }}
           >
-            <Toggle
-              on={gapless && gaplessSupported && !exclusiveMode && !bitPerfect}
-            />
+            <Toggle on={gapless && !gaplessDisabled} />
           </button>
         </SettingRow>
 
         <SettingRow
           title="Normalize volume"
           subtitle={
-            bitPerfect
-              ? "Disabled while bit-perfect output is on"
-              : "Even out volume differences between tracks"
+            controlLock === "hqplayer"
+              ? "Manage volume and processing in HQPlayer"
+              : controlLock
+                ? "Disabled while bit-perfect output is on"
+                : "Even out volume differences between tracks"
           }
-          disabled={bitPerfect}
-          tooltip={bitPerfect ? "Disabled in bit-perfect mode" : undefined}
+          disabled={controlLock !== null}
+          tooltip={
+            controlLock === "hqplayer"
+              ? "Controlled by HQPlayer"
+              : controlLock
+                ? "Disabled in bit-perfect mode"
+                : undefined
+          }
         >
           <button
-            disabled={bitPerfect}
+            disabled={controlLock !== null}
             className="disabled:cursor-not-allowed"
             onClick={() => {
-              if (bitPerfect) return;
-              const next = !volumeNormalization;
-              setVolumeNormalization(next);
-              invoke("set_volume_normalization", { enabled: next }).catch(
-                () => {},
-              );
+              if (controlLock) return;
+              void setVolumeNormalization(!volumeNormalization);
             }}
           >
-            <Toggle on={volumeNormalization} />
+            <Toggle on={!controlLock && volumeNormalization} />
           </button>
         </SettingRow>
 

@@ -27,9 +27,7 @@ import {
   shuffleAtom,
   repeatAtom,
   allowExplicitAtom,
-  bitPerfectAtom,
   volumeNormalizationAtom,
-  bitPerfectPreviousStateAtom,
   consecutiveFailCountAtom,
   userPausedAtom,
 } from "../atoms/playback";
@@ -40,6 +38,12 @@ import {
   videoExpandedAtom,
 } from "../atoms/video";
 import { getMixItems, checkNetworkError } from "../api/tidal";
+import {
+  audioControlLockAtom,
+  audioBufferingAtom,
+  configuredAudioOutputAtom,
+} from "../atoms/audioOutput";
+import { useAudioOutputActions } from "./useAudioOutput";
 import { useToast } from "../contexts/ToastContext";
 import { stampQid, stampQids, ensureQid } from "../lib/qid";
 import {
@@ -202,6 +206,7 @@ async function invokePlayWithRetry(
 
 export function usePlaybackActions() {
   const store = useStore();
+  const { setAudioOutput } = useAudioOutputActions();
   const { showToast } = useToast();
 
   const playGenerationRef = useRef(0);
@@ -421,10 +426,12 @@ export function usePlaybackActions() {
       videoElementRef.current?.pause();
       return;
     }
+    const track = store.get(currentTrackAtom);
     store.set(userPausedAtom, true);
     try {
       await invoke("pause_track");
-      store.set(isPlayingAtom, false);
+      if (store.get(currentTrackAtom) === track && store.get(userPausedAtom))
+        store.set(isPlayingAtom, false);
     } catch (error) {
       console.error("Failed to pause track:", error);
     }
@@ -455,11 +462,13 @@ export function usePlaybackActions() {
       }
       return;
     }
+    const track = store.get(currentTrackAtom);
+    if (!track) return;
+    const superseded = () =>
+      store.get(currentTrackAtom) !== track || store.get(userPausedAtom);
     try {
-      const track = store.get(currentTrackAtom);
-      if (!track) return;
-
       const isFinished = await invoke<boolean>("is_track_finished");
+      if (superseded()) return;
       if (isFinished) {
         // Replaying a finished track from the top: gate interpolation so the bar
         // doesn't show the stale end position during the reload.
@@ -472,6 +481,7 @@ export function usePlaybackActions() {
             showToast("Preparing exclusive audio…", "info");
           },
         );
+        if (superseded()) return;
         store.set(streamInfoAtom, info);
         // Replay starts at 0; clears the load gate and re-emits to the miniplayer.
         notifySeek(0);
@@ -487,8 +497,16 @@ export function usePlaybackActions() {
       } else {
         await invoke("resume_track");
       }
-      store.set(isPlayingAtom, true);
+      if (superseded()) return;
+      const buffering = store.get(audioBufferingAtom);
+      if (buffering)
+        store.set(audioBufferingAtom, { ...buffering, wasPlaying: true });
+      else {
+        markPlaybackLoading(false);
+        store.set(isPlayingAtom, true);
+      }
     } catch (error) {
+      if (superseded()) return;
       console.error("Failed to resume track:", error);
       store.set(isPlayingAtom, false);
       markPlaybackLoading(false);
@@ -521,7 +539,9 @@ export function usePlaybackActions() {
       ? !el.paused
       : store.get(currentVideoAtom)
         ? store.get(videoPlayingAtom)
-        : store.get(isPlayingAtom);
+        : store.get(isPlayingAtom) ||
+          (!!store.get(audioBufferingAtom)?.wasPlaying &&
+            !store.get(userPausedAtom));
     if (playing) await pauseTrack();
     else await resumeTrack();
   }, [store, pauseTrack, resumeTrack]);
@@ -587,15 +607,15 @@ export function usePlaybackActions() {
 
   const setVolume = useCallback(
     async (level: number) => {
-      const bitPerfect = store.get(bitPerfectAtom);
+      const locked = store.get(audioControlLockAtom) !== null;
       const isVideo = !!store.get(currentVideoAtom);
       // Bit-perfect audio stays locked at unity; video audio is lossy, so the
       // slider must still work for it.
-      if (bitPerfect && !isVideo) return;
+      if (locked && !isVideo) return;
       store.set(volumeAtom, level); // the <video> element reads this atom
       // Never push a non-unity level to the GStreamer pipeline while bit-perfect
       // is on — that would attenuate (and un-bit-perfect) audio playback.
-      if (bitPerfect) return;
+      if (locked) return;
       try {
         await invoke("set_volume", { level });
       } catch (error) {
@@ -607,9 +627,10 @@ export function usePlaybackActions() {
 
   const setVolumeNormalization = useCallback(
     async (enabled: boolean) => {
-      store.set(volumeNormalizationAtom, enabled);
+      if (store.get(audioControlLockAtom)) return;
       try {
         await invoke("set_volume_normalization", { enabled });
+        store.set(volumeNormalizationAtom, enabled);
       } catch (error) {
         console.error("Failed to set volume normalization:", error);
       }
@@ -617,76 +638,21 @@ export function usePlaybackActions() {
     [store],
   );
 
-  const rampVolume = useCallback(
-    async (from: number, to: number, durationMs = 300, steps = 12) => {
-      if (Math.abs(from - to) < 1e-4) return;
-      for (let i = 1; i <= steps; i++) {
-        const t = i / steps;
-        const level = from + (to - from) * t;
-        store.set(volumeAtom, level);
-        try {
-          await invoke("set_volume", { level });
-        } catch (error) {
-          console.error("Failed to set volume:", error);
-        }
-        if (i < steps)
-          await new Promise((r) => setTimeout(r, durationMs / steps));
-      }
-    },
-    [store],
-  );
-
   const setBitPerfect = useCallback(
     async (enabled: boolean) => {
-      const currentlyEnabled = store.get(bitPerfectAtom);
-      if (enabled === currentlyEnabled) return;
-
-      if (enabled) {
-        // Save current state so we can restore on disable.
-        const prevVolume = store.get(volumeAtom);
-        store.set(bitPerfectPreviousStateAtom, {
-          volume: prevVolume,
-          volumeNormalization: store.get(volumeNormalizationAtom),
+      const config = store.get(configuredAudioOutputAtom);
+      if (config.route !== "native" || enabled === config.bitPerfect) return;
+      try {
+        await setAudioOutput({
+          bitPerfect: enabled,
+          ...(enabled ? { exclusiveMode: true } : {}),
         });
-        // Ramp BEFORE flipping bit-perfect — the setVolume short-circuit
-        // would block updates otherwise.
-        await rampVolume(prevVolume, 1.0);
-        store.set(volumeNormalizationAtom, false);
-        try {
-          await invoke("set_volume_normalization", { enabled: false });
-        } catch (error) {
-          console.error("Failed to set volume normalization:", error);
-        }
-        store.set(bitPerfectAtom, true);
-        try {
-          await invoke("set_bit_perfect", { enabled: true });
-        } catch (error) {
-          console.error("Failed to set bit perfect:", error);
-        }
-      } else {
-        // Flip the atom FIRST so the ramp's setVolume calls go through.
-        store.set(bitPerfectAtom, false);
-        try {
-          await invoke("set_bit_perfect", { enabled: false });
-        } catch (error) {
-          console.error("Failed to set bit perfect:", error);
-        }
-        const prev = store.get(bitPerfectPreviousStateAtom);
-        if (prev) {
-          await rampVolume(store.get(volumeAtom), prev.volume);
-          store.set(volumeNormalizationAtom, prev.volumeNormalization);
-          try {
-            await invoke("set_volume_normalization", {
-              enabled: prev.volumeNormalization,
-            });
-          } catch (error) {
-            console.error("Failed to set volume normalization:", error);
-          }
-          store.set(bitPerfectPreviousStateAtom, null);
-        }
+      } catch (error) {
+        console.error("Failed to set bit perfect:", error);
+        showToast("Unable to save bit-perfect settings", "error");
       }
     },
-    [store, rampVolume],
+    [store, setAudioOutput, showToast],
   );
 
   const seekTo = useCallback(async (positionSecs: number) => {

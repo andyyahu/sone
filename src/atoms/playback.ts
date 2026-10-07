@@ -28,6 +28,7 @@ export interface OsMixerInfo {
 }
 
 export interface SignalPath {
+  camillaFir?: boolean;
   backend: string | null;
   decodedFormat: string | null;
   decodedRate: number | null;
@@ -85,19 +86,6 @@ export const gaplessAtom = atom(true);
 export const maxQualityAtom = atom("HI_RES_LOSSLESS");
 export const exclusiveDeviceAtom = atom<string | null>(null);
 export const volumeNormalizationAtom = atom(false);
-
-interface BitPerfectPreviousState {
-  volume: number;
-  volumeNormalization: boolean;
-}
-
-export const bitPerfectPreviousStateAtom =
-  atomWithStorage<BitPerfectPreviousState | null>(
-    "sone.bitPerfect.previousState.v1",
-    null,
-    undefined,
-    { getOnInit: true },
-  );
 
 /** Consecutive auto-advance failures for unplayable tracks.
  *  Only mutated by playNext's skip-loop; reset on successful play. */

@@ -100,6 +100,7 @@ export function amplitudeToSliderPercent(amplitude: number): number {
  *   "HDA-Intel - HDA Intel PCH" → "HDA Intel PCH"
  */
 export function dacDisplayName(sp: SignalPath | null): string | null {
+  if (sp?.backend === "HQPlayer") return null;
   const cardName = sp?.dac?.cardName;
   if (cardName) {
     let s = cardName;
@@ -199,6 +200,8 @@ export function deriveAlterations(sp: SignalPath | null) {
     typeof sp?.volumeNormalization === "boolean" &&
     (!sp.volumeNormalization || normKnown);
   const isDirectAlsa = sp?.backend === "DirectAlsa";
+  const isHqPlayer = sp?.backend === "HQPlayer";
+  const hasDsp = !!sp?.camillaFir;
   const conversion = classifyConversion(
     sp?.decodedFormat,
     sp?.outputFormat,
@@ -248,6 +251,7 @@ export function deriveAlterations(sp: SignalPath | null) {
     sp.dac.rate === sp.outputRate &&
     sp.dac.channels === sp.outputChannels;
   const knownModification =
+    hasDsp ||
     userVolAltered ||
     normAltered ||
     conversion === "modified" ||
@@ -267,17 +271,21 @@ export function deriveAlterations(sp: SignalPath | null) {
     conversion === "preserved" &&
     !knownModification &&
     !!dacMatchesPipeline;
-  const verdict: Preservation = isPristine
-    ? "preserved"
-    : knownModification
-      ? "modified"
-      : "unknown";
+  const verdict: Preservation = isHqPlayer
+    ? "unknown"
+    : isPristine
+      ? "preserved"
+      : knownModification
+        ? "modified"
+        : "unknown";
   return {
     userVol,
     normFactor,
     userVolAltered,
     normAltered,
     isDirectAlsa,
+    isHqPlayer,
+    hasDsp,
     isPristine,
     lossyFormatChange,
     losslessPromotion,

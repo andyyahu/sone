@@ -181,3 +181,35 @@ describe("signal path explanations", () => {
     expect(screen.getByText("PROMOTED")).toBeTruthy();
   });
 });
+
+describe("external and DSP signal paths", () => {
+  it("always identifies CamillaDSP samples as modified", () => {
+    expect(deriveAlterations(path({ camillaFir: true }))).toMatchObject({
+      verdict: "modified",
+      isPristine: false,
+    });
+    render(
+      <FlowDiagramBody
+        sp={path({ camillaFir: true })}
+        streamInfo={null}
+        currentTrack={null}
+      />,
+    );
+    expect(screen.getByText("CAMILLA DSP")).toBeTruthy();
+    expect(screen.queryByText("BIT-PERFECT MODE")).toBeNull();
+    expect(screen.queryByText(/PRISTINE · BIT-TRANSPARENT/)).toBeNull();
+  });
+  it("does not infer HQPlayer downstream preservation from local PCM or stale DAC measurements", () => {
+    const sp = path({ backend: "HQPlayer" });
+    expect(deriveAlterations(sp)).toMatchObject({
+      verdict: "unknown",
+      isPristine: false,
+    });
+    render(<FlowDiagramBody sp={sp} streamInfo={null} currentTrack={null} />);
+    expect(screen.getByText("HQPlayer Desktop")).toBeTruthy();
+    expect(screen.getByText(/DAC measurements are unavailable/)).toBeTruthy();
+    expect(screen.queryByText("Test DAC")).toBeNull();
+    expect(screen.queryByText("BIT-PERFECT MODE")).toBeNull();
+    expect(screen.queryByText("PRISTINE")).toBeNull();
+  });
+});

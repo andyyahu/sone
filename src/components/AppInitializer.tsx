@@ -1,3 +1,12 @@
+import { useAudioBuffering } from "../hooks/useAudioBuffering";
+import {
+  useAudioOutputSync,
+  useAudioOutputActions,
+} from "../hooks/useAudioOutput";
+import {
+  audioOutputStateAtom,
+  configuredAudioOutputAtom,
+} from "../atoms/audioOutput";
 import { useAudioErrors } from "../hooks/useAudioErrors";
 /**
  * AppInitializer — invisible component rendered once at the app root.
@@ -45,11 +54,8 @@ import {
   queueAtom,
   volumeAtom,
   preMuteVolumeAtom,
-  exclusiveModeAtom,
-  bitPerfectAtom,
   gaplessAtom,
   maxQualityAtom,
-  exclusiveDeviceAtom,
   volumeNormalizationAtom,
   originalQueueAtom,
   manualQueueAtom,
@@ -170,6 +176,9 @@ export function AppInitializer() {
 
   // ---- Store for one-time reads (volume, queue, history, etc.) — no subscription ----
   const store = useStore();
+  useAudioOutputSync();
+  useAudioBuffering();
+  const { setAudioOutput } = useAudioOutputActions();
 
   // ---- Navigation ----
   const setCurrentView = useSetAtom(currentViewAtom);
@@ -260,21 +269,11 @@ export function AppInitializer() {
         // User name is fetched in the [isAuthenticated]-keyed preload effect
         // below so it re-populates on in-session re-login, not just startup.
 
-        // Exclusive mode settings (non-blocking, backend-authoritative)
-        invoke<boolean>("get_exclusive_mode")
-          .then((v) => store.set(exclusiveModeAtom, v))
-          .catch(() => {});
-        invoke<boolean>("get_bit_perfect")
-          .then((v) => store.set(bitPerfectAtom, v))
-          .catch(() => {});
         invoke<boolean>("get_gapless")
           .then((v) => store.set(gaplessAtom, v))
           .catch(() => {});
         invoke<string>("get_max_quality")
           .then((v) => store.set(maxQualityAtom, v))
-          .catch(() => {});
-        invoke<string | null>("get_exclusive_device")
-          .then((v) => store.set(exclusiveDeviceAtom, v))
           .catch(() => {});
         invoke<boolean>("get_volume_normalization")
           .then((v) => store.set(volumeNormalizationAtom, v))
@@ -548,23 +547,9 @@ export function AppInitializer() {
   useEffect(() => {
     if (volumeSyncedRef.current) return;
     volumeSyncedRef.current = true;
-    // Never push a persisted volume into a bit-perfect pipeline — it must stay at
-    // unity. bitPerfectAtom hydrates asynchronously (get_bit_perfect resolves AFTER
-    // this mount effect), so reading the atom here yields its default `false` and
-    // leaks a non-unity volume (e.g. one set during video) on cold start. Read the
-    // authoritative value from the backend instead.
-    (async () => {
-      let bitPerfect = store.get(bitPerfectAtom);
-      try {
-        bitPerfect = await invoke<boolean>("get_bit_perfect");
-      } catch {
-        // Fall back to the atom's current value on IPC failure.
-      }
-      if (!bitPerfect) {
-        const vol = store.get(volumeAtom);
-        invoke("set_volume", { level: vol }).catch(() => {});
-      }
-    })();
+    // The backend keeps the remembered slider separate from effective unity
+    // gain in bit-perfect/HQPlayer output.
+    invoke("set_volume", { level: store.get(volumeAtom) }).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1026,54 +1011,23 @@ export function AppInitializer() {
     },
     refreshData: () => void refreshApp(),
     toggleExclusive: () => {
-      const isExclusive = store.get(exclusiveModeAtom);
-      if (isExclusive) {
-        store.set(exclusiveModeAtom, false);
-        if (store.get(bitPerfectAtom)) {
-          setBitPerfect(false);
-        }
-        invoke("set_exclusive_mode", { enabled: false }).catch(() => {});
-        showToast("Exclusive output off — takes effect next track");
-      } else {
-        store.set(exclusiveModeAtom, true);
-        invoke("set_exclusive_mode", { enabled: true }).catch(() => {});
-        invoke<Array<{ id: string; name: string }>>("list_audio_devices")
-          .then((devices) => {
-            if (!store.get(exclusiveDeviceAtom) && devices.length > 0) {
-              store.set(exclusiveDeviceAtom, devices[0].id);
-              invoke("set_exclusive_device", { device: devices[0].id }).catch(
-                () => {},
-              );
-            }
-          })
-          .catch(() => {});
-        showToast("Exclusive output on — takes effect next track");
-      }
+      if (!store.get(audioOutputStateAtom)) return;
+      const config = store.get(configuredAudioOutputAtom);
+      if (config.route !== "native") return;
+      const exclusiveMode = !config.exclusiveMode;
+      void setAudioOutput({
+        exclusiveMode,
+        ...(!exclusiveMode ? { bitPerfect: false } : {}),
+      })
+        .then(() =>
+          showToast("Output settings saved — applies on next playback"),
+        )
+        .catch(() => showToast("Unable to save output settings", "error"));
     },
     toggleBitPerfect: () => {
-      const isBP = store.get(bitPerfectAtom);
-      if (isBP) {
-        setBitPerfect(false);
-        showToast("Bit-perfect off — takes effect next track");
-      } else {
-        const isExclusive = store.get(exclusiveModeAtom);
-        if (!isExclusive) {
-          store.set(exclusiveModeAtom, true);
-          invoke("set_exclusive_mode", { enabled: true }).catch(() => {});
-          invoke<Array<{ id: string; name: string }>>("list_audio_devices")
-            .then((devices) => {
-              if (!store.get(exclusiveDeviceAtom) && devices.length > 0) {
-                store.set(exclusiveDeviceAtom, devices[0].id);
-                invoke("set_exclusive_device", {
-                  device: devices[0].id,
-                }).catch(() => {});
-              }
-            })
-            .catch(() => {});
-        }
-        setBitPerfect(true);
-        showToast("Bit-perfect on — takes effect next track");
-      }
+      if (!store.get(audioOutputStateAtom)) return;
+      const config = store.get(configuredAudioOutputAtom);
+      if (config.route === "native") void setBitPerfect(!config.bitPerfect);
     },
     toggleShortcuts: () => {
       window.dispatchEvent(new CustomEvent("toggle-shortcuts"));

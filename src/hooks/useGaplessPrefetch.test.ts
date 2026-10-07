@@ -6,6 +6,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { useGaplessPrefetch } from "./useGaplessPrefetch";
 import { currentTrackAtom, queueAtom, gaplessAtom } from "../atoms/playback";
 import { PROXY_SAVED_EVENT } from "../atoms/proxy";
+import {
+  acceptAudioOutputAtom,
+  configuredAudioOutputAtom,
+} from "../atoms/audioOutput";
 import type { Track } from "../types";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -115,5 +119,92 @@ describe("useGaplessPrefetch proxy invalidation", () => {
     window.dispatchEvent(new Event(PROXY_SAVED_EVENT));
     await waitFor(() => expect(attempts()).toHaveLength(2));
     expect(attempts()[1][1]).toMatchObject({ trackId: LIVE.id });
+  });
+});
+
+describe("output-aware gapless prefetch", () => {
+  beforeEach(() => {
+    vi.mocked(invoke).mockReset();
+    vi.mocked(invoke).mockImplementation(async (command) =>
+      command === "get_gapless_supported" ? true : {},
+    );
+  });
+  it("prepares HQPlayer even when the remembered native mode is exclusive and bit-perfect", async () => {
+    const store = createStore();
+    const config = {
+      ...store.get(configuredAudioOutputAtom),
+      route: "hqplayer" as const,
+      exclusiveMode: true,
+      bitPerfect: true,
+    };
+    store.set(acceptAudioOutputAtom, {
+      configured: config,
+      active: config,
+      playbackGeneration: 1,
+      revision: 0,
+      pending: false,
+    });
+    store.set(currentTrackAtom, LIVE);
+    setup(store, () => DEAD);
+    await waitFor(() => expect(attempts()).toHaveLength(1));
+  });
+  it.each(["camilla", "pending"])(
+    "does not arm a next track for %s output",
+    async (mode) => {
+      const store = createStore();
+      const config = {
+        ...store.get(configuredAudioOutputAtom),
+        route:
+          mode === "camilla" ? ("camilla" as const) : ("hqplayer" as const),
+      };
+      store.set(acceptAudioOutputAtom, {
+        configured: config,
+        active: config,
+        playbackGeneration: 1,
+        revision: 0,
+        pending: mode === "pending",
+      });
+      store.set(currentTrackAtom, LIVE);
+      setup(store, () => DEAD);
+      await waitFor(() =>
+        expect(invoke).toHaveBeenCalledWith("clear_next_track"),
+      );
+      expect(attempts()).toHaveLength(0);
+    },
+  );
+  it("invalidates in-flight preparation when a route change becomes pending", async () => {
+    let finish!: (value: unknown) => void;
+    vi.mocked(invoke).mockImplementation(async (command) =>
+      command === "set_next_track"
+        ? new Promise((resolve) => {
+            finish = resolve;
+          })
+        : true,
+    );
+    const store = createStore();
+    const config = store.get(configuredAudioOutputAtom);
+    store.set(acceptAudioOutputAtom, {
+      configured: config,
+      active: config,
+      playbackGeneration: 1,
+      revision: 0,
+      pending: false,
+    });
+    store.set(currentTrackAtom, LIVE);
+    setup(store, () => DEAD);
+    await waitFor(() => expect(attempts()).toHaveLength(1));
+    store.set(acceptAudioOutputAtom, {
+      configured: { ...config, route: "hqplayer" },
+      active: config,
+      playbackGeneration: 1,
+      revision: 0,
+      pending: true,
+    });
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("clear_next_track"),
+    );
+    finish({});
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(attempts()).toHaveLength(1);
   });
 });

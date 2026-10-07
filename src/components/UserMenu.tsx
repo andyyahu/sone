@@ -1,29 +1,11 @@
-import {
-  LogOut,
-  Keyboard,
-  X,
-  Headphones,
-  Shield,
-  ChevronDown,
-  Settings,
-  Info,
-  RefreshCw,
-} from "lucide-react";
-import { useState, useEffect, useRef, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { LogOut, Keyboard, X, Settings, Info } from "lucide-react";
+import { useState, useEffect, useRef } from "react";
 import { useAtom, useAtomValue } from "jotai";
 import { useAuth } from "../hooks/useAuth";
 import { useNavigation } from "../hooks/useNavigation";
-import { usePlaybackActions } from "../hooks/usePlaybackActions";
 import { useEscapeDismiss } from "../hooks/useEscapeDismiss";
 import { DISMISS_PRIORITY } from "../lib/dismissStack";
-import {
-  exclusiveModeAtom,
-  bitPerfectAtom,
-  exclusiveDeviceAtom,
-} from "../atoms/playback";
 import { currentUserAvatarAtom } from "../atoms/auth";
-import { useToast } from "../contexts/ToastContext";
 import {
   ACTION_REGISTRY,
   FIXED_KEY_DOCS,
@@ -39,7 +21,7 @@ import {
 import SettingsSheet, { type TabId } from "./settings/SettingsSheet";
 import { OPEN_SETTINGS_EVENT } from "./ProxyNoticeBanner";
 import AboutModal from "./AboutModal";
-import Toggle from "./Toggle";
+import AudioOutputSettings from "./settings/AudioOutputSettings";
 import TidalImage from "./TidalImage";
 
 export default function UserMenu() {
@@ -57,35 +39,6 @@ export default function UserMenu() {
   const [bindings, setBindings] = useAtom(shortcutsAtom);
   const [editingId, setEditingId] = useState<ActionId | null>(null);
   const [reservedHint, setReservedHint] = useState(false);
-  const [exclusiveMode, setExclusiveMode] = useAtom(exclusiveModeAtom);
-  const bitPerfect = useAtomValue(bitPerfectAtom);
-  const [exclusiveDevice, setExclusiveDevice] = useAtom(exclusiveDeviceAtom);
-  const { setBitPerfect } = usePlaybackActions();
-  const [audioDevices, setAudioDevices] = useState<
-    Array<{ id: string; name: string }>
-  >([]);
-
-  const [devicesLoading, setDevicesLoading] = useState(false);
-  const [devicesError, setDevicesError] = useState(false);
-  const deviceRequest = useRef(0);
-  const loadDevices = useCallback((forceRefresh = false) => {
-    const request = ++deviceRequest.current;
-    setDevicesLoading(true);
-    setDevicesError(false);
-    invoke<Array<{ id: string; name: string }>>("list_audio_devices", {
-      forceRefresh,
-    })
-      .then((devices) => {
-        if (request === deviceRequest.current) setAudioDevices(devices);
-      })
-      .catch(() => {
-        if (request === deviceRequest.current) setDevicesError(true);
-      })
-      .finally(() => {
-        if (request === deviceRequest.current) setDevicesLoading(false);
-      });
-  }, []);
-
   // The proxy banner renders above this menu and cannot reach the sheet's
   // state, so it asks. Only meaningful inside the authenticated shell — the
   // pre-login banner has no settings screen to send anyone to, which is the
@@ -99,8 +52,6 @@ export default function UserMenu() {
     window.addEventListener(OPEN_SETTINGS_EVENT, onOpen);
     return () => window.removeEventListener(OPEN_SETTINGS_EVENT, onOpen);
   }, []);
-  const [deviceDropdownOpen, setDeviceDropdownOpen] = useState(false);
-  const { showToast } = useToast();
   const menuRef = useRef<HTMLDivElement>(null);
 
   // Toggle shortcuts modal from ? key
@@ -153,20 +104,12 @@ export default function UserMenu() {
     return () => window.removeEventListener("keydown", handler, true);
   }, [editingId, bindings, setBindings]);
 
-  useEffect(() => {
-    if (exclusiveMode && open) loadDevices();
-    return () => {
-      deviceRequest.current += 1;
-    };
-  }, [exclusiveMode, open, loadDevices]);
-
   // Close on click outside
   useEffect(() => {
     if (!open) return;
     const handler = (e: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setOpen(false);
-        setDeviceDropdownOpen(false);
       }
     };
     document.addEventListener("mousedown", handler);
@@ -177,7 +120,6 @@ export default function UserMenu() {
     open,
     () => {
       setOpen(false);
-      setDeviceDropdownOpen(false);
     },
     DISMISS_PRIORITY.contextMenu,
   );
@@ -211,7 +153,7 @@ export default function UserMenu() {
       </button>
 
       {open && (
-        <div className="absolute right-0 top-full mt-2 w-72 bg-th-surface rounded-lg shadow-2xl shadow-black/60 border border-th-border-subtle z-50 py-1 animate-fadeIn">
+        <div className="absolute right-0 top-full mt-2 w-80 max-h-[80vh] overflow-y-auto bg-th-surface rounded-lg shadow-2xl shadow-black/60 border border-th-border-subtle z-50 py-1 animate-fadeIn">
           {/* User info — navigates to profile */}
           <button
             onClick={() => {
@@ -237,120 +179,7 @@ export default function UserMenu() {
             </div>
           </button>
 
-          {/* ── Exclusive output group ── */}
-
-          {/* Exclusive output */}
-          <button
-            onClick={() => {
-              const next = !exclusiveMode;
-              setExclusiveMode(next);
-              if (!next && bitPerfect) {
-                // Disabling exclusive also disables bit-perfect; route through
-                // the action so volume/normalization restore to previous state.
-                setBitPerfect(false);
-              }
-              invoke("set_exclusive_mode", { enabled: next }).catch(() => {});
-              showToast(
-                next
-                  ? "Exclusive output on — takes effect next track"
-                  : "Exclusive output off — takes effect next track",
-              );
-            }}
-            className={menuItemClass}
-          >
-            <Headphones size={16} />
-            <span className="flex-1 text-left">Exclusive output</span>
-            <Toggle on={exclusiveMode} />
-          </button>
-
-          {/* Device selector (visible when exclusive on) */}
-          {exclusiveMode && (
-            <div className="px-4 py-1 relative">
-              <div className="ml-7">
-                <button
-                  type="button"
-                  onClick={() => loadDevices(true)}
-                  disabled={devicesLoading}
-                  className="mb-1 flex items-center gap-2 text-[12px] text-th-text-secondary disabled:opacity-50"
-                >
-                  <RefreshCw
-                    size={12}
-                    className={devicesLoading ? "animate-spin" : ""}
-                  />
-                  {devicesLoading ? "Refreshing devices…" : "Refresh devices"}
-                </button>
-                {devicesError && (
-                  <p role="alert" className="text-[12px] text-red-400">
-                    Unable to load audio devices. Try refreshing.
-                  </p>
-                )}
-                {!devicesLoading &&
-                  !devicesError &&
-                  audioDevices.length === 0 && (
-                    <p role="status" className="text-[12px] text-th-text-muted">
-                      No audio devices found.
-                    </p>
-                  )}
-
-                <button
-                  onClick={() => setDeviceDropdownOpen((p) => !p)}
-                  className="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-md bg-th-inset border border-th-border-subtle text-[12px] text-th-text-secondary hover:border-th-accent/50 transition-colors"
-                >
-                  <span className="truncate">
-                    {audioDevices.find((d) => d.id === exclusiveDevice)?.name ||
-                      "Select device"}
-                  </span>
-                  <ChevronDown
-                    size={12}
-                    className={`shrink-0 transition-transform ${deviceDropdownOpen ? "rotate-180" : ""}`}
-                  />
-                </button>
-                {deviceDropdownOpen && (
-                  <div className="absolute left-4 right-4 ml-7 mt-1 bg-th-elevated border border-th-border-subtle rounded-md shadow-xl z-10 py-1 max-h-[160px] overflow-y-auto">
-                    {audioDevices.map((d) => (
-                      <button
-                        key={d.id}
-                        onClick={() => {
-                          setExclusiveDevice(d.id);
-                          invoke("set_exclusive_device", {
-                            device: d.id,
-                          }).catch(() => {});
-                          setDeviceDropdownOpen(false);
-                        }}
-                        className={`w-full text-left px-2.5 py-1.5 text-[12px] transition-colors ${
-                          exclusiveDevice === d.id
-                            ? "text-th-accent bg-th-accent/10"
-                            : "text-th-text-secondary hover:bg-th-border-subtle"
-                        }`}
-                      >
-                        {d.name}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Bit-perfect mode (visible when exclusive on) */}
-          {exclusiveMode && (
-            <button
-              onClick={() => {
-                const next = !bitPerfect;
-                setBitPerfect(next);
-                showToast(
-                  next
-                    ? "Bit-perfect on — takes effect next track"
-                    : "Bit-perfect off — takes effect next track",
-                );
-              }}
-              className={menuItemClass}
-            >
-              <Shield size={16} />
-              <span className="flex-1 text-left">Bit-perfect</span>
-              <Toggle on={bitPerfect} />
-            </button>
-          )}
+          <AudioOutputSettings />
 
           {/* ── Settings ── */}
           <div className="border-t border-th-border-subtle my-1" />

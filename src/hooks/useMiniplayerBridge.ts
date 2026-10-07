@@ -19,6 +19,7 @@ function sameDisplayState(a: DisplayState, b: DisplayState) {
     a.repeat === b.repeat &&
     a.volume === b.volume &&
     a.bitPerfect === b.bitPerfect &&
+    a.volumeLock === b.volumeLock &&
     a.accentColor === b.accentColor &&
     a.error === b.error &&
     a.playbackSourceLabel?.type === b.playbackSourceLabel?.type &&

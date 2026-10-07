@@ -69,6 +69,8 @@ export default function SignalPathPanel({
     userVolAltered,
     normAltered,
     isDirectAlsa,
+    isHqPlayer,
+    hasDsp,
     isPristine,
     lossyFormatChange,
     losslessPromotion,
@@ -90,6 +92,11 @@ export default function SignalPathPanel({
   let headline: string;
   if (!sp || !sp.backend) {
     headline = "Idle — no track playing";
+  } else if (isHqPlayer) {
+    headline =
+      "Handed off to HQPlayer — downstream processing and DAC unverified";
+  } else if (hasDsp) {
+    headline = "CamillaDSP processing through exclusive ALSA";
   } else if (!sp.dac && !sp.outputFormat) {
     headline = "Pipeline starting…";
   } else if (sp.dac?.state === "Closed") {
@@ -120,11 +127,13 @@ export default function SignalPathPanel({
     headline = "Measured output differs from the decoded source";
   }
 
-  const verdictWord = isPristine
-    ? "PRISTINE"
-    : verdict === "unknown"
-      ? "UNKNOWN"
-      : "MODIFIED";
+  const verdictWord = isHqPlayer
+    ? "HQPLAYER"
+    : isPristine
+      ? "PRISTINE"
+      : verdict === "unknown"
+        ? "UNKNOWN"
+        : "MODIFIED";
   const ringColor = isPristine ? "border-green-400" : "border-amber-400";
   const wordColor = isPristine ? "text-green-400" : "text-amber-300";
   const dotColor = isPristine ? "bg-green-400" : "bg-amber-400";
@@ -231,7 +240,7 @@ export default function SignalPathPanel({
                     (sp?.osMixer && !isDirectAlsa)) && (
                     <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[10.5px] font-mono text-th-text-faint mb-6 uppercase tracking-wider">
                       {sp?.exclusiveMode && <span>exclusive</span>}
-                      {sp?.bitPerfect && (
+                      {sp?.bitPerfect && !isHqPlayer && !hasDsp && (
                         <>
                           {sp?.exclusiveMode && (
                             <span className="text-th-text-faint/40">·</span>

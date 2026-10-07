@@ -3,6 +3,8 @@ import { useStore } from "jotai";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { isPlayingAtom, streamInfoAtom } from "../atoms/playback";
+import { audioBufferingAtom } from "../atoms/audioOutput";
+import { markPlaybackLoading } from "../lib/playbackPosition";
 import { useToast } from "../contexts/ToastContext";
 import { BIT_PERFECT_UNSUPPORTED_MESSAGE } from "../lib/errorUtils";
 
@@ -17,6 +19,8 @@ export function useAudioErrors() {
       ({ payload: { kind, message } }) => {
         if (!active) return;
         store.set(isPlayingAtom, false);
+        store.set(audioBufferingAtom, null);
+        markPlaybackLoading(false);
         if (
           kind === "device_disconnected" ||
           kind === "playback_error" ||

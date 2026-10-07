@@ -60,6 +60,8 @@ export default function FlowDiagramBody({
     userVolAltered,
     normAltered,
     isDirectAlsa,
+    isHqPlayer,
+    hasDsp,
     isPristine,
     losslessPromotion,
     verdict,
@@ -89,6 +91,52 @@ export default function FlowDiagramBody({
     .filter(Boolean)
     .join(" ");
 
+  if (isHqPlayer) {
+    return (
+      <div className="px-6 py-5 text-th-text-secondary">
+        {!hideTrackHeader && (
+          <p className="text-[13px] mb-4">
+            {trackTitle ?? "No track"}
+            {trackArtist ? ` — ${trackArtist}` : ""}
+          </p>
+        )}
+        <div className="flex items-center gap-3 text-[12px]">
+          <div className="rounded-lg bg-th-surface p-3">
+            <p>TIDAL → PCM</p>
+            <p className="text-th-text-muted">
+              {displayFormat(sp?.decodedFormat)} ·{" "}
+              {formatRate(sp?.decodedRate) ?? "Rate unknown"}
+            </p>
+          </div>
+          <span aria-hidden="true">→</span>
+          <div className="rounded-lg bg-th-surface p-3">
+            <p>HQPlayer Desktop</p>
+            <p className="text-th-text-muted">
+              {displayFormat(sp?.outputFormat)} ·{" "}
+              {formatRate(sp?.outputRate) ?? "Rate unknown"}
+            </p>
+            <p className="text-th-text-muted">Local PCM handoff</p>
+          </div>
+        </div>
+        <p className="text-[12px] mt-4">
+          Processing and volume are controlled by HQPlayer.
+        </p>
+        <p className="text-[11px] text-th-text-muted mt-2">
+          Downstream filters, output format and DAC measurements are
+          unavailable. Bit-perfect output is not verified.
+        </p>
+        {onBack && (
+          <button
+            className="flex items-center gap-2 mt-4 text-[12px]"
+            onClick={onBack}
+          >
+            <ArrowLeft size={14} /> Back
+          </button>
+        )}
+      </div>
+    );
+  }
+
   const mixSource: {
     fmt: string | null;
     rate: number | null;
@@ -97,7 +145,11 @@ export default function FlowDiagramBody({
     ? {
         fmt: sp?.outputFormat ?? null,
         rate: sp?.outputRate ?? null,
-        tertiary: userVolAltered || normAltered ? "+gain stage" : "pass-thru",
+        tertiary: hasDsp
+          ? "CamillaDSP"
+          : userVolAltered || normAltered
+            ? "+gain stage"
+            : "pass-thru",
       }
     : sp?.osMixer
       ? {
@@ -121,7 +173,7 @@ export default function FlowDiagramBody({
       tertiary: sp?.decodedChannels ? `${sp.decodedChannels}ch` : null,
     },
     {
-      title: "MIX",
+      title: hasDsp ? "DSP" : "MIX",
       primary: displayFormat(mixSource.fmt),
       secondary: formatRate(mixSource.rate),
       tertiary: mixSource.tertiary,
@@ -143,6 +195,14 @@ export default function FlowDiagramBody({
   };
 
   const cable1Alterations: Alteration[] = [];
+  if (hasDsp)
+    cable1Alterations.push({
+      state: "lossy",
+      label: "CAMILLA DSP",
+      detail: "Samples processed by CamillaDSP",
+      reason:
+        "Configured filters modify PCM samples; this output is not bit-perfect",
+    });
   if (sp?.resampledFrom && sp?.resampledTo) {
     cable1Alterations.push({
       state: "lossy",
@@ -493,7 +553,7 @@ export default function FlowDiagramBody({
                   EXCLUSIVE
                 </span>
               )}
-              {sp?.bitPerfect && (
+              {sp?.bitPerfect && !hasDsp && (
                 <span className="px-1.5 py-0.5 rounded bg-th-inset text-th-text-muted tracking-wider">
                   BIT-PERFECT MODE
                 </span>

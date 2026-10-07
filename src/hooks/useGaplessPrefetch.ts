@@ -8,11 +8,13 @@ import {
   repeatAtom,
   shuffleAtom,
   autoplayAtom,
-  exclusiveModeAtom,
-  bitPerfectAtom,
   gaplessAtom,
   useTrackGainAtom,
 } from "../atoms/playback";
+import {
+  audioOutputStateAtom,
+  effectiveAudioOutputAtom,
+} from "../atoms/audioOutput";
 import { currentVideoAtom } from "../atoms/video";
 import { PROXY_SAVED_EVENT } from "../atoms/proxy";
 import type { Track, StreamInfo } from "../types";
@@ -58,11 +60,17 @@ export function useGaplessPrefetch(
     // device-busy retries and on every pause; gating on it would churn the slot (network round-trips,
     // gap-on-resume-near-end). A paused track's armed slot is harmless (concat can't switch its
     // active pad while paused — no EOS propagates), so leave it armed across pause/resume.
+    const output = store.get(effectiveAudioOutputAtom);
+    const routeSupportsGapless =
+      output.route === "hqplayer" ||
+      (output.route === "native" &&
+        cachedSupported &&
+        !output.exclusiveMode &&
+        !output.bitPerfect);
     const enabled =
-      cachedSupported &&
+      routeSupportsGapless &&
+      !store.get(audioOutputStateAtom)?.pending &&
       store.get(gaplessAtom) &&
-      !store.get(exclusiveModeAtom) &&
-      !store.get(bitPerfectAtom) &&
       !store.get(currentVideoAtom) && // a video is the current item → not audio-gapless
       !!store.get(currentTrackAtom);
     if (!enabled) {
@@ -179,8 +187,12 @@ export function useGaplessPrefetch(
       store.sub(repeatAtom, refreshDebounced),
       store.sub(shuffleAtom, refreshDebounced),
       store.sub(autoplayAtom, refreshDebounced),
-      store.sub(exclusiveModeAtom, refreshImmediate),
-      store.sub(bitPerfectAtom, refreshImmediate),
+      store.sub(audioOutputStateAtom, () => {
+        pendingNextRef.current = null;
+        failedRef.current = null;
+        refreshImmediate();
+      }),
+      store.sub(effectiveAudioOutputAtom, refreshImmediate),
       store.sub(gaplessAtom, refreshImmediate),
     ];
     void refresh();
@@ -188,5 +200,5 @@ export function useGaplessPrefetch(
       if (timer.current) clearTimeout(timer.current);
       subs.forEach((u) => u());
     };
-  }, [store, refresh, refreshDebounced, refreshImmediate]);
+  }, [store, refresh, refreshDebounced, refreshImmediate, pendingNextRef]);
 }

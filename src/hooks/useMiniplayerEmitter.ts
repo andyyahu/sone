@@ -8,8 +8,12 @@ import {
   volumeAtom,
   playbackSourceAtom,
   contextSourceAtom,
-  bitPerfectAtom,
 } from "../atoms/playback";
+import {
+  audioControlLockAtom,
+  effectiveBitPerfectAtom,
+} from "../atoms/audioOutput";
+import { currentVideoAtom } from "../atoms/video";
 import { favoriteTrackIdsAtom } from "../atoms/favorites";
 import { miniplayerOpenAtom } from "../atoms/ui";
 import { themeAtom } from "../atoms/theme";
@@ -46,6 +50,7 @@ export interface MiniplayerState {
     name: string;
   } | null;
   bitPerfect: boolean;
+  volumeLock?: "hqplayer" | "bit-perfect" | null;
   accentColor: string;
   error?: string;
 }
@@ -97,7 +102,10 @@ export function useMiniplayerEmitter() {
       playbackSourceLabel: source
         ? { type: source.type, id: source.id, name: source.name }
         : null,
-      bitPerfect: store.get(bitPerfectAtom),
+      bitPerfect: store.get(effectiveBitPerfectAtom),
+      volumeLock: store.get(currentVideoAtom)
+        ? null
+        : store.get(audioControlLockAtom),
       accentColor,
       error: lastErrorRef.current,
     };
@@ -128,7 +136,9 @@ export function useMiniplayerEmitter() {
       favoriteTrackIdsAtom,
       playbackSourceAtom,
       contextSourceAtom,
-      bitPerfectAtom,
+      effectiveBitPerfectAtom,
+      audioControlLockAtom,
+      currentVideoAtom,
     ];
 
     const unsubs = atoms.map((a) => store.sub(a, scheduleEmit));

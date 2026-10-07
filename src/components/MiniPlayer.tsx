@@ -334,7 +334,7 @@ function ArtOverlayControls({
     shuffle: boolean;
     repeat: number;
     volume: number;
-    bitPerfect: boolean;
+    volumeLocked: boolean;
     sendVolume: (vol: number) => void;
     colors: VibrantColors;
     accentColor: string;
@@ -392,16 +392,17 @@ function ArtOverlayControls({
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                if (!full.bitPerfect) setShowVolume((v) => !v);
+                if (!full.volumeLocked) setShowVolume((v) => !v);
               }}
-              className={`w-9 h-9 flex items-center justify-center transition-colors ${full.bitPerfect ? "text-white/30 cursor-not-allowed" : "text-white/70 hover:text-white"}`}
+              disabled={full.volumeLocked}
+              className={`w-9 h-9 flex items-center justify-center transition-colors ${full.volumeLocked ? "text-white/30 cursor-not-allowed" : "text-white/70 hover:text-white"}`}
               title={
-                full.bitPerfect
-                  ? "Volume disabled in bit-perfect mode"
+                full.volumeLocked
+                  ? "Volume managed by the audio output"
                   : undefined
               }
             >
-              {full.bitPerfect ? (
+              {full.volumeLocked ? (
                 <VolumeX size={20} />
               ) : full.volume === 0 ? (
                 <VolumeX size={20} />
@@ -409,7 +410,7 @@ function ArtOverlayControls({
                 <Volume2 size={20} />
               )}
             </button>
-            {showVolume && !full.bitPerfect && (
+            {showVolume && !full.volumeLocked && (
               <VolumeSlider
                 volume={full.volume}
                 sendVolume={full.sendVolume}
@@ -741,7 +742,7 @@ function NarrowTier({
   shuffle,
   repeat,
   volume,
-  bitPerfect,
+  volumeLocked,
   sendCommand,
   sendVolume,
   colors,
@@ -754,7 +755,7 @@ function NarrowTier({
   shuffle: boolean;
   repeat: number;
   volume: number;
-  bitPerfect: boolean;
+  volumeLocked: boolean;
   sendCommand: (action: string, value?: number) => void;
   sendVolume: (vol: number) => void;
   colors: VibrantColors;
@@ -814,15 +815,16 @@ function NarrowTier({
           <div className="relative flex-shrink-0">
             <button
               onClick={() => {
-                if (!bitPerfect) setShowVolumeSlider((v) => !v);
+                if (!volumeLocked) setShowVolumeSlider((v) => !v);
               }}
-              className={`w-6 h-8 flex items-center justify-center transition-colors ${bitPerfect ? "opacity-30 cursor-not-allowed" : "hover:!text-white"}`}
+              disabled={volumeLocked}
+              className={`w-6 h-8 flex items-center justify-center transition-colors ${volumeLocked ? "opacity-30 cursor-not-allowed" : "hover:!text-white"}`}
               style={{ color: colors.textSecondary }}
               title={
-                bitPerfect ? "Volume disabled in bit-perfect mode" : undefined
+                volumeLocked ? "Volume managed by the audio output" : undefined
               }
             >
-              {bitPerfect ? (
+              {volumeLocked ? (
                 <VolumeX size={18} />
               ) : volume === 0 ? (
                 <VolumeX size={18} />
@@ -830,7 +832,7 @@ function NarrowTier({
                 <Volume2 size={18} />
               )}
             </button>
-            {showVolumeSlider && !bitPerfect && (
+            {showVolumeSlider && !volumeLocked && (
               <VolumeSlider
                 volume={volume}
                 sendVolume={sendVolume}
@@ -911,7 +913,7 @@ function CompactTier({
   shuffle,
   repeat,
   volume,
-  bitPerfect,
+  volumeLocked,
   playbackSourceLabel,
   sendCommand,
   sendVolume,
@@ -926,7 +928,7 @@ function CompactTier({
   shuffle: boolean;
   repeat: number;
   volume: number;
-  bitPerfect: boolean;
+  volumeLocked: boolean;
   playbackSourceLabel: { type: string; name: string } | null;
   sendCommand: (action: string, value?: number) => void;
   sendVolume: (vol: number) => void;
@@ -1005,15 +1007,16 @@ function CompactTier({
           <div className="relative flex-shrink-0">
             <button
               onClick={() => {
-                if (!bitPerfect) setShowVolume((v) => !v);
+                if (!volumeLocked) setShowVolume((v) => !v);
               }}
-              className={`w-8 h-8 flex items-center justify-center transition-colors ${bitPerfect ? "opacity-30 cursor-not-allowed" : "hover:!text-white"}`}
+              disabled={volumeLocked}
+              className={`w-8 h-8 flex items-center justify-center transition-colors ${volumeLocked ? "opacity-30 cursor-not-allowed" : "hover:!text-white"}`}
               style={{ color: colors.textSecondary }}
               title={
-                bitPerfect ? "Volume disabled in bit-perfect mode" : undefined
+                volumeLocked ? "Volume managed by the audio output" : undefined
               }
             >
-              {bitPerfect ? (
+              {volumeLocked ? (
                 <VolumeX size={18} />
               ) : volume === 0 ? (
                 <VolumeX size={18} />
@@ -1021,7 +1024,7 @@ function CompactTier({
                 <Volume2 size={18} />
               )}
             </button>
-            {showVolume && !bitPerfect && (
+            {showVolume && !volumeLocked && (
               <VolumeSlider
                 volume={volume}
                 sendVolume={sendVolume}
@@ -1102,7 +1105,7 @@ function FullTier({
   shuffle,
   repeat,
   volume,
-  bitPerfect,
+  volumeLocked,
   positionClock,
   containerRef,
   duration,
@@ -1118,7 +1121,7 @@ function FullTier({
   shuffle: boolean;
   repeat: number;
   volume: number;
-  bitPerfect: boolean;
+  volumeLocked: boolean;
   positionClock: MiniplayerClock;
   containerRef: RefObject<HTMLDivElement | null>;
   duration: number;
@@ -1159,7 +1162,7 @@ function FullTier({
             shuffle,
             repeat,
             volume,
-            bitPerfect,
+            volumeLocked,
             sendVolume,
             colors,
             accentColor,
@@ -1308,7 +1311,11 @@ export default function MiniPlayer() {
             shuffle={state.shuffle}
             repeat={state.repeat}
             volume={state.volume}
-            bitPerfect={state.bitPerfect}
+            volumeLocked={
+              state.volumeLock === undefined
+                ? state.bitPerfect
+                : state.volumeLock !== null
+            }
             sendCommand={sendCommand}
             sendVolume={sendVolume}
             colors={colors}
@@ -1325,7 +1332,11 @@ export default function MiniPlayer() {
             shuffle={state.shuffle}
             repeat={state.repeat}
             volume={state.volume}
-            bitPerfect={state.bitPerfect}
+            volumeLocked={
+              state.volumeLock === undefined
+                ? state.bitPerfect
+                : state.volumeLock !== null
+            }
             playbackSourceLabel={state.playbackSourceLabel}
             sendCommand={sendCommand}
             sendVolume={sendVolume}
@@ -1344,7 +1355,11 @@ export default function MiniPlayer() {
             shuffle={state.shuffle}
             repeat={state.repeat}
             volume={state.volume}
-            bitPerfect={state.bitPerfect}
+            volumeLocked={
+              state.volumeLock === undefined
+                ? state.bitPerfect
+                : state.volumeLock !== null
+            }
             positionClock={positionClock}
             containerRef={containerRef}
             duration={state.duration}
