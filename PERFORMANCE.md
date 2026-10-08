@@ -1,5 +1,72 @@
 # UI performance experiments
 
+## 2026-10-08: integrate experimental audio outputs
+
+The imported `experiment/hqplayer-camilladsp` snapshot (`6cee774`) is reconciled
+with the newer catalog, artwork, cache, settings, and rendering changes.
+Native, CamillaDSP and local HQPlayer Desktop are independent routes.
+Changes apply on new playback;
+pause/resume and seeking retain the active route. Remembered native preferences
+are separate from effective processing, and the interface shows pending changes.
+
+Output updates validate DSP files or probe HQPlayer before locking settings.
+The durable transaction then takes the playback gate in store-first order,
+retaining it through rollback. Playback never snapshots an uncommitted choice.
+Monotonic state revisions reject stale UI responses; separate playback tokens
+reject delayed events from an earlier play of the same track. Regression tests
+cover lock ordering, failed-rename visibility, cancelled startup and prefetch.
+
+CamillaDSP uses the pinned v4.1.3 processing library at source rate, retains
+bounded ALSA recovery, and stops on DSP errors. Padded final blocks emit only
+valid input frames. Native non-bit-perfect output retains its compatibility
+negotiation; strict bit-perfect still rejects sample changes. HQPlayer receives
+unscaled S32 PCM via a bounded loopback WAV service with private temporary
+storage. Control mutations are not replayed after uncertain failures. Confirmed
+transport state drives startup and completion; buffering pauses playback timing.
+HQ gapless boundary detection uses observed position resets and its prepared
+queue. Downstream filtering, volume and DAC properties remain unknown to SONE.
+
+Validation: 690 frontend tests in 93 files and 490 Rust tests pass. TypeScript,
+Vite, Prettier, rustfmt and all-target Clippy pass. ESLint reports zero errors
+and 262 existing warnings; Vite retains its large-chunk warning. Knip passes in
+an isolated copy: the nested worktree's ignored `nocommit` parent otherwise
+misclassifies the version script. Tests using sockets run outside the filesystem
+sandbox against local fake peers. No live account, physical DAC or HQPlayer
+Desktop was used. Both optional routes remain experimental and default off.
+`AGENTS.md` is unchanged. The separate source checkout was left untouched;
+its later beta/Slint development is outside this snapshot's merge scope.
+
+The release executable was rebuilt with the production frontend at
+`src-tauri/target/release/sone` on 2026-10-08 01:33 Asia/Taipei
+(50,393,512 bytes; SHA-256
+`d46f5c5ff81c3904dd8bd59e43a2a01fc1ae3a12126884a6abb8a020c83af73b`).
+Its shared libraries resolve locally. It was not launched against the user's
+account or audio devices during validation.
+
+Three alternating baseline/candidate runs per workload compare mainline
+`db146e6` with the integration using WebKitGTK 2.52.6 and identical local data:
+
+| Workload | Baseline median p95 | Integration median p95 |
+| --- | --- | --- |
+| Playlist, 1,000 rows, warmed covers | 17 ms | 17 ms |
+| Playlist, 1,000 rows, delayed covers | 18 ms | 18 ms |
+| Virtual album grid, 1,000 cards | 17 ms | 17 ms |
+| HomeSection, 24 shelves / 288 albums, warm local PNGs | 18 ms | 19 ms |
+| HomeSection, same shelves, cold local PNGs | 19 ms | 19 ms |
+
+Each comparison meets the 10% regression limit. Playlist sampling found no
+gaps or overlaps and no pending visible covers at completion; mounted rows
+were capped at 31. The grid kept 18 cards mounted with no sampled overlaps.
+The viewport was identical between versions within each workload (853x920
+warm playlist; 853x455 cold playlist/grid; 855x920 HomeSection; DPR 2).
+HomeSection had no image errors, overlapping shelves or intervals over 32ms;
+both builds retained two pending images in the final bounding-box sample.
+Its cold workload exercises local image admission/decoding, not network delay,
+and excludes the Home page's API orchestration. These are scripted rAF intervals, not physical
+wheel latency, compositor presentation, real API loading, or whole-app FPS.
+Raw samples and the runner are under the integration worktree's ignored
+`nocommit/audio-perf-*` paths.
+
 ## 2026-10-04: cache, settings, rendering and audio reliability
 
 This batch preserves the working virtual playlist rows and image concurrency

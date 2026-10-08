@@ -28,6 +28,14 @@ https://github.com/user-attachments/assets/67d7a8ed-352b-4ce6-8b9c-70b7427a5f22
   <img src="data/sone_theme_readme.png" width="32%" alt="SONE custom theme — native Linux music player with full color customization" />
 </p>
 
+## This fork
+
+This is [Andy's fork](https://github.com/andyyahu/sone) of
+[SONE by lullabyX](https://github.com/lullabyX/sone). The original application,
+Linux desktop integration, and direct ALSA playback are upstream work. This
+fork adds playlist and artwork performance improvements, transactional settings,
+and the experimental audio routes described below.
+
 ## The Vision
 
 The Linux desktop app TIDAL never built.
@@ -40,6 +48,7 @@ We went beyond the basics with direct-to-DAC bit-perfect ALSA output, a resizabl
 <summary>Table of Contents</summary>
 
 - [Features](#features)
+- [Experimental audio outputs](#experimental-audio-outputs)
 - [Why SONE?](#why-sone)
 - [Installation](#installation)
 - [Usage](#usage)
@@ -98,11 +107,47 @@ We went beyond the basics with direct-to-DAC bit-perfect ALSA output, a resizabl
 - **Discord Rich Presence** — show what you're listening to with album art, track info, and a direct TIDAL link
 - **Proxy support** — route everything through an HTTP, HTTPS, or SOCKS5 proxy, including audio playback, with optional username and password. If the proxy can't be reached, SONE stops rather than sending your traffic around it
 
+## Experimental audio outputs
+
+The account menu's audio output selector offers three independent routes:
+
+| Route | Processing and controls |
+| --- | --- |
+| Native | System mixer or exclusive ALSA, with the existing bit-perfect option. |
+| CamillaDSP — experimental | Embedded processing from a CamillaDSP YAML configuration, followed by exclusive ALSA output at the source rate. This route modifies samples and is never described as bit-perfect. |
+| HQPlayer — experimental | Source-rate, 32-bit PCM WAV delivered to HQPlayer Desktop on the same computer. HQPlayer owns its filters, volume and DAC. |
+
+Changes apply to the next track or explicit replay. Pause/resume and seeking keep
+the active route; the menu shows when a choice is pending. Native device,
+bit-perfect, volume and ReplayGain preferences are remembered when another route
+is selected. Controls follow the route actually playing.
+
+For CamillaDSP, choose a YAML file from the output selector. SONE checks the
+configuration and coefficient files before saving, and checks compatibility
+again for the track's sample rate and channel layout. The YAML's capture and
+playback devices do not open hardware; SONE owns ALSA. Processing failures stop
+playback instead of bypassing DSP. Final block padding does not extend the track;
+the full convolution tail is not appended. This route does not add gapless ALSA
+playback or a built-in upscaler.
+
+For HQPlayer, start Desktop and enable its local control interface, normally on
+port `4321`. The connection check does not stop the current track or release its
+DAC; handoff happens when the next playback starts. SONE's volume and ReplayGain
+controls are disabled while HQPlayer is active. The signal path reports the
+known WAV handoff, not an unmeasured downstream DAC or a bit-perfect verdict.
+Playback, seeking and preloading are controlled by SONE. LAN endpoints and
+CamillaDSP-to-HQPlayer chaining are not supported. Tracks exceeding the classic
+RIFF/WAV size limit are rejected rather than truncated.
+
+Both optional routes are off by default and remain experimental. Automated
+tests exercise DSP processing and simulated HQ control/HTTP clients; they do not
+establish compatibility with every physical DAC or HQPlayer installation.
+
 ## Why SONE?
 
 SONE is a lightweight, native alternative to the official TIDAL web player and Electron-based unofficial clients.
 
-- **Full audio quality** — browsers and Electron apps downsample audio to 48kHz before it leaves the application. SONE is native — it outputs at the source's original sample rate, up to 192kHz (TIDAL's max). Exclusive ALSA mode bypasses the system mixer entirely for bit-perfect output to your DAC.
+- **Full audio quality** — strict bit-perfect ALSA output preserves the decoded source rate and samples, up to 192kHz. Playback stops if the hardware cannot preserve them; ordinary native output can negotiate a compatible format and rate.
 - **Familiar interface** — a modern UI inspired by the streaming apps you already use
 - **Direct hardware access** — GStreamer talks directly to your audio hardware. Lock your DAC to the exact source format, bypassing the system mixer
 - **Lightweight** — built with Tauri and Rust. Small binary, low memory footprint
@@ -110,6 +155,9 @@ SONE is a lightweight, native alternative to the official TIDAL web player and E
 - **No telemetry, no tracking** — fully open source under GPL-3.0. SONE collects no telemetry and sends nothing to its developers. Finished plays are reported to TIDAL so Recently Played works; turn it off in Settings → Scrobbling
 
 ## Installation
+
+The package and store links below install **upstream SONE**. To use this fork's
+experimental outputs, build this repository using the source instructions.
 
 ### Flathub
 
@@ -360,9 +408,9 @@ sudo pacman -S --needed gst-plugin-pipewire alsa-plugins
 **Build and run:**
 
 ```bash
-git clone https://github.com/lullabyX/sone.git
+git clone https://github.com/andyyahu/sone.git
 cd sone
-pnpm install
+pnpm install --frozen-lockfile
 pnpm tauri dev             # Development mode
 pnpm tauri build           # Release build (produces .deb, .rpm, .AppImage)
 ```
@@ -429,6 +477,13 @@ WEBKIT_DISABLE_COMPOSITING_MODE=1 sone
 ```
 
 This is a known issue with NVIDIA's proprietary drivers and WebKitGTK hardware acceleration.
+
+**Comparing renderer behavior in this fork?**
+The default `SONE_RENDERER=auto` leaves DMA-BUF selection to WebKit.
+`SONE_RENDERER=dmabuf` allows DMA-BUF; `SONE_RENDERER=compatibility` disables it
+for troubleshooting. For example, run `SONE_RENDERER=compatibility sone`.
+An explicitly set `WEBKIT_DISABLE_DMABUF_RENDERER` takes precedence. Startup
+logs report the requested policy; they do not prove which GPU WebKit selected.
 
 </details>
 
@@ -530,11 +585,9 @@ To fix this, either close the other application using the device, or select a di
 
 Both bypass your system's sound server (PulseAudio/PipeWire) and write directly to the ALSA hardware device. The difference is in how much processing happens before audio reaches your DAC.
 
-**Exclusive mode** locks the ALSA device so no other application can use it. Audio is converted to a fixed format (32-bit integer, stereo) while preserving the source's native sample rate — no resampling occurs. You still have software volume control and volume normalization (ReplayGain).
+**Native exclusive mode** opens the ALSA device directly. It negotiates a compatible format and sample rate, with resampling when needed. Software volume and ReplayGain remain available. The signal-path panel reports the actual processing.
 
-**Bit-perfect mode** goes a step further. There is zero processing — no format conversion, no resampling, no volume control. The decoded audio reaches your DAC exactly as it was encoded. The volume slider is locked at 100% and disabled. This is the mode to use if you want the purest signal path to your DAC.
-
-In short: exclusive gives you direct hardware access with volume control. Bit-perfect gives you a completely unaltered signal.
+**Bit-perfect mode** requires the source sample rate and unchanged decoded sample values. Lossless integer widening or repacking is allowed; resampling, dithering, volume changes and ReplayGain are disabled. Unsupported negotiation stops playback. SONE remembers your ordinary volume and normalization preferences for later native playback.
 
 </details>
 
@@ -585,7 +638,7 @@ Leave that running and SONE will find it. Run it before starting SONE, or restar
 
 ## Contributing
 
-Issues and pull requests are welcome on [GitHub](https://github.com/lullabyX/sone). To set up a development environment, follow the [Building from source](#building-from-source) instructions.
+Issues and pull requests for this fork are welcome on [GitHub](https://github.com/andyyahu/sone). For upstream SONE, see [lullabyX/sone](https://github.com/lullabyX/sone). To set up a development environment, follow the [Building from source](#building-from-source) instructions.
 
 If you enjoy using SONE, consider giving the project a star to help others find it.
 
